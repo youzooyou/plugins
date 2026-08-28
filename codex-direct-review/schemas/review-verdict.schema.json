@@ -8,16 +8,17 @@
         "type": "object",
         "properties": {
           "file": { "type": "string" },
-          "line": { "type": "integer" },
-          "severity": { "type": "string" },
+          "line": { "type": ["integer", "null"] },
+          "severity": { "type": ["string", "null"] },
           "summary": { "type": "string" },
           "evidence": { "type": "string" }
         },
-        "required": ["file", "summary", "evidence"]
+        "required": ["file", "line", "severity", "summary", "evidence"],
+        "additionalProperties": false
       }
     },
-    "summary": { "type": "string" }
+    "summary": { "type": ["string", "null"] }
   },
-  "required": ["verdict", "findings"],
+  "required": ["verdict", "findings", "summary"],
   "additionalProperties": false
 }
