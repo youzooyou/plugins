@@ -631,8 +631,9 @@ jq -r '.plugins["codex-direct-review@youzooyou-plugins"][] | select(.scope=="use
   ~/.claude/plugins/installed_plugins.json
 ```
 Expected: prints a real path like
-`~/.claude/plugins/cache/youzooyou-plugins/codex-direct-review/1.0.0`. If empty,
-the plugin isn't actually installed at `user` scope — re-run Step 3.
+`~/.claude/plugins/cache/youzooyou-plugins/codex-direct-review/<installed-version>` (the version
+segment tracks whatever is currently installed, not necessarily 1.0.0). If empty, the plugin isn't
+actually installed at `user` scope — re-run Step 3.
 
 - [ ] **Step 6: Live end-to-end test of `/codex-review`**
 
