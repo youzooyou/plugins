@@ -5,6 +5,5 @@
   "author": {
     "name": "youzooyou",
     "url": "https://github.com/youzooyou"
-  },
-  "hooks": "./hooks/hooks.json"
+  }
 }
