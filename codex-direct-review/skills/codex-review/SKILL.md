@@ -7,8 +7,9 @@ description: Use when you want a single, one-shot Codex CLI review run directly 
 
 ## Overview
 
-Runs exactly one Codex review as a fresh, ephemeral `codex exec review` process via this plugin's
-`run-codex-review.sh`, and presents the result. Unlike `/cc`, there is no round loop or
+Runs exactly one Codex review as a fresh, ephemeral process — generic `codex exec` with a
+hand-built prompt that embeds a self-gathered git diff (not the `review` subcommand) — via this
+plugin's `run-codex-review.sh`, and presents the result. Unlike `/cc`, there is no round loop or
 cross-verification — this is the lightweight, single-shot version.
 
 ## When invoked

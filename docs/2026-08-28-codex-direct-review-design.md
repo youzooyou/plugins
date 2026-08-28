@@ -52,6 +52,41 @@ The wrapper's own CLI surface (`--cwd`, `--uncommitted`/`--base`/`--commit`, `--
 is unchanged — only what happens *inside* the wrapper changes. `/cc` and `/codex-review` (Components
 3 and 4 below) are unaffected by this revision.
 
+## Revision 2 (2026-08-28, same implementation round — Structured Outputs strict-mode schema fixes)
+
+This was the second of two major fixes discovered during Task 3's implementation — and, per Task
+3's implementation report, the one that actually got the pipeline to its first `"ok":true` result
+end-to-end. It is at least as central to this story as the `codex exec review` → generic `codex
+exec` pivot documented above; the two fixes landed in the same implementation pass.
+
+Once the wrapper was pointed at generic `codex exec` with `--output-schema`, the first live smoke
+test attempts still failed, this time with real API 400 errors rather than a silent schema mismatch:
+
+1. `'additionalProperties' is required to be supplied and to be false` — the schema's root object
+   already had `"additionalProperties": false`, but nested objects did not. OpenAI's Structured
+   Outputs strict mode requires `"additionalProperties": false` at **every** nesting level, not just
+   the root — the API rejected the `findings` array's `items` object specifically for missing it.
+2. `'required' is required to be supplied and to be an array including every key in properties` —
+   strict mode requires every property to appear in `required`; true optionality has to be expressed
+   via a nullable type union (e.g. `"type": ["string", "null"]`) instead of omitting the key from
+   `required`.
+
+Fix: `findings.items` gained its own `"additionalProperties": false`; `line`, `severity` (per
+finding) and the top-level `summary` changed from plain types to `["<type>", "null"]`; and all three
+moved into their respective `required` arrays alongside the already-required fields. The
+currently-shipped, correct schema is `codex-direct-review/schemas/review-verdict.schema.json`.
+
+With this fix in place, a live smoke test (`--base aacd77e`) returned a real `"ok":true` end-to-end
+for the first time, including a genuine `ISSUES` verdict identifying real bugs in the prior
+review-based script.
+
+**Known gap:** `docs/superpowers/plans/2026-08-28-codex-direct-review.md`'s Task 2 section, and this
+doc's own Components §2 below, both still show the original, looser, pre-fix schema (no
+`additionalProperties: false` on `findings.items`, and `line`/`severity`/`summary` omitted from
+`required`). Neither was updated after this fix — Task 3's implementation report, and
+`codex-direct-review/schemas/review-verdict.schema.json` itself, are the source of truth for the
+shape that actually shipped.
+
 ## Decision
 
 Replace only `/cc`'s "call Codex" step with a direct, one-shot invocation of the Codex CLI —
@@ -138,8 +173,10 @@ silence.
 
 Inputs (CLI args): working directory, scope (`--uncommitted` | `--base <branch>` | `--commit <sha>`
 — passed straight through to `codex exec review`), focus/prompt text, path to a JSON Schema file.
+*(Superseded — see Revision above: scope is consumed to build a git diff ourselves, sent via a
+hand-built prompt on stdin to generic `codex exec`, not passed as CLI args to `codex exec review`.)*
 
-Behavior:
+Behavior (superseded — see Revision above for the actual invocation shape):
 ```
 codex exec review --ephemeral --sandbox read-only --skip-git-repo-check --json \
   --output-schema "$SCHEMA" --output-last-message "$OUTFILE" \
@@ -233,6 +270,8 @@ run directly...". Behavior:
   within a normal process lifetime" — the 300s timeout is a judgment call, not a guarantee reviews
   never legitimately need longer. If real usage shows timeouts on large-but-legitimate reviews,
   raise the timeout rather than treating it as a design failure.
-- `codex exec review`'s built-in scope flags (`--uncommitted`/`--base`/`--commit`) are being trusted
-  to gather target context correctly, the same way the current plugin does internally — this
-  wrapper does not re-implement diff collection.
+- **Superseded — see Revision above.** This bullet originally assumed `codex exec review`'s built-in
+  scope flags could be trusted to gather target context, with the wrapper never re-implementing diff
+  collection. The opposite is now true: the wrapper stopped trusting those flags specifically because
+  `codex exec review` doesn't honor `--output-schema`, and now gathers the diff itself via
+  `git diff`/`git show`. Left here only as a record of the original (now-obsolete) risk framing.

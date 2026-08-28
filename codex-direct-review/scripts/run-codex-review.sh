@@ -11,7 +11,7 @@ judge_result() {
   local exit_code="$1" eventlog="$2" outfile="$3"
 
   if [ "$exit_code" -ne 0 ]; then
-    printf '{"ok":false,"reason":"nonzero_exit","detail":"codex exec review exited %s"}\n' "$exit_code"
+    printf '{"ok":false,"reason":"nonzero_exit","detail":"codex exec exited %s"}\n' "$exit_code"
     return 1
   fi
 
