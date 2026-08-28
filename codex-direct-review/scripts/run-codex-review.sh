@@ -132,7 +132,8 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--timeout requires a value"}\n'; exit 1; }
       TIMEOUT_SECS="$2"; shift 2 ;;
     *)
-      printf '{"ok":false,"reason":"bad_args","detail":"unknown argument: %s"}\n' "$1"
+      ESCAPED_ARG="$(printf '%s' "$1" | sed 's/"/\\"/g')"
+      printf '{"ok":false,"reason":"bad_args","detail":"unknown argument: %s"}\n' "$ESCAPED_ARG"
       exit 1 ;;
   esac
 done
