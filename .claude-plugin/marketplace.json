@@ -15,7 +15,7 @@
     },
     {
       "name": "codex-direct-review",
-      "description": "Run a Codex CLI review as a fresh, one-shot process (codex exec review) — no shared broker, no silent failures.",
+      "description": "Run a Codex CLI review as a fresh, one-shot process (generic codex exec with a hand-built prompt) — no shared broker, no silent failures.",
       "source": "./codex-direct-review",
       "category": "productivity"
     }

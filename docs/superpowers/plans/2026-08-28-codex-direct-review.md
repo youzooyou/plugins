@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace `/cc`'s Codex invocation (currently `Agent(codex:codex-rescue)` → the `openai-codex` plugin's shared app-server broker) with a new, independently-shareable `codex-direct-review` plugin that runs `codex exec review` as a one-shot, ephemeral process per call — eliminating the broker's silent-failure, premature-completion, and idle-stall failure modes.
+**Goal:** Replace `/cc`'s Codex invocation (currently `Agent(codex:codex-rescue)` → the `openai-codex` plugin's shared app-server broker) with a new, independently-shareable `codex-direct-review` plugin that runs generic `codex exec` with a hand-built prompt as a one-shot, ephemeral process per call — eliminating the broker's silent-failure, premature-completion, and idle-stall failure modes.
 
-**Architecture:** A new plugin in the `youzooyou/plugins` marketplace repo bundles a Bash wrapper (`run-codex-review.sh`) that invokes `codex exec review` with strict, hand-checked success criteria (exit code + `turn.completed` event + schema-valid output), a JSON Schema for the verdict shape, and a standalone `/codex-review` skill for direct use. `/cc` (a separate personal command, not part of this plugin) resolves the plugin's install path dynamically via `jq` against `~/.claude/plugins/installed_plugins.json` and calls the same wrapper directly via Bash — no subagent layer.
+**Architecture:** A new plugin in the `youzooyou/plugins` marketplace repo bundles a Bash wrapper (`run-codex-review.sh`) that invokes generic `codex exec` (with a hand-built prompt embedding a self-gathered git diff) with strict, hand-checked success criteria (exit code + `turn.completed` event + schema-valid output), a JSON Schema for the verdict shape, and a standalone `/codex-review` skill for direct use. `/cc` (a separate personal command, not part of this plugin) resolves the plugin's install path dynamically via `jq` against `~/.claude/plugins/installed_plugins.json` and calls the same wrapper directly via Bash — no subagent layer.
 
-**Tech Stack:** Bash (wrapper script — no new language runtime), `jq` (already installed, used for all JSON parsing/validation — no new dependency), `codex` CLI 0.146.0+ (`codex exec review` subcommand), Claude Code plugin/marketplace conventions (`.claude-plugin/plugin.json`, `skills/<name>/SKILL.md`, `${CLAUDE_PLUGIN_ROOT}`).
+**Tech Stack:** Bash (wrapper script — no new language runtime), `jq` (already installed, used for all JSON parsing/validation — no new dependency), `codex` CLI 0.146.0+ (generic `codex exec`, not the `review` subcommand), Claude Code plugin/marketplace conventions (`.claude-plugin/plugin.json`, `skills/<name>/SKILL.md`, `${CLAUDE_PLUGIN_ROOT}`).
 
 **Spec:** `docs/2026-08-28-codex-direct-review-design.md` (this plan implements that design; read both — the spec has the full rationale and the live-verification evidence this plan builds on).
 
@@ -14,7 +14,7 @@
 
 - No new external dependencies (no `ajv`, no `python-jsonschema`, no `timeout`/`gtimeout`) — use `jq` (already present) and portable Bash for everything, including the wall-clock timeout (macOS has no built-in `timeout`/`gtimeout`; implement via a background-PID poll loop).
 - The wrapper script must **never print nothing** on failure — every failure path prints a `{"ok":false,"reason":"...","detail":"..."}` JSON object to stdout and exits non-zero.
-- `--sandbox read-only` is used on every `codex exec review` invocation — this plugin never edits files.
+- `--sandbox read-only` is used on every `codex exec` invocation — this plugin never edits files.
 - Default timeout: 300 seconds per review round (per the spec's Codex-recommended value).
 - `main` branch of `youzooyou/plugins` is protected (PR required, 0 approvals needed — see repo settings). Every task's commit goes to a feature branch; merging via PR happens as its own explicit step, not silently bundled into a task.
 - File paths below are all relative to the `youzooyou/plugins` repo root (`/Users/hmc7279235/Work/Develop/plugins`) unless given as an absolute `~/.claude/...` path.
