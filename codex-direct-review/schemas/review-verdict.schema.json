@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "properties": {
+    "verdict": { "type": "string", "enum": ["CLEAN", "ISSUES"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "file": { "type": "string" },
+          "line": { "type": ["integer", "null"] },
+          "severity": { "type": ["string", "null"] },
+          "summary": { "type": "string" },
+          "evidence": { "type": "string" }
+        },
+        "required": ["file", "line", "severity", "summary", "evidence"],
+        "additionalProperties": false
+      }
+    },
+    "summary": { "type": ["string", "null"] }
+  },
+  "required": ["verdict", "findings", "summary"],
+  "additionalProperties": false
+}
