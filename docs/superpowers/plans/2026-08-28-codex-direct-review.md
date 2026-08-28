@@ -273,16 +273,25 @@ git commit -m "Add review-verdict schema and judge_result logic with selftest"
 
 ---
 
-### Task 3: Implement the real `codex exec review` invocation with timeout enforcement
+### Task 3 (REVISED): Implement the real `codex exec` invocation — self-gathered diff, hand-built prompt, timeout enforcement
+
+**Revision note:** the first attempt at this task used `codex exec review` directly and discovered
+(via 3 real live calls) that `codex exec review` does not honor `--output-schema` — it returns
+prose regardless. This revised version uses generic `codex exec` with a prompt we build ourselves,
+embedding a diff we gather via plain `git diff`/`git show` — the exact pattern already live-verified
+working earlier in this project (a plain instruction prompt + `--output-schema` returned exactly the
+requested JSON). See `docs/2026-08-28-codex-direct-review-design.md`'s "Revision" section for the
+full story. The wrapper's external CLI surface is unchanged from the original plan — only what
+happens inside it changes.
 
 **Files:**
 - Modify: `codex-direct-review/scripts/run-codex-review.sh`
 
 **Interfaces:**
-- Consumes: `judge_result` from Task 2 (unchanged signature).
-- Produces: the script's real CLI surface: `run-codex-review.sh --cwd <dir> (--uncommitted | --base <branch> | --commit <sha>) [--focus <text>] [--timeout <seconds>]`.
+- Consumes: `judge_result` from Task 2 (unchanged 3-arg signature: `exit_code eventlog outfile`).
+- Produces: the script's real CLI surface (unchanged from the original plan): `run-codex-review.sh --cwd <dir> (--uncommitted | --base <branch> | --commit <sha>) [--focus <text>] [--timeout <seconds>]`. New behavior: an empty diff (nothing to review) short-circuits to `{"ok":true,"verdict":{"verdict":"CLEAN","findings":[]}}` with **no API call at all** — this doubles as the smoke test's free, no-cost path. A git command that itself fails (bad branch/commit reference) returns `{"ok":false,"reason":"git_error","detail":"..."}` without ever reaching codex.
 
-- [ ] **Step 1: Replace the placeholder "not implemented yet" block with argument parsing and the real run**
+- [ ] **Step 1: Replace the placeholder "not implemented yet" block with argument parsing, diff-gathering, and the real run**
 
 In `codex-direct-review/scripts/run-codex-review.sh`, replace this block:
 ```bash
@@ -302,36 +311,99 @@ if [ "${1:-}" = "--selftest" ]; then
 fi
 
 CWD=""
-SCOPE_FLAGS=""
+SCOPE=""
+SCOPE_VALUE=""
 FOCUS=""
 TIMEOUT_SECS="$DEFAULT_TIMEOUT_SECS"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --cwd) CWD="$2"; shift 2 ;;
-    --uncommitted) SCOPE_FLAGS="--uncommitted"; shift ;;
-    --base) SCOPE_FLAGS="--base $2"; shift 2 ;;
-    --commit) SCOPE_FLAGS="--commit $2"; shift 2 ;;
-    --focus) FOCUS="$2"; shift 2 ;;
-    --timeout) TIMEOUT_SECS="$2"; shift 2 ;;
-    *) printf '{"ok":false,"reason":"bad_args","detail":"unknown argument: %s"}\n' "$1"; exit 1 ;;
+    --cwd)
+      [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--cwd requires a value"}\n'; exit 1; }
+      CWD="$2"; shift 2 ;;
+    --uncommitted)
+      if [ -n "$SCOPE" ]; then
+        printf '{"ok":false,"reason":"bad_args","detail":"only one of --uncommitted/--base/--commit allowed, already set to %s"}\n' "$SCOPE"
+        exit 1
+      fi
+      SCOPE="uncommitted"; shift ;;
+    --base)
+      [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--base requires a value"}\n'; exit 1; }
+      if [ -n "$SCOPE" ]; then
+        printf '{"ok":false,"reason":"bad_args","detail":"only one of --uncommitted/--base/--commit allowed, already set to %s"}\n' "$SCOPE"
+        exit 1
+      fi
+      SCOPE="base"; SCOPE_VALUE="$2"; shift 2 ;;
+    --commit)
+      [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--commit requires a value"}\n'; exit 1; }
+      if [ -n "$SCOPE" ]; then
+        printf '{"ok":false,"reason":"bad_args","detail":"only one of --uncommitted/--base/--commit allowed, already set to %s"}\n' "$SCOPE"
+        exit 1
+      fi
+      SCOPE="commit"; SCOPE_VALUE="$2"; shift 2 ;;
+    --focus)
+      [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--focus requires a value"}\n'; exit 1; }
+      FOCUS="$2"; shift 2 ;;
+    --timeout)
+      [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--timeout requires a value"}\n'; exit 1; }
+      TIMEOUT_SECS="$2"; shift 2 ;;
+    *)
+      printf '{"ok":false,"reason":"bad_args","detail":"unknown argument: %s"}\n' "$1"
+      exit 1 ;;
   esac
 done
 
-if [ -z "$CWD" ] || [ -z "$SCOPE_FLAGS" ]; then
+if [ -z "$CWD" ] || [ -z "$SCOPE" ]; then
   printf '{"ok":false,"reason":"bad_args","detail":"require --cwd and exactly one of --uncommitted/--base/--commit"}\n'
   exit 1
 fi
 
+# Gather the diff ourselves. codex exec review does not honor --output-schema
+# (see design doc's Revision section) -- so we never call the review
+# subcommand; we build the diff and the JSON-shape instruction ourselves and
+# send both to generic `codex exec`, which DOES follow an explicit in-prompt
+# instruction (live-verified earlier in this project).
+case "$SCOPE" in
+  uncommitted) DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff HEAD 2>&1)" ;;
+  base)        DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff "${SCOPE_VALUE}...HEAD" 2>&1)" ;;
+  commit)      DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git show "$SCOPE_VALUE" 2>&1)" ;;
+esac
+GIT_STATUS=$?
+
+if [ "$GIT_STATUS" -ne 0 ]; then
+  FIRST_LINE="$(printf '%s' "$DIFF_TEXT" | head -1 | sed 's/"/\\"/g')"
+  printf '{"ok":false,"reason":"git_error","detail":"git command failed for scope %s: %s"}\n' "$SCOPE" "$FIRST_LINE"
+  exit 1
+fi
+
+if [ -z "$DIFF_TEXT" ]; then
+  printf '{"ok":true,"verdict":{"verdict":"CLEAN","findings":[]}}\n'
+  exit 0
+fi
+
+PROMPT_FILE="$(mktemp)"
+{
+  echo "Review the following git diff for correctness bugs, security issues, and reuse/simplification opportunities."
+  if [ -n "$FOCUS" ]; then
+    echo "Additional focus: $FOCUS"
+  fi
+  echo ""
+  echo "Respond with ONLY valid JSON matching this exact shape, no prose, no markdown code fences:"
+  echo '{"verdict": "CLEAN or ISSUES", "findings": [{"file": "path", "line": optional integer, "severity": "optional string", "summary": "string", "evidence": "string"}], "summary": "optional string"}'
+  echo ""
+  echo "Diff:"
+  echo "$DIFF_TEXT"
+} > "$PROMPT_FILE"
+
 EVENTLOG="$(mktemp)"
 OUTFILE="$(mktemp)"
 
+set -m
 (
   cd "$CWD" || exit 127
-  # shellcheck disable=SC2086
-  codex exec review --ephemeral --sandbox read-only --skip-git-repo-check --json \
+  codex exec --ephemeral --sandbox read-only --skip-git-repo-check --json \
     --output-schema "$SCHEMA" --output-last-message "$OUTFILE" \
-    $SCOPE_FLAGS "$FOCUS" < /dev/null > "$EVENTLOG" 2>&1
+    < "$PROMPT_FILE" > "$EVENTLOG" 2>&1
 ) &
 CODEX_PID=$!
 
@@ -340,9 +412,14 @@ TIMED_OUT=0
 while kill -0 "$CODEX_PID" 2>/dev/null; do
   if [ "$SECONDS" -ge "$DEADLINE" ]; then
     TIMED_OUT=1
-    kill -TERM "$CODEX_PID" 2>/dev/null
+    # Negative PID kills the whole process group, not just the top PID --
+    # `codex` is a Node wrapper that spawns the real review process (and an
+    # MCP host) as children, so a single-PID kill leaves them orphaned and
+    # still running a live API call. `set -m` above gives the backgrounded
+    # job its own process group so this works.
+    kill -TERM -"$CODEX_PID" 2>/dev/null
     sleep 2
-    kill -KILL "$CODEX_PID" 2>/dev/null
+    kill -KILL -"$CODEX_PID" 2>/dev/null
     break
   fi
   sleep 1
@@ -350,8 +427,10 @@ done
 wait "$CODEX_PID" 2>/dev/null
 EXIT_CODE=$?
 
+rm -f "$PROMPT_FILE"
+
 if [ "$TIMED_OUT" -eq 1 ]; then
-  printf '{"ok":false,"reason":"timeout","detail":"codex exec review exceeded %ss"}\n' "$TIMEOUT_SECS"
+  printf '{"ok":false,"reason":"timeout","detail":"codex exec exceeded %ss"}\n' "$TIMEOUT_SECS"
   rm -f "$EVENTLOG" "$OUTFILE"
   exit 1
 fi
@@ -362,6 +441,13 @@ rm -f "$EVENTLOG" "$OUTFILE"
 exit $RESULT
 ```
 
+Note on `judge_result`'s shape check vs. the full JSON Schema: the schema additionally declares
+`"additionalProperties": false` and types `line` as `integer`/`severity` as `string` when present.
+`judge_result`'s jq check (Task 2) only verifies the `required` fields' presence, not the optional
+fields' types or the absence of extra properties — this is a deliberate, accepted simplification
+(defense-in-depth on top of the prompt's explicit instruction, not the sole correctness mechanism),
+not a gap to fix in this task.
+
 - [ ] **Step 2: Re-run the selftest to make sure argument parsing didn't break it**
 
 ```bash
@@ -369,33 +455,52 @@ exit $RESULT
 ```
 Expected: `run-codex-review.sh: selftest OK` (the `--selftest` branch still returns before touching any of the new argument-parsing code).
 
-- [ ] **Step 3: Live smoke test against a real `codex exec review` call**
+- [ ] **Step 3: Free, no-API-cost test of the empty-diff short-circuit**
 
-This costs a real Codex API call — run it once to prove the whole pipeline works end-to-end, not as part of the automated selftest.
+```bash
+cd /Users/hmc7279235/Work/Develop/plugins
+git status --short   # confirm clean, or this test isn't meaningful right now
+/Users/hmc7279235/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh \
+  --cwd /Users/hmc7279235/Work/Develop/plugins --uncommitted
+```
+Expected (only if `git status --short` was empty): `{"ok":true,"verdict":{"verdict":"CLEAN","findings":[]}}`, exit 0, instantly (no API call made — confirm this by timing it; it should take well under a second, not several seconds like a real API round trip).
+
+- [ ] **Step 4: Live smoke test against a real `codex exec` call with a guaranteed real diff**
+
+This costs a real Codex API call — run it once to prove the whole pipeline works end-to-end against
+actual content, not as part of the automated selftest. Use `--base` against a commit that predates
+this feature's own changes, so there is guaranteed real diff content regardless of working-tree
+state:
 
 ```bash
 cd /Users/hmc7279235/Work/Develop/plugins
 /Users/hmc7279235/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh \
   --cwd /Users/hmc7279235/Work/Develop/plugins \
-  --uncommitted \
-  --focus "This is a smoke test. If there are no staged/unstaged changes, just return verdict CLEAN with an empty findings array." \
-  --timeout 120
+  --base aacd77e \
+  --focus "This is a smoke test of the review pipeline itself. Review normally, but keep your response brief." \
+  --timeout 300
 ```
-Expected: exit code 0, stdout is one line of JSON: `{"ok":true,"verdict":{"verdict":"CLEAN","findings":[]}}` (or `ISSUES` with real findings, if the working tree happens to have uncommitted changes at test time — either is a pass, as long as `"ok":true` and the shape matches). If it prints `"ok":false`, read the `reason`/`detail` field — it tells you exactly which of the six failure modes fired; fix the underlying cause (not the check) before moving on.
+Expected: exit code 0, stdout is one line of JSON starting `{"ok":true,"verdict":{"verdict":...`. If
+it prints `"ok":false"`, read the `reason`/`detail` field — it tells you which failure mode fired
+(`git_error`, `timeout`, or one of `judge_result`'s five reasons from Task 2) — fix the underlying
+cause (not the check) before moving on. Do not repeat this call speculatively if it succeeds; if it
+fails, diagnose from the `reason`/`detail` and the raw `$EVENTLOG`/`$OUTFILE` content (temporarily
+add a debug-copy of both to a fixed `/tmp` path before their `rm -f`, inspect, then revert the
+debug line) before trying again — don't guess-and-rerun.
 
-- [ ] **Step 4: Confirm no lingering process**
+- [ ] **Step 5: Confirm no lingering process**
 
 ```bash
 ps aux | grep -i codex | grep -v grep
 ```
-Expected: no output (matches the same check done manually earlier in this project — a fresh, ephemeral run leaves nothing behind).
+Expected: no output.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 cd /Users/hmc7279235/Work/Develop/plugins
 git add codex-direct-review/scripts/run-codex-review.sh
-git commit -m "Implement real codex exec review invocation with wall-clock timeout"
+git commit -m "Implement real codex exec invocation: self-gathered diff, hand-built prompt, timeout"
 ```
 
 ---
