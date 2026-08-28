@@ -12,6 +12,12 @@
       "description": "Back up durable memory and in-progress session state before /clear, then auto-restore the handoff note right after.",
       "source": "./clear-prep",
       "category": "productivity"
+    },
+    {
+      "name": "codex-direct-review",
+      "description": "Run a Codex CLI review as a fresh, one-shot process (codex exec review) — no shared broker, no silent failures.",
+      "source": "./codex-direct-review",
+      "category": "productivity"
     }
   ]
 }
