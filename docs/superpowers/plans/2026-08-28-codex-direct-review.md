@@ -117,7 +117,7 @@ git commit -m "Scaffold codex-direct-review plugin"
 - Create: `codex-direct-review/scripts/run-codex-review.sh`
 
 **Interfaces:**
-- Produces: `judge_result(exit_code, eventlog_path, outfile_path, schema_path)` — a Bash function inside `run-codex-review.sh` that prints one JSON line to stdout (`{"ok":true,"verdict":{...}}` or `{"ok":false,"reason":"...","detail":"..."}`) and returns 0/1 accordingly, given an *already-finished* run's exit code and output files. `judge_result` itself only ever sets `reason` to one of: `nonzero_exit`, `missing_turn_completed`, `empty_output`, `invalid_json`, `schema_mismatch` — it has no concept of wall-clock time. `timeout` (Task 3) and `bad_args` (Task 3) are reasons the *wrapper script* prints directly, before/without calling `judge_result` at all, since a timed-out or never-started run has no finished exit code or output files to judge.
+- Produces: `judge_result(exit_code, eventlog_path, outfile_path)` — a Bash function inside `run-codex-review.sh` that prints one JSON line to stdout (`{"ok":true,"verdict":{...}}` or `{"ok":false,"reason":"...","detail":"..."}`) and returns 0/1 accordingly, given an *already-finished* run's exit code and output files. It has no `schema_path` parameter: the shape check is a hand-written `jq` boolean expression (kept in sync with the schema file by hand, not by loading it), so there's nothing for the function itself to do with the schema file's path. `judge_result` itself only ever sets `reason` to one of: `nonzero_exit`, `missing_turn_completed`, `empty_output`, `invalid_json`, `schema_mismatch` — it has no concept of wall-clock time. `timeout` (Task 3) and `bad_args` (Task 3) are reasons the *wrapper script* prints directly, before/without calling `judge_result` at all, since a timed-out or never-started run has no finished exit code or output files to judge. The `$SCHEMA` path variable is still used in Task 3, but only as the `--output-schema` argument to `codex exec review` itself, not as an argument to `judge_result`.
 - Consumes: nothing from earlier tasks (this is the first real logic).
 
 - [ ] **Step 1: Write the schema file**
@@ -165,7 +165,7 @@ DEFAULT_TIMEOUT_SECS=300
 # judge_result: given a finished run's exit code and output files, decide
 # ok/not-ok. Prints exactly one JSON line to stdout. Returns 0 if ok, 1 if not.
 judge_result() {
-  local exit_code="$1" eventlog="$2" outfile="$3" schema="$4"
+  local exit_code="$1" eventlog="$2" outfile="$3"
 
   if [ "$exit_code" -ne 0 ]; then
     printf '{"ok":false,"reason":"nonzero_exit","detail":"codex exec review exited %s"}\n' "$exit_code"
@@ -208,31 +208,31 @@ run_selftest() {
   # Case 1: good result -> ok:true
   echo '{"type":"turn.completed","usage":{}}' > "$tmp/good.jsonl"
   echo '{"verdict":"CLEAN","findings":[]}' > "$tmp/good.json"
-  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/good.json" "$SCHEMA")"
+  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/good.json")"
   echo "$out" | jq -e '.ok == true' >/dev/null 2>&1 || { echo "FAIL: good case: $out"; fail=1; }
 
   # Case 2: nonzero exit
-  out="$(judge_result 1 "$tmp/good.jsonl" "$tmp/good.json" "$SCHEMA")"
+  out="$(judge_result 1 "$tmp/good.jsonl" "$tmp/good.json")"
   echo "$out" | jq -e '.reason == "nonzero_exit"' >/dev/null 2>&1 || { echo "FAIL: nonzero_exit case: $out"; fail=1; }
 
   # Case 3: missing turn.completed
   echo '{"type":"turn.started"}' > "$tmp/no_complete.jsonl"
-  out="$(judge_result 0 "$tmp/no_complete.jsonl" "$tmp/good.json" "$SCHEMA")"
+  out="$(judge_result 0 "$tmp/no_complete.jsonl" "$tmp/good.json")"
   echo "$out" | jq -e '.reason == "missing_turn_completed"' >/dev/null 2>&1 || { echo "FAIL: missing_turn_completed case: $out"; fail=1; }
 
   # Case 4: empty output file
   : > "$tmp/empty.json"
-  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/empty.json" "$SCHEMA")"
+  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/empty.json")"
   echo "$out" | jq -e '.reason == "empty_output"' >/dev/null 2>&1 || { echo "FAIL: empty_output case: $out"; fail=1; }
 
   # Case 5: invalid JSON
   echo 'not json' > "$tmp/bad.json"
-  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/bad.json" "$SCHEMA")"
+  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/bad.json")"
   echo "$out" | jq -e '.reason == "invalid_json"' >/dev/null 2>&1 || { echo "FAIL: invalid_json case: $out"; fail=1; }
 
   # Case 6: valid JSON, wrong shape (Codex's own flagged risk)
   echo '{"verdict":"MAYBE","findings":"not-an-array"}' > "$tmp/wrong_shape.json"
-  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/wrong_shape.json" "$SCHEMA")"
+  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/wrong_shape.json")"
   echo "$out" | jq -e '.reason == "schema_mismatch"' >/dev/null 2>&1 || { echo "FAIL: schema_mismatch case: $out"; fail=1; }
 
   rm -rf "$tmp"
@@ -356,7 +356,7 @@ if [ "$TIMED_OUT" -eq 1 ]; then
   exit 1
 fi
 
-judge_result "$EXIT_CODE" "$EVENTLOG" "$OUTFILE" "$SCHEMA"
+judge_result "$EXIT_CODE" "$EVENTLOG" "$OUTFILE"
 RESULT=$?
 rm -f "$EVENTLOG" "$OUTFILE"
 exit $RESULT
