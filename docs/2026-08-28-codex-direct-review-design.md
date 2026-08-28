@@ -24,20 +24,52 @@ Because the broker/app-server process is shared and long-lived (confirmed via `p
 running continuously since before this session started), a bad state from one review can carry
 into the next.
 
+## Revision (2026-08-28, during implementation — corrects a wrong claim below)
+
+**`codex exec review` does not honor `--output-schema`.** This was discovered during Task 3's
+implementation, via three real live `codex exec review` calls (two against an empty diff, one
+against a real 845-insertion diff via `--base`). The third call proved codex genuinely performed a
+thorough, correct review — it read repo files, ran `git diff`, even executed our own script to
+reproduce a bug — but returned the result as **prose**, not JSON, regardless of `--output-schema`.
+This directly contradicts the "Codex confirmed... it respects `--output-schema` correctly" claim in
+the bullet list right below, which was Codex's own (wrong) answer to a design-validation question
+asked before any live testing of the `review` subcommand specifically happened.
+
+**Corrected decision:** use generic `codex exec` (no `review` subcommand) with a hand-built prompt
+that (a) embeds a diff we gather ourselves via `git diff`/`git diff <base>...HEAD`/`git show <sha>`
+and (b) explicitly instructs the model to respond with only JSON in the target shape. This exact
+pattern — generic `codex exec` + an explicit in-prompt instruction of the desired JSON shape — was
+live-verified working, twice, during this project's own initial research (see the "What I verified
+live" section of this doc's history / the implementation plan's Task 3): a plain `"Reply with
+exactly PONG"` prompt, and a `"Return verdict CLEAN with an empty findings array"` prompt against a
+`{verdict, findings}` schema, both returned exactly the requested content. The `review` subcommand's
+own diff-gathering convenience (`--uncommitted`/`--base`/`--commit`) is replaced by doing the
+equivalent `git diff` ourselves — no new dependency, and it removes an entire class of arg-parsing
+conflicts the `review` subcommand had (a positional prompt is unconditionally incompatible with its
+scope flags in codex-cli 0.146.0, which was a separate bug found in the same investigation).
+
+The wrapper's own CLI surface (`--cwd`, `--uncommitted`/`--base`/`--commit`, `--focus`, `--timeout`)
+is unchanged — only what happens *inside* the wrapper changes. `/cc` and `/codex-review` (Components
+3 and 4 below) are unaffected by this revision.
+
 ## Decision
 
-Replace only `/cc`'s "call Codex" step with a direct, one-shot invocation of the Codex CLI's own
-`codex exec review` subcommand — bypassing the `openai-codex` plugin's broker entirely for this
-path. Everything else in `/cc` (phases, round loop, convergence table, scope constraint, adversarial
-re-verification by Claude) is unchanged.
+Replace only `/cc`'s "call Codex" step with a direct, one-shot invocation of the Codex CLI —
+bypassing the `openai-codex` plugin's broker entirely for this path. Everything else in `/cc`
+(phases, round loop, convergence table, scope constraint, adversarial re-verification by Claude) is
+unchanged.
 
-### Why `codex exec review`, not the broker
+### Why direct `codex exec`, not the broker
 
-Verified live on this machine (codex-cli 0.146.0) and confirmed by Codex itself on request:
+Verified live on this machine (codex-cli 0.146.0). The bullet below about `codex exec review` and
+`--output-schema` was Codex's own answer to a design-validation question and turned out to be
+**wrong** — see the Revision section above for the corrected mechanism (generic `codex exec` + a
+hand-built prompt, not the `review` subcommand). The rest of this list still holds:
 
-- `codex exec review [--uncommitted | --base <branch> | --commit <sha>] "<focus text>"` is a
+- ~~`codex exec review [--uncommitted | --base <branch> | --commit <sha>] "<focus text>"` is a
   purpose-built, non-interactive, one-shot review command — Codex confirmed this (not a hand-rolled
-  `codex exec` prompt) is the correct subcommand, and that it respects `--output-schema` correctly.
+  `codex exec` prompt) is the correct subcommand, and that it respects `--output-schema` correctly.~~
+  **Wrong — see Revision above.** `codex exec review` ignores `--output-schema` and returns prose.
 - `--ephemeral` skips repo indexing/session persistence. Codex confirmed this doesn't degrade review
   quality (review doesn't depend on learned session state) — only a large-codebase indexing-cache
   speed tradeoff, not correctness.
