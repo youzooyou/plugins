@@ -3,7 +3,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA="$SCRIPT_DIR/../schemas/review-verdict.schema.json"
-DEFAULT_TIMEOUT_SECS=300
+DEFAULT_TIMEOUT_SECS=1800
 
 # judge_result: given a finished run's exit code and output files, decide
 # ok/not-ok. Prints exactly one JSON line to stdout. Returns 0 if ok, 1 if not.

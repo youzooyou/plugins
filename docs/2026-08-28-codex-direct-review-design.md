@@ -183,8 +183,9 @@ codex exec review --ephemeral --sandbox read-only --skip-git-repo-check --json \
   $SCOPE_FLAGS "$FOCUS_TEXT" < /dev/null > "$EVENTLOG" 2>&1 &
 CODEX_PID=$!
 ```
-- Enforce a **hard wall-clock timeout** (default 300s, per Codex's explicit recommendation — don't
-  rely on `turn.completed` absence alone). On timeout: kill the process tree, report failure.
+- Enforce a **hard wall-clock timeout** (default 1800s — raised from an original 300s after real
+  usage showed large-diff reviews legitimately taking 20+ minutes; see Open risks below). On
+  timeout: kill the process tree, report failure.
 - On normal exit, success requires **all three**:
   1. exit code 0
   2. `$EVENTLOG` contains a `"type":"turn.completed"` line
@@ -266,10 +267,13 @@ run directly...". Behavior:
 
 ## Open risks (carried forward, not blocking)
 
-- Codex flagged only MEDIUM confidence on "does a genuinely large diff review realistically finish
-  within a normal process lifetime" — the 300s timeout is a judgment call, not a guarantee reviews
-  never legitimately need longer. If real usage shows timeouts on large-but-legitimate reviews,
-  raise the timeout rather than treating it as a design failure.
+- **Resolved (2026-08-28):** Codex flagged only MEDIUM confidence on "does a genuinely large diff
+  review realistically finish within a normal process lifetime" — the original 300s timeout was a
+  judgment call, not a guarantee reviews never legitimately need longer. Real usage confirmed this:
+  large reviews (via the prior `codex-rescue` broker path) sometimes ran 20+ minutes depending on
+  scope. Default raised to 1800s (30 minutes) — comfortable margin above the observed max, still
+  bounded. The wrapper's `--timeout <seconds>` flag remains available to override per-call if a
+  future review needs even more.
 - **Superseded — see Revision above.** This bullet originally assumed `codex exec review`'s built-in
   scope flags could be trusted to gather target context, with the wrapper never re-implementing diff
   collection. The opposite is now true: the wrapper stopped trusting those flags specifically because

@@ -15,9 +15,10 @@
 - No new external dependencies (no `ajv`, no `python-jsonschema`, no `timeout`/`gtimeout`) — use `jq` (already present) and portable Bash for everything, including the wall-clock timeout (macOS has no built-in `timeout`/`gtimeout`; implement via a background-PID poll loop).
 - The wrapper script must **never print nothing** on failure — every failure path prints a `{"ok":false,"reason":"...","detail":"..."}` JSON object to stdout and exits non-zero.
 - `--sandbox read-only` is used on every `codex exec` invocation — this plugin never edits files.
-- Default timeout: 300 seconds per review round (per the spec's Codex-recommended value).
+- Default timeout: 1800 seconds per review round (raised from an original 300s on 2026-08-28 after
+  real usage showed large-diff reviews taking 20+ minutes — see the design doc's Open risks).
 - `main` branch of `youzooyou/plugins` is protected (PR required, 0 approvals needed — see repo settings). Every task's commit goes to a feature branch; merging via PR happens as its own explicit step, not silently bundled into a task.
-- File paths below are all relative to the `youzooyou/plugins` repo root (`/Users/hmc7279235/Work/Develop/plugins`) unless given as an absolute `~/.claude/...` path.
+- File paths below are all relative to the `youzooyou/plugins` repo root (`~/Work/Develop/plugins`) unless given as an absolute `~/.claude/...` path.
 
 ---
 
@@ -81,16 +82,16 @@ Read `.claude-plugin/marketplace.json` first (it currently lists only `clear-pre
 - [ ] **Step 3: Create the empty directory skeleton**
 
 ```bash
-mkdir -p /Users/hmc7279235/Work/Develop/plugins/codex-direct-review/scripts
-mkdir -p /Users/hmc7279235/Work/Develop/plugins/codex-direct-review/schemas
-mkdir -p /Users/hmc7279235/Work/Develop/plugins/codex-direct-review/skills/codex-review
+mkdir -p ~/Work/Develop/plugins/codex-direct-review/scripts
+mkdir -p ~/Work/Develop/plugins/codex-direct-review/schemas
+mkdir -p ~/Work/Develop/plugins/codex-direct-review/skills/codex-review
 ```
 
 - [ ] **Step 4: Validate JSON syntax**
 
 Run:
 ```bash
-cd /Users/hmc7279235/Work/Develop/plugins
+cd ~/Work/Develop/plugins
 jq empty codex-direct-review/.claude-plugin/plugin.json && echo "plugin.json OK"
 jq empty .claude-plugin/marketplace.json && echo "marketplace.json OK"
 jq '.plugins | length' .claude-plugin/marketplace.json
@@ -100,7 +101,7 @@ Expected: both print `OK`, and the length query prints `2`.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/hmc7279235/Work/Develop/plugins
+cd ~/Work/Develop/plugins
 git checkout -b feat/codex-direct-review-scaffold
 git add codex-direct-review/.claude-plugin/plugin.json .claude-plugin/marketplace.json
 git commit -m "Scaffold codex-direct-review plugin"
@@ -258,15 +259,15 @@ exit 1
 - [ ] **Step 3: Make it executable and run the selftest**
 
 ```bash
-chmod +x /Users/hmc7279235/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh
-/Users/hmc7279235/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh --selftest
+chmod +x ~/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh
+~/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh --selftest
 ```
 Expected: `run-codex-review.sh: selftest OK` and exit code 0. If any `FAIL:` lines print, fix `judge_result` (not the test) until all six cases pass — the six cases encode the exact failure modes from the spec's "Problem" section plus Codex's own flagged "valid JSON, wrong shape" risk, so don't loosen them.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/hmc7279235/Work/Develop/plugins
+cd ~/Work/Develop/plugins
 git add codex-direct-review/schemas/review-verdict.schema.json codex-direct-review/scripts/run-codex-review.sh
 git commit -m "Add review-verdict schema and judge_result logic with selftest"
 ```
@@ -451,17 +452,17 @@ not a gap to fix in this task.
 - [ ] **Step 2: Re-run the selftest to make sure argument parsing didn't break it**
 
 ```bash
-/Users/hmc7279235/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh --selftest
+~/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh --selftest
 ```
 Expected: `run-codex-review.sh: selftest OK` (the `--selftest` branch still returns before touching any of the new argument-parsing code).
 
 - [ ] **Step 3: Free, no-API-cost test of the empty-diff short-circuit**
 
 ```bash
-cd /Users/hmc7279235/Work/Develop/plugins
+cd ~/Work/Develop/plugins
 git status --short   # confirm clean, or this test isn't meaningful right now
-/Users/hmc7279235/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh \
-  --cwd /Users/hmc7279235/Work/Develop/plugins --uncommitted
+~/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh \
+  --cwd ~/Work/Develop/plugins --uncommitted
 ```
 Expected (only if `git status --short` was empty): `{"ok":true,"verdict":{"verdict":"CLEAN","findings":[]}}`, exit 0, instantly (no API call made — confirm this by timing it; it should take well under a second, not several seconds like a real API round trip).
 
@@ -473,9 +474,9 @@ this feature's own changes, so there is guaranteed real diff content regardless 
 state:
 
 ```bash
-cd /Users/hmc7279235/Work/Develop/plugins
-/Users/hmc7279235/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh \
-  --cwd /Users/hmc7279235/Work/Develop/plugins \
+cd ~/Work/Develop/plugins
+~/Work/Develop/plugins/codex-direct-review/scripts/run-codex-review.sh \
+  --cwd ~/Work/Develop/plugins \
   --base aacd77e \
   --focus "This is a smoke test of the review pipeline itself. Review normally, but keep your response brief." \
   --timeout 300
@@ -498,7 +499,7 @@ Expected: no output.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/hmc7279235/Work/Develop/plugins
+cd ~/Work/Develop/plugins
 git add codex-direct-review/scripts/run-codex-review.sh
 git commit -m "Implement real codex exec invocation: self-gathered diff, hand-built prompt, timeout"
 ```
@@ -568,7 +569,7 @@ cross-verification — this is the lightweight, single-shot version.
 - [ ] **Step 2: Validate the frontmatter parses**
 
 ```bash
-cd /Users/hmc7279235/Work/Develop/plugins
+cd ~/Work/Develop/plugins
 head -4 codex-direct-review/skills/codex-review/SKILL.md
 ```
 Expected: the three-dash-delimited YAML block with `name: codex-review` and a `description:` line — confirms no stray characters broke the frontmatter block before it reaches the closing `---`.
@@ -589,7 +590,7 @@ git commit -m "Add standalone /codex-review command"
 - [ ] **Step 1: Push the branch and open a PR**
 
 ```bash
-cd /Users/hmc7279235/Work/Develop/plugins
+cd ~/Work/Develop/plugins
 git push -u origin feat/codex-direct-review-scaffold
 ```
 Open the PR at the URL git prints, then merge it on GitHub (repo requires a PR — direct push to `main` is blocked by the branch protection ruleset set up earlier in this project).
@@ -597,7 +598,7 @@ Open the PR at the URL git prints, then merge it on GitHub (repo requires a PR �
 - [ ] **Step 2: Sync local `main` after merge**
 
 ```bash
-cd /Users/hmc7279235/Work/Develop/plugins
+cd ~/Work/Develop/plugins
 git checkout main
 git pull origin main
 git log --oneline -5
@@ -630,7 +631,7 @@ jq -r '.plugins["codex-direct-review@youzooyou-plugins"][] | select(.scope=="use
   ~/.claude/plugins/installed_plugins.json
 ```
 Expected: prints a real path like
-`/Users/hmc7279235/.claude/plugins/cache/youzooyou-plugins/codex-direct-review/1.0.0`. If empty,
+`~/.claude/plugins/cache/youzooyou-plugins/codex-direct-review/1.0.0`. If empty,
 the plugin isn't actually installed at `user` scope — re-run Step 3.
 
 - [ ] **Step 6: Live end-to-end test of `/codex-review`**
