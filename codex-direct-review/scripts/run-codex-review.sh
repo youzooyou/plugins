@@ -60,7 +60,23 @@ read_bounded() {
 # it closes the whole class of "forgot to register a new temp file for
 # cleanup" bug, not just today's specific instance.
 register_temp_file() {
-  [ -n "${TEMP_FILE_REGISTRY:-}" ] && printf '%s\n' "$1" >> "$TEMP_FILE_REGISTRY"
+  [ -n "${TEMP_FILE_REGISTRY:-}" ] && printf '%s\0' "$1" >> "$TEMP_FILE_REGISTRY"
+}
+
+# mktemp_registered -> creates a temp file via mktemp AND registers it for
+# cleanup in one call, printing its path. This does not fully close the gap
+# between file creation and registration (bash has no atomic
+# "create+register" primitive), but it removes the "a new mktemp call site
+# forgot to also call register_temp_file" failure mode entirely, and
+# narrows the residual race to one place instead of one per call site. The
+# residual risk -- at most one small leaked temp file, only if a signal
+# lands in this exact one-line-wide gap -- is accepted as proportional to
+# this being a local developer tool, not a hardened service.
+mktemp_registered() {
+  local f
+  f="$(mktemp)"
+  register_temp_file "$f"
+  printf '%s' "$f"
 }
 
 # is_binary_content FILE -> exit 0 if FILE contains any NUL byte, 1 otherwise.
@@ -137,8 +153,7 @@ format_untracked_entry() {
     # below ever gets a chance to run. This ONLY works because this
     # function is called directly (never via `$(...)`) -- see the block
     # comment above.
-    UNTRACKED_TMPOUT="$(mktemp)"
-    register_temp_file "$UNTRACKED_TMPOUT"
+    UNTRACKED_TMPOUT="$(mktemp_registered)"
     read_bounded "$path" "$UNTRACKED_TMPOUT" 3 1048576
     read_status=$?
     # Re-check identity after the read: the earlier -L/-f checks and this
@@ -443,37 +458,66 @@ run_selftest() {
   # which broke on_signal's cleanup visibility for READ_PID/UNTRACKED_TMPOUT
   # once already -- see their own function comments). Grep the script's own
   # source for that exact regression shape.
-  if grep -nE '\$\((collect_untracked_diff|format_untracked_entry)\b' "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
+  if grep -nE '\$\([[:space:]]*(collect_untracked_diff|format_untracked_entry)\b' "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
     echo "FAIL: found format_untracked_entry/collect_untracked_diff invoked via \$(...) -- this reintroduces the signal-cleanup regression, see their function comments"
     fail=1
   fi
 
   # Case 23: live signal-safety regression test. Confirms that when
   # read_bounded is invoked the SAME way format_untracked_entry invokes it
-  # (a direct call, global UNTRACKED_TMPOUT, no `$(...)` anywhere in the
+  # (a direct call, global UNTRACKED_TMPOUT, no $(...) anywhere in the
   # chain), an external SIGTERM to the enclosing process still correctly
   # kills the backgrounded `head`. This is the exact mechanism that broke
   # (orphaned `head`, confirmed via live SIGTERM reproduction during
-  # development) when these functions first communicated via `$(...)`
-  # instead of a file parameter.
+  # development) when these functions first communicated via $(...) instead
+  # of a file parameter.
+  #
+  # Process detection is scoped to THIS test's own child process tree via
+  # `pgrep -P` (direct children of case_signal_pid) rather than a global
+  # `pgrep -f`/`pkill -f` command-line pattern match -- an earlier revision
+  # used a global pattern match, which Codex correctly flagged as able to
+  # match (and pkill -KILL) an unrelated host process that happened to share
+  # the same command line. Waiting for the actual head child to appear
+  # (bounded by its own timeout, failing loudly if it never does) replaces a
+  # blind fixed sleep, which under system load could let SIGTERM arrive
+  # before read_bounded even started, silently passing without ever
+  # exercising a blocked read.
+  fifo_dir="$(mktemp -d)"
   (
-    trap 'kill -KILL "${READ_PID:-}" 2>/dev/null; rm -f "${UNTRACKED_TMPOUT:-}"; exit 1' TERM
-    fifo_dir="$(mktemp -d)"
-    mkfifo "$fifo_dir/blocking"
+    trap 'kill -KILL "${READ_PID:-}" 2>/dev/null; rm -f "${UNTRACKED_TMPOUT:-}"; rm -rf "${fifo_dir:-}"; exit 1' TERM
+    mkfifo "$fifo_dir/blocking" || exit 1
     UNTRACKED_TMPOUT="$(mktemp)"
     read_bounded "$fifo_dir/blocking" "$UNTRACKED_TMPOUT" 30 1048576
+    rm -rf "$fifo_dir"
   ) &
   case_signal_pid=$!
-  sleep 1
-  kill -TERM "$case_signal_pid" 2>/dev/null
-  sleep 1
-  if pgrep -f 'head -c 1048577' >/dev/null 2>&1; then
-    echo "FAIL: read_bounded left an orphaned head process after SIGTERM (signal-cleanup regression)"
+
+  head_pid=""
+  wait_deadline=$((SECONDS + 5))
+  while [ "$SECONDS" -lt "$wait_deadline" ]; do
+    head_pid="$(pgrep -P "$case_signal_pid" 2>/dev/null | head -1)"
+    [ -n "$head_pid" ] && break
+    sleep 0.1
+  done
+
+  if [ -z "$head_pid" ]; then
+    echo "FAIL: read_bounded's background head never started within 5s (cannot verify signal cleanup)"
     fail=1
+  else
+    kill -TERM "$case_signal_pid" 2>/dev/null
+    cleanup_deadline=$((SECONDS + 5))
+    while [ "$SECONDS" -lt "$cleanup_deadline" ] && kill -0 "$head_pid" 2>/dev/null; do
+      sleep 0.1
+    done
+    if kill -0 "$head_pid" 2>/dev/null; then
+      echo "FAIL: read_bounded left an orphaned head process (PID $head_pid) after SIGTERM (signal-cleanup regression)"
+      fail=1
+      kill -KILL "$head_pid" 2>/dev/null
+    fi
   fi
   kill -KILL "$case_signal_pid" 2>/dev/null
-  pkill -KILL -f 'head -c 1048577' 2>/dev/null
   wait "$case_signal_pid" 2>/dev/null
+  rm -rf "$fifo_dir"
 
   # --- enumerate_untracked_files: real git integration ---
 
@@ -603,18 +647,33 @@ on_signal() {
   for job_pid in $(jobs -p 2>/dev/null); do
     kill -KILL "$job_pid" 2>/dev/null
   done
-  # Sweep every temp file ever registered via register_temp_file, not a
-  # hand-maintained list -- see register_temp_file's own comment.
+  # Temp-file registry cleanup is handled by cleanup_temp_files, installed as
+  # an EXIT trap -- bash's EXIT pseudo-signal trap fires after this function's
+  # own `exit 1` below too, so it covers this path as well without this
+  # function sweeping the registry itself.
+  printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
+  exit 1
+}
+
+# cleanup_temp_files -> sweeps every temp file ever registered via
+# register_temp_file (global TEMP_FILE_REGISTRY) and removes the registry
+# file itself. Installed as an EXIT trap immediately after TEMP_FILE_REGISTRY
+# is created, so it fires on ANY script termination -- normal fall-through,
+# every explicit `exit` call anywhere in the script (the empty-diff CLEAN
+# shortcut, the git_error paths, the incomplete_collection path, the timeout
+# path, the final `exit $RESULT`), AND after on_signal's own `exit 1` (bash
+# runs the EXIT trap after a signal trap calls exit) -- replacing the need
+# for a hand-maintained list of `"${VAR:-}"` cleanup calls at every exit site.
+cleanup_temp_files() {
   if [ -n "${TEMP_FILE_REGISTRY:-}" ] && [ -f "$TEMP_FILE_REGISTRY" ]; then
-    while IFS= read -r reg_path; do
+    while IFS= read -r -d '' reg_path; do
       [ -n "$reg_path" ] && rm -f "$reg_path"
     done < "$TEMP_FILE_REGISTRY"
     rm -f "$TEMP_FILE_REGISTRY"
   fi
-  printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
-  exit 1
 }
 TEMP_FILE_REGISTRY="$(mktemp)"
+trap cleanup_temp_files EXIT
 trap on_signal INT TERM
 
 # Gather the diff ourselves. codex exec review does not honor --output-schema
@@ -638,8 +697,7 @@ esac
 # live on this machine) polluted DIFF_TEXT with non-diff text, which could
 # both defeat the empty-diff CLEAN shortcut and get sent to Codex as if it
 # were reviewable content.
-GIT_STDERR_FILE="$(mktemp)"
-register_temp_file "$GIT_STDERR_FILE"
+GIT_STDERR_FILE="$(mktemp_registered)"
 
 case "$SCOPE" in
   uncommitted)
@@ -663,8 +721,7 @@ case "$SCOPE" in
       # preceding `git diff` already succeeded so its old contents are no
       # longer needed) -- see enumerate_untracked_files above for why it must
       # stay separate from UNTRACKED_LIST_FILE.
-      UNTRACKED_LIST_FILE="$(mktemp)"
-      register_temp_file "$UNTRACKED_LIST_FILE"
+      UNTRACKED_LIST_FILE="$(mktemp_registered)"
       enumerate_untracked_files "$CWD" "$UNTRACKED_LIST_FILE" "$GIT_STDERR_FILE"
       UNTRACKED_LIST_STATUS=$?
       if [ "$UNTRACKED_LIST_STATUS" -ne 0 ]; then
@@ -680,8 +737,7 @@ case "$SCOPE" in
       # down) is even in effect. Called DIRECTLY (never via `$(...)`) so
       # read_bounded's READ_PID and format_untracked_entry's UNTRACKED_TMPOUT
       # stay visible to on_signal in THIS process, not a forked subshell.
-      UNTRACKED_DIFF_FILE="$(mktemp)"
-      register_temp_file "$UNTRACKED_DIFF_FILE"
+      UNTRACKED_DIFF_FILE="$(mktemp_registered)"
       collect_untracked_diff "$CWD" "$UNTRACKED_LIST_FILE" 30 "$UNTRACKED_DIFF_FILE"
       UNTRACKED_COLLECTION_STATUS=$?
       DIFF_TEXT="$DIFF_TEXT$(cat "$UNTRACKED_DIFF_FILE" 2>/dev/null)"
@@ -736,8 +792,7 @@ fi
 # can't be pre-guessed and embedded in a crafted diff ahead of time.
 BOUNDARY="DIFF_$$_${RANDOM}${RANDOM}"
 
-PROMPT_FILE="$(mktemp)"
-register_temp_file "$PROMPT_FILE"
+PROMPT_FILE="$(mktemp_registered)"
 {
   echo "Review the following git diff for correctness bugs, security issues, and reuse/simplification opportunities."
   if [ -n "$FOCUS" ]; then
@@ -762,10 +817,8 @@ register_temp_file "$PROMPT_FILE"
   echo "</$BOUNDARY>"
 } > "$PROMPT_FILE"
 
-EVENTLOG="$(mktemp)"
-register_temp_file "$EVENTLOG"
-OUTFILE="$(mktemp)"
-register_temp_file "$OUTFILE"
+EVENTLOG="$(mktemp_registered)"
+OUTFILE="$(mktemp_registered)"
 
 set -m
 (
