@@ -482,6 +482,31 @@ run_selftest() {
   # blind fixed sleep, which under system load could let SIGTERM arrive
   # before read_bounded even started, silently passing without ever
   # exercising a blocked read.
+  # Send TERM first (giving case_signal_pid's own trap a chance to clean up
+  # its READ_PID/UNTRACKED_TMPOUT/fifo_dir) and only escalate to KILL if it
+  # doesn't die promptly -- an earlier revision jumped straight to KILL in
+  # the "head never started" fail path, which bypasses a TERM-only trap
+  # entirely (SIGKILL is never catchable) and could leave BOTH a leaked
+  # temp file and a genuinely orphaned `head` process that nothing is left
+  # alive to ever clean up. Same TERM-then-KILL idiom this file already
+  # uses for CODEX_PID below.
+  terminate_case23_subshell() {
+    [ -n "${case_signal_pid:-}" ] || return 0
+    kill -TERM "$case_signal_pid" 2>/dev/null
+    local deadline=$((SECONDS + 2))
+    while [ "$SECONDS" -lt "$deadline" ] && kill -0 "$case_signal_pid" 2>/dev/null; do
+      sleep 0.1
+    done
+    kill -KILL "$case_signal_pid" 2>/dev/null
+  }
+  # `--selftest` exits before the main script's own on_signal/trap setup
+  # ever runs, so without this, an external INT/TERM to the whole
+  # `--selftest` invocation while Case 23 is mid-flight has nothing to
+  # clean up case_signal_pid or its background `head` at all -- live
+  # confirmed with a parent-only SIGTERM leaving the child running. Scoped
+  # tightly to this case and restored right after.
+  trap 'terminate_case23_subshell; for j in $(jobs -p 2>/dev/null); do kill -KILL "$j" 2>/dev/null; done; exit 1' INT TERM
+
   fifo_dir="$(mktemp -d)"
   (
     trap 'kill -KILL "${READ_PID:-}" 2>/dev/null; rm -f "${UNTRACKED_TMPOUT:-}"; rm -rf "${fifo_dir:-}"; exit 1' TERM
@@ -515,9 +540,10 @@ run_selftest() {
       kill -KILL "$head_pid" 2>/dev/null
     fi
   fi
-  kill -KILL "$case_signal_pid" 2>/dev/null
+  terminate_case23_subshell
   wait "$case_signal_pid" 2>/dev/null
   rm -rf "$fifo_dir"
+  trap - INT TERM
 
   # --- enumerate_untracked_files: real git integration ---
 
@@ -666,7 +692,15 @@ on_signal() {
 # for a hand-maintained list of `"${VAR:-}"` cleanup calls at every exit site.
 cleanup_temp_files() {
   if [ -n "${TEMP_FILE_REGISTRY:-}" ] && [ -f "$TEMP_FILE_REGISTRY" ]; then
-    while IFS= read -r -d '' reg_path; do
+    # `|| [ -n "$reg_path" ]` -- `read -d ''` returns non-zero (loop-body
+    # skipping) failure when it hits EOF without a final NUL delimiter, but
+    # STILL populates reg_path with whatever partial data it read. Without
+    # this, a registry whose very last entry lost its trailing NUL (e.g. a
+    # signal landing mid-write inside register_temp_file's own `printf`)
+    # would have that last path silently skipped and then the whole
+    # registry deleted anyway, leaking that one temp file. Live-verified
+    # with a hand-built unterminated registry entry.
+    while IFS= read -r -d '' reg_path || [ -n "$reg_path" ]; do
       [ -n "$reg_path" ] && rm -f "$reg_path"
     done < "$TEMP_FILE_REGISTRY"
     rm -f "$TEMP_FILE_REGISTRY"
