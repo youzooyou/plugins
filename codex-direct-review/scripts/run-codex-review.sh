@@ -304,6 +304,7 @@ case "$SCOPE" in
       # otherwise still add up to a long delay before the main --timeout
       # deadline (set up much further down) is even in effect.
       UNTRACKED_LOOP_DEADLINE=$((SECONDS + 30))
+      UNTRACKED_COLLECTION_INCOMPLETE=0
       # Use -z (NUL-delimited) output: git C-quotes unusual filenames
       # (non-ASCII, tabs, quotes, newlines) in its normal output, which a
       # plain line-based read would otherwise treat as a literal (wrong,
@@ -311,8 +312,12 @@ case "$SCOPE" in
       while IFS= read -r -d '' UNTRACKED_FILE; do
         [ -n "$UNTRACKED_FILE" ] || continue
         if [ "$SECONDS" -ge "$UNTRACKED_LOOP_DEADLINE" ]; then
-          DIFF_TEXT="$DIFF_TEXT
---- untracked-file collection stopped after a 30s aggregate budget; remaining untracked files not examined ---"
+          # Record this as a genuine failure, not just a note appended to
+          # DIFF_TEXT -- an earlier revision only left a marker and kept
+          # going, which could still reach a real CLEAN verdict despite
+          # never having examined every untracked file --uncommitted
+          # promises to cover. Checked right after the loop, below.
+          UNTRACKED_COLLECTION_INCOMPLETE=1
           break
         fi
         if [ -L "$CWD/$UNTRACKED_FILE" ]; then
@@ -348,6 +353,18 @@ case "$SCOPE" in
           elif [ -z "$UNTRACKED_SIZE" ] || [ "$UNTRACKED_SIZE" -gt 1048576 ]; then
             DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE (over 1MB cap or unreadable; contents omitted) ---"
+          elif od -An -tx1 "$UNTRACKED_TMPOUT" 2>/dev/null | tr -d ' \n' | grep -q '00'; then
+            # `$(cat ...)` (bash command substitution) silently drops NUL
+            # bytes -- verified live, on this exact bash, that it turns
+            # "left\0right" into "leftright" rather than preserving it.
+            # Embedding a binary file's content this way wouldn't just be
+            # unreadable, it would be quietly corrupted with no signal that
+            # anything was lost. Detect any NUL byte via `od` (a plain text
+            # scan, doesn't route the content through a bash variable) and
+            # skip embedding, matching how `git diff` itself represents a
+            # binary file (a marker, not corrupted "text").
+            DIFF_TEXT="$DIFF_TEXT
+--- new untracked file: $UNTRACKED_FILE (binary content; not embedded as text) ---"
           else
             DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE ---
@@ -365,6 +382,11 @@ $(cat "$UNTRACKED_TMPOUT" 2>/dev/null)"
         fi
       done < "$UNTRACKED_LIST_FILE"
       rm -f "$UNTRACKED_LIST_FILE"
+      if [ "$UNTRACKED_COLLECTION_INCOMPLETE" -eq 1 ]; then
+        rm -f "$GIT_STDERR_FILE"
+        printf '{"ok":false,"reason":"incomplete_collection","detail":"untracked-file collection exceeded its 30s aggregate budget; --uncommitted scope was not fully examined"}\n'
+        exit 1
+      fi
     fi
     ;;
   base)
