@@ -1,7 +1,7 @@
 {
   "name": "clear-prep",
-  "version": "1.0.3",
-  "description": "Back up durable memory and in-progress session state before /clear, then auto-restore the handoff note right after.",
+  "version": "1.0.5",
+  "description": "Run /clear-prep before /clear to back up durable memory and in-progress session state; a bundled hook then auto-restores the handoff note right after.",
   "author": {
     "name": "youzooyou",
     "url": "https://github.com/youzooyou"
