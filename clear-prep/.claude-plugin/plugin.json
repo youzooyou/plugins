@@ -1,6 +1,6 @@
 {
   "name": "clear-prep",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Back up durable memory and in-progress session state before /clear, then auto-restore the handoff note right after.",
   "author": {
     "name": "youzooyou",

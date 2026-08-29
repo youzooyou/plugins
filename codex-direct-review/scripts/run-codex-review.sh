@@ -5,6 +5,36 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA="$SCRIPT_DIR/../schemas/review-verdict.schema.json"
 DEFAULT_TIMEOUT_SECS=1800
 
+# Portable inode lookup: GNU stat's `-c%i` (Linux) falls back to BSD stat's
+# `-f%i` (macOS) -- a bare `stat -f%i` silently fails on Linux (its stderr
+# discarded elsewhere), which would make every regular untracked file look
+# unreadable there despite --uncommitted's documented scope.
+get_inode() {
+  stat -c%i "$1" 2>/dev/null || stat -f%i "$1" 2>/dev/null
+}
+
+# Read a path bounded by wall-clock time, not just a size check performed
+# beforehand -- checking size/type on the path first can itself hang if the
+# path is swapped for a FIFO between that check and the read. This reads
+# into a temp file under a short timeout so a swapped-in FIFO gets killed
+# rather than blocking the whole review (which runs before the main
+# --timeout deadline further down even applies).
+read_bounded() {
+  local path="$1" out_file="$2" timeout_secs="${3:-3}"
+  ( cat "$path" > "$out_file" 2>/dev/null ) &
+  local read_pid=$!
+  local deadline=$((SECONDS + timeout_secs))
+  while kill -0 "$read_pid" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      kill -KILL "$read_pid" 2>/dev/null
+      wait "$read_pid" 2>/dev/null
+      return 124
+    fi
+    sleep 0.1
+  done
+  wait "$read_pid" 2>/dev/null
+}
+
 # judge_result: given a finished run's exit code and output files, decide
 # ok/not-ok. Prints exactly one JSON line to stdout. Returns 0 if ok, 1 if not.
 judge_result() {
@@ -219,42 +249,39 @@ case "$SCOPE" in
           DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE (symlink -> $LINK_TARGET; target contents not read) ---"
         elif [ -f "$CWD/$UNTRACKED_FILE" ]; then
-          # Check size before reading (avoids buffering an unbounded amount
-          # of content into memory/the prompt) and check cat's own exit
-          # status -- an unreadable (permission-denied) or raced (deleted
-          # mid-loop) file previously degraded silently to an empty content
-          # block, letting a review pass CLEAN without ever having actually
-          # seen that file.
-          UNTRACKED_SIZE="$(wc -c < "$CWD/$UNTRACKED_FILE" 2>/dev/null | tr -d ' ')"
-          UNTRACKED_INODE_BEFORE="$(stat -f%i "$CWD/$UNTRACKED_FILE" 2>/dev/null)"
-          if [ -z "$UNTRACKED_SIZE" ] || [ -z "$UNTRACKED_INODE_BEFORE" ]; then
+          # Bounded-time read (see read_bounded above) rather than a size
+          # check performed before reading -- an earlier revision checked
+          # size/type on the path first, but that check itself could hang if
+          # the path was swapped for a FIFO in the window before it ran.
+          # Reading into a temp file under a short timeout, then checking
+          # the temp file's size, avoids ever blocking on the live path.
+          UNTRACKED_INODE_BEFORE="$(get_inode "$CWD/$UNTRACKED_FILE")"
+          UNTRACKED_TMPOUT="$(mktemp)"
+          read_bounded "$CWD/$UNTRACKED_FILE" "$UNTRACKED_TMPOUT" 3
+          READ_STATUS=$?
+          # Re-check identity after the read: the earlier -L/-f checks and
+          # this read are separate operations on the same path, with a
+          # window between them where the path could be swapped for a
+          # symlink or a different file (classic check-then-use race). Bash
+          # has no portable no-follow-open primitive, so this detects a swap
+          # after the fact (via inode + re-checked -L) rather than
+          # preventing it outright -- proportional to this being a local
+          # developer tool, not a hardened multi-tenant service.
+          UNTRACKED_INODE_AFTER="$(get_inode "$CWD/$UNTRACKED_FILE")"
+          UNTRACKED_SIZE="$(wc -c < "$UNTRACKED_TMPOUT" 2>/dev/null | tr -d ' ')"
+          if [ "$READ_STATUS" -ne 0 ] || [ -z "$UNTRACKED_INODE_BEFORE" ] || \
+             [ -L "$CWD/$UNTRACKED_FILE" ] || [ "$UNTRACKED_INODE_AFTER" != "$UNTRACKED_INODE_BEFORE" ]; then
             DIFF_TEXT="$DIFF_TEXT
---- new untracked file: $UNTRACKED_FILE (could not be read; contents omitted) ---"
-          elif [ "$UNTRACKED_SIZE" -gt 1048576 ]; then
-            DIFF_TEXT="$DIFF_TEXT
---- new untracked file: $UNTRACKED_FILE (${UNTRACKED_SIZE} bytes, over 1MB cap; contents omitted) ---"
-          else
-            UNTRACKED_CONTENT="$(cat "$CWD/$UNTRACKED_FILE" 2>/dev/null)"
-            CAT_STATUS=$?
-            # Re-check identity after the read: the earlier -L/-f/size checks
-            # and this cat are separate operations on the same path, with a
-            # window between them where the path could be swapped for a
-            # symlink or a different file (classic check-then-use race).
-            # Bash has no portable no-follow-open primitive, so this detects
-            # a swap after the fact (via inode + re-checked -L) rather than
-            # preventing it outright -- proportional to this being a local
-            # developer tool, not a hardened multi-tenant service.
-            UNTRACKED_INODE_AFTER="$(stat -f%i "$CWD/$UNTRACKED_FILE" 2>/dev/null)"
-            if [ "$CAT_STATUS" -ne 0 ] || [ -L "$CWD/$UNTRACKED_FILE" ] || \
-               [ "$UNTRACKED_INODE_AFTER" != "$UNTRACKED_INODE_BEFORE" ]; then
-              DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE (could not be safely read; contents omitted) ---"
-            else
-              DIFF_TEXT="$DIFF_TEXT
+          elif [ -z "$UNTRACKED_SIZE" ] || [ "$UNTRACKED_SIZE" -gt 1048576 ]; then
+            DIFF_TEXT="$DIFF_TEXT
+--- new untracked file: $UNTRACKED_FILE (over 1MB cap or unreadable; contents omitted) ---"
+          else
+            DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE ---
-$UNTRACKED_CONTENT"
-            fi
+$(cat "$UNTRACKED_TMPOUT" 2>/dev/null)"
           fi
+          rm -f "$UNTRACKED_TMPOUT"
         else
           # Whitelist regular files only -- anything else (FIFO, device,
           # socket) is read here, not just symlinks. `cat` on an untracked
@@ -327,6 +354,12 @@ on_signal() {
     sleep 1
     kill -KILL -"$CODEX_PID" 2>/dev/null
   fi
+  # The timeout and normal-exit paths both clean up these temp files; this
+  # path must too, or a signal-interrupted run leaks them (found via a
+  # whole-file re-read after the fact, not the same round that added the
+  # trap itself -- exactly the kind of gap an isolated per-line diff review
+  # misses but a full end-to-end trace catches).
+  rm -f "${PROMPT_FILE:-}" "${EVENTLOG:-}" "${OUTFILE:-}" 2>/dev/null
   printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
   exit 1
 }

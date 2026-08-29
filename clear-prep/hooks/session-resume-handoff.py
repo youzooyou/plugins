@@ -27,8 +27,13 @@ def build_output(payload):
     # symlink (or a larger file) in between. An open file descriptor always
     # refers to the one inode we actually validate below, regardless of
     # what happens to the path afterward.
+    # O_NONBLOCK matters only for a FIFO/special file: opening one O_RDONLY
+    # without it blocks until a writer connects (or forever) -- the earlier
+    # os.path.isfile() check incidentally avoided this by rejecting FIFOs
+    # before ever opening them, a property this open-first approach must
+    # preserve explicitly. O_NONBLOCK has no effect on a regular file open.
     try:
-        fd = os.open(handoff_path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(handoff_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
@@ -60,7 +65,25 @@ def main():
 
 
 def _selftest():
+    import signal
     import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp3:
+        fifo_dir = os.path.join(tmp3, ".claude", "handoff")
+        os.makedirs(fifo_dir)
+        os.mkfifo(os.path.join(fifo_dir, "latest.md"))
+
+        def _timeout_handler(signum, frame):
+            raise TimeoutError("build_output blocked on a FIFO -- O_NONBLOCK regression")
+
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(2)
+        try:
+            out = build_output({"source": "clear", "cwd": tmp3})
+            assert out is None, "expected no output when handoff path is a FIFO"
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
     with tempfile.TemporaryDirectory() as tmp:
         handoff_dir = os.path.join(tmp, ".claude", "handoff")
