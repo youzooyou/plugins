@@ -290,11 +290,21 @@ case "$SCOPE" in
       # so its own exit status is actually captured -- process substitution
       # silently discarded a failure here (e.g. a bad core.excludesFile
       # config), leaving untracked files unexamined with no error surfaced.
+      # Stderr goes to GIT_STDERR_FILE (already allocated above, and the
+      # preceding `git diff` already succeeded so its old contents are no
+      # longer needed) -- NEVER merged into UNTRACKED_LIST_FILE via `2>&1`.
+      # That stream is parsed purely on NUL boundaries (see the -z read loop
+      # below); a successful `git ls-files` (exit 0) can still print a
+      # newline-terminated warning to stderr (e.g. an fsmonitor hint,
+      # observed live on this machine -- see the GIT_STDERR_FILE comment
+      # above), and merging it would glue that warning onto the very first
+      # NUL-delimited record, silently corrupting/dropping the first real
+      # untracked filename while the run still reports success.
       UNTRACKED_LIST_FILE="$(mktemp)"
-      ( cd "$CWD" 2>/dev/null && git ls-files -z --others --exclude-standard > "$UNTRACKED_LIST_FILE" 2>&1 )
+      ( cd "$CWD" 2>/dev/null && git ls-files -z --others --exclude-standard > "$UNTRACKED_LIST_FILE" 2>"$GIT_STDERR_FILE" )
       UNTRACKED_LIST_STATUS=$?
       if [ "$UNTRACKED_LIST_STATUS" -ne 0 ]; then
-        DETAIL_JSON="$(head -1 "$UNTRACKED_LIST_FILE" 2>/dev/null | jq -Rs '"failed to enumerate untracked files: " + .')"
+        DETAIL_JSON="$(head -1 "$GIT_STDERR_FILE" 2>/dev/null | jq -Rs '"failed to enumerate untracked files: " + .')"
         rm -f "$UNTRACKED_LIST_FILE" "$GIT_STDERR_FILE"
         printf '{"ok":false,"reason":"git_error","detail":%s}\n' "$DETAIL_JSON"
         exit 1
