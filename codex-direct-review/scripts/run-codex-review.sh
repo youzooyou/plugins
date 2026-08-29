@@ -363,7 +363,7 @@ case "$SCOPE" in
           elif [ -z "$UNTRACKED_SIZE" ] || [ "$UNTRACKED_SIZE" -gt 1048576 ]; then
             DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE (over 1MB cap or unreadable; contents omitted) ---"
-          elif od -An -tx1 "$UNTRACKED_TMPOUT" 2>/dev/null | tr -d ' \n' | grep -q '00'; then
+          elif od -An -tx1 "$UNTRACKED_TMPOUT" 2>/dev/null | tr -s '[:space:]' '\n' | grep -qx '00'; then
             # `$(cat ...)` (bash command substitution) silently drops NUL
             # bytes -- verified live, on this exact bash, that it turns
             # "left\0right" into "leftright" rather than preserving it.
@@ -373,6 +373,16 @@ case "$SCOPE" in
             # scan, doesn't route the content through a bash variable) and
             # skip embedding, matching how `git diff` itself represents a
             # binary file (a marker, not corrupted "text").
+            #
+            # One hex byte PER LINE (`tr -s '[:space:]' '\n'`) then an EXACT
+            # line match (`grep -qx`) -- an earlier revision stripped all
+            # whitespace first (`tr -d ' \n'`) and substring-matched the
+            # result, which false-positived on plain text with no NUL byte
+            # at all: e.g. bytes `50 0a` (an ordinary "P\n") concatenate to
+            # "500a", which contains "00" across the byte boundary even
+            # though neither byte is actually zero. Splitting one byte per
+            # line and requiring a full-line match makes that boundary
+            # collision impossible.
             DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE (binary content; not embedded as text) ---"
           else
