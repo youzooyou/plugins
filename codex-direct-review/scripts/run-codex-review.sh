@@ -13,26 +13,35 @@ get_inode() {
   stat -c%i "$1" 2>/dev/null || stat -f%i "$1" 2>/dev/null
 }
 
-# Read a path bounded by wall-clock time, not just a size check performed
-# beforehand -- checking size/type on the path first can itself hang if the
-# path is swapped for a FIFO between that check and the read. This reads
-# into a temp file under a short timeout so a swapped-in FIFO gets killed
-# rather than blocking the whole review (which runs before the main
-# --timeout deadline further down even applies).
+# Read a path bounded by BOTH wall-clock time and byte count -- checking
+# size/type on the path first (an earlier revision) can itself hang if the
+# path is swapped for a FIFO between that check and the read, and reading
+# unconditionally before checking size (the revision right before this one)
+# copies an unbounded amount of a large/growing file to disk before the cap
+# is ever enforced. `head -c` caps bytes actually written; the wall-clock
+# timeout still catches a FIFO with no writer at all (head still blocks
+# waiting for its first byte in that case). Sets the global READ_PID (not
+# `local`) while active so on_signal (see below) can kill it if the wrapper
+# itself is interrupted mid-read -- the CALLER is responsible for treating a
+# non-empty leftover READ_PID as "nothing to kill" once this returns.
 read_bounded() {
-  local path="$1" out_file="$2" timeout_secs="${3:-3}"
-  ( cat "$path" > "$out_file" 2>/dev/null ) &
-  local read_pid=$!
+  local path="$1" out_file="$2" timeout_secs="${3:-3}" max_bytes="${4:-1048576}"
+  ( head -c "$((max_bytes + 1))" "$path" > "$out_file" 2>/dev/null ) &
+  READ_PID=$!
   local deadline=$((SECONDS + timeout_secs))
-  while kill -0 "$read_pid" 2>/dev/null; do
+  while kill -0 "$READ_PID" 2>/dev/null; do
     if [ "$SECONDS" -ge "$deadline" ]; then
-      kill -KILL "$read_pid" 2>/dev/null
-      wait "$read_pid" 2>/dev/null
+      kill -KILL "$READ_PID" 2>/dev/null
+      wait "$READ_PID" 2>/dev/null
+      READ_PID=""
       return 124
     fi
     sleep 0.1
   done
-  wait "$read_pid" 2>/dev/null
+  wait "$READ_PID" 2>/dev/null
+  local status=$?
+  READ_PID=""
+  return "$status"
 }
 
 # judge_result: given a finished run's exit code and output files, decide
@@ -206,6 +215,29 @@ if [ -z "$CWD" ] || [ -z "$SCOPE" ]; then
   exit 1
 fi
 
+# Installed here, before ANY background process (including read_bounded's
+# internal reads during untracked-file gathering below), not just around the
+# codex exec call -- an earlier revision installed this trap right before
+# spawning codex, which left every background read in the untracked-file
+# loop unsupervised: interrupting the wrapper while read_bounded's own
+# background `head` was blocked on a FIFO orphaned it, the exact class of
+# gap this trap exists to close. READ_PID and CODEX_PID are both checked
+# with `${VAR:-}` since at any given moment only one (or neither) is set.
+on_signal() {
+  if [ -n "${READ_PID:-}" ]; then
+    kill -KILL "$READ_PID" 2>/dev/null
+  fi
+  if [ -n "${CODEX_PID:-}" ]; then
+    kill -TERM -"$CODEX_PID" 2>/dev/null
+    sleep 1
+    kill -KILL -"$CODEX_PID" 2>/dev/null
+  fi
+  rm -f "${PROMPT_FILE:-}" "${EVENTLOG:-}" "${OUTFILE:-}" "${UNTRACKED_TMPOUT:-}" 2>/dev/null
+  printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
+  exit 1
+}
+trap on_signal INT TERM
+
 # Gather the diff ourselves. codex exec review does not honor --output-schema
 # (see design doc's Revision section) -- so we never call the review
 # subcommand; we build the diff and the JSON-shape instruction ourselves and
@@ -249,15 +281,13 @@ case "$SCOPE" in
           DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE (symlink -> $LINK_TARGET; target contents not read) ---"
         elif [ -f "$CWD/$UNTRACKED_FILE" ]; then
-          # Bounded-time read (see read_bounded above) rather than a size
-          # check performed before reading -- an earlier revision checked
-          # size/type on the path first, but that check itself could hang if
-          # the path was swapped for a FIFO in the window before it ran.
-          # Reading into a temp file under a short timeout, then checking
-          # the temp file's size, avoids ever blocking on the live path.
+          # Bounded read (see read_bounded above): time-bounded so a path
+          # swapped for a FIFO can't hang this loop, and byte-bounded (via
+          # `head -c`) so a large/growing file isn't unboundedly copied to
+          # disk before the size cap below ever gets to reject it.
           UNTRACKED_INODE_BEFORE="$(get_inode "$CWD/$UNTRACKED_FILE")"
           UNTRACKED_TMPOUT="$(mktemp)"
-          read_bounded "$CWD/$UNTRACKED_FILE" "$UNTRACKED_TMPOUT" 3
+          read_bounded "$CWD/$UNTRACKED_FILE" "$UNTRACKED_TMPOUT" 3 1048576
           READ_STATUS=$?
           # Re-check identity after the read: the earlier -L/-f checks and
           # this read are separate operations on the same path, with a
@@ -341,29 +371,6 @@ PROMPT_FILE="$(mktemp)"
 
 EVENTLOG="$(mktemp)"
 OUTFILE="$(mktemp)"
-
-# If the wrapper itself is interrupted (Ctrl-C, a parent process killing it,
-# an early shell exit), the timeout branch below never runs -- without this
-# trap, the backgrounded codex process group would keep running as a true
-# orphan with nothing left to enforce any timeout on it at all. Verified live:
-# without this trap, SIGTERM to the wrapper kills the wrapper but leaves the
-# codex child running; with it, the child is confirmed terminated.
-on_signal() {
-  if [ -n "${CODEX_PID:-}" ]; then
-    kill -TERM -"$CODEX_PID" 2>/dev/null
-    sleep 1
-    kill -KILL -"$CODEX_PID" 2>/dev/null
-  fi
-  # The timeout and normal-exit paths both clean up these temp files; this
-  # path must too, or a signal-interrupted run leaks them (found via a
-  # whole-file re-read after the fact, not the same round that added the
-  # trap itself -- exactly the kind of gap an isolated per-line diff review
-  # misses but a full end-to-end trace catches).
-  rm -f "${PROMPT_FILE:-}" "${EVENTLOG:-}" "${OUTFILE:-}" 2>/dev/null
-  printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
-  exit 1
-}
-trap on_signal INT TERM
 
 set -m
 (
