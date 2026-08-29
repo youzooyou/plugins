@@ -5,45 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA="$SCRIPT_DIR/../schemas/review-verdict.schema.json"
 DEFAULT_TIMEOUT_SECS=1800
 
-# Portable inode lookup: GNU stat's `-c%i` (Linux) falls back to BSD stat's
-# `-f%i` (macOS) -- a bare `stat -f%i` silently fails on Linux (its stderr
-# discarded elsewhere), which would make every regular untracked file look
-# unreadable there despite --uncommitted's documented scope.
-get_inode() {
-  stat -c%i "$1" 2>/dev/null || stat -f%i "$1" 2>/dev/null
-}
-
-# Read a path bounded by BOTH wall-clock time and byte count -- checking
-# size/type on the path first (an earlier revision) can itself hang if the
-# path is swapped for a FIFO between that check and the read, and reading
-# unconditionally before checking size (the revision right before this one)
-# copies an unbounded amount of a large/growing file to disk before the cap
-# is ever enforced. `head -c` caps bytes actually written; the wall-clock
-# timeout still catches a FIFO with no writer at all (head still blocks
-# waiting for its first byte in that case). Sets the global READ_PID (not
-# `local`) while active so on_signal (see below) can kill it if the wrapper
-# itself is interrupted mid-read -- the CALLER is responsible for treating a
-# non-empty leftover READ_PID as "nothing to kill" once this returns.
-read_bounded() {
-  local path="$1" out_file="$2" timeout_secs="${3:-3}" max_bytes="${4:-1048576}"
-  ( head -c "$((max_bytes + 1))" "$path" > "$out_file" 2>/dev/null ) &
-  READ_PID=$!
-  local deadline=$((SECONDS + timeout_secs))
-  while kill -0 "$READ_PID" 2>/dev/null; do
-    if [ "$SECONDS" -ge "$deadline" ]; then
-      kill -KILL "$READ_PID" 2>/dev/null
-      wait "$READ_PID" 2>/dev/null
-      READ_PID=""
-      return 124
-    fi
-    sleep 0.1
-  done
-  wait "$READ_PID" 2>/dev/null
-  local status=$?
-  READ_PID=""
-  return "$status"
-}
-
 # register_temp_file PATH -> appends PATH to the temp-file cleanup
 # registry (global TEMP_FILE_REGISTRY, created right before the
 # on_signal trap below is installed). Call this immediately after every
@@ -54,8 +15,8 @@ read_bounded() {
 #
 # A file APPEND survives subshell boundaries (unlike a bash variable
 # assignment made inside a forked subshell -- the exact bug class that
-# once broke on_signal's visibility into READ_PID/UNTRACKED_TMPOUT, see
-# format_untracked_entry's own comment), so this registry stays correct
+# once broke on_signal's visibility into a background-read PID and its temp
+# file, back when that logic lived in bash), so this registry stays correct
 # even if a future function is accidentally invoked via `$(...)` again --
 # it closes the whole class of "forgot to register a new temp file for
 # cleanup" bug, not just today's specific instance.
@@ -95,156 +56,6 @@ mktemp_registered() {
   f="$(mktemp)"
   register_temp_file "$f"
   printf -v "$__mktemp_registered_var" '%s' "$f"
-}
-
-# is_binary_content FILE -> exit 0 if FILE contains any NUL byte, 1 otherwise.
-# Scans via `od` (never routes the file's bytes through a bash variable,
-# which would silently drop any NUL) and requires an EXACT line match ("00")
-# on one hex byte PER LINE -- an earlier revision stripped all whitespace
-# first and substring-matched the concatenated hex digits, which
-# false-positived on ordinary text with no NUL byte at all: bytes `50 0a`
-# (an ordinary "P\n") concatenate to "500a", which contains "00" across the
-# byte boundary even though neither byte is actually zero. Splitting one
-# byte per line and requiring a full-line match makes that boundary
-# collision structurally impossible.
-is_binary_content() {
-  local file="$1"
-  od -An -tx1 "$file" 2>/dev/null | tr -s '[:space:]' '\n' | grep -qx '00'
-}
-
-# enumerate_untracked_files CWD LIST_FILE STDERR_FILE -> writes NUL-delimited
-# untracked file paths to LIST_FILE, git's stderr to STDERR_FILE -- kept
-# SEPARATE, never merged via `2>&1`. LIST_FILE is parsed purely on NUL
-# boundaries by collect_untracked_diff below; a successful (exit 0)
-# `git ls-files` can still print a newline-terminated warning to stderr
-# (e.g. an fsmonitor hint, observed live on this machine), and merging it
-# would glue that warning onto the very first NUL-delimited record, silently
-# corrupting/dropping the real first untracked filename while the run still
-# reports success. Returns git's own exit status.
-enumerate_untracked_files() {
-  local cwd="$1" list_file="$2" stderr_file="$3"
-  ( cd "$cwd" 2>/dev/null && git ls-files -z --others --exclude-standard > "$list_file" 2>"$stderr_file" )
-}
-
-# format_untracked_entry CWD FILE OUTFILE -> APPENDS the DIFF_TEXT fragment
-# for one untracked file to OUTFILE (each fragment prefixed by a newline).
-# Never dereferences a symlink, never blocks longer than read_bounded's own
-# cap, never embeds NUL/binary content as text.
-#
-# Writes to OUTFILE via `>>` rather than printing to stdout for the caller to
-# capture with `$(...)` -- command substitution forks a SUBSHELL, and an
-# earlier revision of this function ran entirely inside one. That broke the
-# wrapper's signal-cleanup contract: read_bounded's READ_PID and this
-# function's own UNTRACKED_TMPOUT were being set as globals INSIDE that
-# subshell, invisible to the top-level `on_signal` trap in the real wrapper
-# process. Live-verified: sending SIGTERM while blocked on a FIFO read left
-# the backgrounded `head` process orphaned and still running with the
-# subshell version, but correctly killed with this direct (no-subshell)
-# version -- same test, same signal, only the call structure differed.
-# Appending directly to a file keeps every assignment in the CALLER's own
-# process, exactly like the original inline loop.
-format_untracked_entry() {
-  local cwd="$1" file="$2" outfile="$3"
-  local path="$cwd/$file"
-
-  if [ -L "$path" ]; then
-    # Never dereference an untracked symlink -- `cat` would follow it and
-    # could leak the contents of an arbitrary file outside the repo (e.g. a
-    # link pointing at ~/.ssh/id_rsa) into the prompt.
-    local link_target
-    link_target="$(readlink "$path" 2>/dev/null)"
-    printf -- "\n--- new untracked file: %s (symlink -> %s; target contents not read) ---" "$file" "$link_target" >> "$outfile"
-    return 0
-  fi
-
-  if [ -f "$path" ]; then
-    # Bounded read (see read_bounded above): time-bounded so a path swapped
-    # for a FIFO can't hang this loop, and byte-bounded (via `head -c`) so a
-    # large/growing file isn't unboundedly copied to disk before the size
-    # cap below ever gets to reject it.
-    local inode_before inode_after read_status size
-    inode_before="$(get_inode "$path")"
-    # UNTRACKED_TMPOUT is intentionally GLOBAL (not `local`), matching
-    # read_bounded's own READ_PID above -- on_signal's cleanup list
-    # references this exact variable name to remove the temp file if the
-    # wrapper is interrupted mid-read, before this function's own `rm -f`
-    # below ever gets a chance to run. This ONLY works because this
-    # function is called directly (never via `$(...)`) -- see the block
-    # comment above.
-    mktemp_registered UNTRACKED_TMPOUT
-    read_bounded "$path" "$UNTRACKED_TMPOUT" 3 1048576
-    read_status=$?
-    # Re-check identity after the read: the earlier -L/-f checks and this
-    # read are separate operations on the same path, with a window between
-    # them where the path could be swapped for a symlink or a different file
-    # (classic check-then-use race). Bash has no portable no-follow-open
-    # primitive, so this detects a swap after the fact (via inode + re-
-    # checked -L) rather than preventing it outright -- proportional to this
-    # being a local developer tool, not a hardened multi-tenant service.
-    inode_after="$(get_inode "$path")"
-    size="$(wc -c < "$UNTRACKED_TMPOUT" 2>/dev/null | tr -d ' ')"
-    if [ "$read_status" -ne 0 ] || [ -z "$inode_before" ] || \
-       [ -L "$path" ] || [ "$inode_after" != "$inode_before" ]; then
-      printf -- "\n--- new untracked file: %s (could not be safely read; contents omitted) ---" "$file" >> "$outfile"
-    elif [ -z "$size" ] || [ "$size" -gt 1048576 ]; then
-      printf -- "\n--- new untracked file: %s (over 1MB cap or unreadable; contents omitted) ---" "$file" >> "$outfile"
-    elif is_binary_content "$UNTRACKED_TMPOUT"; then
-      # Embedding a binary file's content wouldn't just be unreadable, it
-      # would risk corruption with no signal that anything was lost. Skip
-      # embedding, matching how `git diff` itself represents a binary file
-      # (a marker, not corrupted "text").
-      printf -- "\n--- new untracked file: %s (binary content; not embedded as text) ---" "$file" >> "$outfile"
-    else
-      # `cat` straight into OUTFILE, never through a bash variable -- no
-      # NUL-truncation risk even in principle (is_binary_content above
-      # already excludes NUL content, but this is also simply the more
-      # direct way to copy file content into another file).
-      {
-        printf -- "\n--- new untracked file: %s ---\n" "$file"
-        cat "$UNTRACKED_TMPOUT" 2>/dev/null
-      } >> "$outfile"
-    fi
-    rm -f "$UNTRACKED_TMPOUT"
-    return 0
-  fi
-
-  # Whitelist regular files only -- anything else (FIFO, device, socket) is
-  # handled here, not just symlinks. `cat` on an untracked FIFO with no
-  # writer blocks indefinitely, and this loop runs before the main --timeout
-  # deadline is even in effect, so nothing would ever kill a hang here.
-  printf -- "\n--- new untracked file: %s (not a regular file; contents not read) ---" "$file" >> "$outfile"
-}
-
-# collect_untracked_diff CWD LIST_FILE DEADLINE_SECS OUTFILE -> appends all
-# DIFF_TEXT fragments for the NUL-delimited untracked file paths in
-# LIST_FILE to OUTFILE (via format_untracked_entry, called directly -- see
-# its own comment on why never via `$(...)`). Returns 1 if the aggregate
-# DEADLINE_SECS budget runs out before every path has been processed; the
-# CALLER must treat that as a hard failure (abort before ever reaching a
-# verdict on a partially-examined scope), not just a note appended to the
-# output.
-collect_untracked_diff() {
-  local cwd="$1" list_file="$2" deadline_secs="$3" outfile="$4"
-  local deadline=$((SECONDS + deadline_secs))
-  local file
-  local incomplete=0
-  # Use -z (NUL-delimited) output: git C-quotes unusual filenames
-  # (non-ASCII, tabs, quotes, newlines) in its normal output, which a plain
-  # line-based read would otherwise treat as a literal (wrong, quote-mark-
-  # and-all) path.
-  while IFS= read -r -d '' file; do
-    [ -n "$file" ] || continue
-    if [ "$SECONDS" -ge "$deadline" ]; then
-      # Record this as a genuine failure, not just a note appended to the
-      # output -- an earlier revision only left a marker and kept going,
-      # which could still reach a real CLEAN verdict despite never having
-      # examined every untracked file --uncommitted promises to cover.
-      incomplete=1
-      break
-    fi
-    format_untracked_entry "$cwd" "$file" "$outfile"
-  done < "$list_file"
-  return "$incomplete"
 }
 
 # judge_result: given a finished run's exit code and output files, decide
@@ -335,252 +146,6 @@ run_selftest() {
   out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/wrong_types.json")"
   echo "$out" | jq -e '.reason == "schema_mismatch"' >/dev/null 2>&1 || { echo "FAIL: wrong_types case: $out"; fail=1; }
 
-  # --- is_binary_content: regression coverage for the b6/d1 fix chain ---
-
-  # Case 8: real NUL byte -> detected
-  printf 'left\000right' > "$tmp/has_nul.bin"
-  is_binary_content "$tmp/has_nul.bin" || { echo "FAIL: is_binary_content missed a real NUL byte"; fail=1; }
-
-  # Case 9: d1 regression guard -- bytes 50 0a ("P\n") must NOT false-positive
-  # via the "500a contains 00 across the byte boundary" bug.
-  printf 'P\n' > "$tmp/d1_false_positive.txt"
-  is_binary_content "$tmp/d1_false_positive.txt" && { echo "FAIL: is_binary_content d1 regression -- false positive on 'P\\n'"; fail=1; }
-
-  # Case 10: ordinary plain text -> not binary
-  printf 'hello world\n' > "$tmp/plain_for_binary_check.txt"
-  is_binary_content "$tmp/plain_for_binary_check.txt" && { echo "FAIL: is_binary_content false positive on plain text"; fail=1; }
-
-  # Case 11: empty file -> not binary
-  : > "$tmp/empty_for_binary_check.txt"
-  is_binary_content "$tmp/empty_for_binary_check.txt" && { echo "FAIL: is_binary_content false positive on empty file"; fail=1; }
-
-  # Case 12: NUL landing exactly on an od row boundary (byte 17 of 33) -> detected
-  { head -c 16 /dev/zero | tr '\0' 'A'; printf '\000'; head -c 16 /dev/zero | tr '\0' 'B'; } > "$tmp/row_boundary_nul.bin"
-  is_binary_content "$tmp/row_boundary_nul.bin" || { echo "FAIL: is_binary_content missed a NUL on an od row boundary"; fail=1; }
-
-  # Case 13: multi-row, no NUL anywhere -> not binary (adversarial stress case
-  # for byte-boundary false positives spanning multiple od output lines)
-  head -c 32 /dev/zero | tr '\0' '\001' > "$tmp/no_nul_multirow.bin"
-  is_binary_content "$tmp/no_nul_multirow.bin" && { echo "FAIL: is_binary_content false positive on multi-row non-NUL content"; fail=1; }
-
-  # --- format_untracked_entry: one DIFF_TEXT fragment per untracked file ---
-
-  mkdir -p "$tmp/proj"
-
-  # Case 14: symlink -> marker only, target never read
-  ln -s /etc/hosts "$tmp/proj/link.txt"
-  : > "$tmp/case14_out.txt"
-  format_untracked_entry "$tmp/proj" "link.txt" "$tmp/case14_out.txt"
-  out="$(cat "$tmp/case14_out.txt")"
-  case "$out" in
-    *"symlink ->"*"target contents not read"*) : ;;
-    *) echo "FAIL: format_untracked_entry symlink case: $out"; fail=1 ;;
-  esac
-
-  # Case 15: plain text file -> content embedded
-  printf 'hello from format_untracked_entry test' > "$tmp/proj/plain.txt"
-  : > "$tmp/case15_out.txt"
-  format_untracked_entry "$tmp/proj" "plain.txt" "$tmp/case15_out.txt"
-  out="$(cat "$tmp/case15_out.txt")"
-  case "$out" in
-    *"hello from format_untracked_entry test"*) : ;;
-    *) echo "FAIL: format_untracked_entry plain text case: $out"; fail=1 ;;
-  esac
-
-  # Case 16: binary (NUL) file -> marker only, never corrupted-embedded
-  printf 'left\000right' > "$tmp/proj/bin.dat"
-  : > "$tmp/case16_out.txt"
-  format_untracked_entry "$tmp/proj" "bin.dat" "$tmp/case16_out.txt"
-  out="$(cat "$tmp/case16_out.txt")"
-  case "$out" in
-    *"binary content; not embedded as text"*) : ;;
-    *) echo "FAIL: format_untracked_entry binary case: $out"; fail=1 ;;
-  esac
-  case "$out" in
-    *"leftright"*) echo "FAIL: format_untracked_entry binary case leaked corrupted content: $out"; fail=1 ;;
-  esac
-
-  # Case 17: over-size file -> capped before the binary check even runs
-  head -c 2000000 /dev/zero > "$tmp/proj/big.bin"
-  : > "$tmp/case17_out.txt"
-  format_untracked_entry "$tmp/proj" "big.bin" "$tmp/case17_out.txt"
-  out="$(cat "$tmp/case17_out.txt")"
-  case "$out" in
-    *"over 1MB cap"*) : ;;
-    *) echo "FAIL: format_untracked_entry oversize case: $out"; fail=1 ;;
-  esac
-
-  # Case 18: non-regular file (FIFO) -> marker only, and MUST NOT block --
-  # wrapped in its own wall-clock guard so a future regression that makes
-  # this open/cat the FIFO fails this test instead of hanging it. Also
-  # asserts mkfifo actually succeeded first -- a silently-swallowed mkfifo
-  # failure would leave a nonexistent path, which also (wrongly) satisfies
-  # the "not a regular file" assertion below for the wrong reason (Codex
-  # flagged this exact gap in review).
-  mkfifo "$tmp/proj/fifo_entry"
-  [ -p "$tmp/proj/fifo_entry" ] || { echo "FAIL: mkfifo did not create a FIFO, cannot test the no-block path"; fail=1; }
-  : > "$tmp/fifo_out.txt"
-  ( format_untracked_entry "$tmp/proj" "fifo_entry" "$tmp/fifo_out.txt" ) &
-  fifo_test_pid=$!
-  fifo_test_deadline=$((SECONDS + 5))
-  while kill -0 "$fifo_test_pid" 2>/dev/null; do
-    if [ "$SECONDS" -ge "$fifo_test_deadline" ]; then
-      kill -KILL "$fifo_test_pid" 2>/dev/null
-      echo "FAIL: format_untracked_entry FIFO case timed out (regression: now blocks on a FIFO)"
-      fail=1
-      break
-    fi
-    sleep 0.1
-  done
-  wait "$fifo_test_pid" 2>/dev/null
-  out="$(cat "$tmp/fifo_out.txt" 2>/dev/null)"
-  case "$out" in
-    *"not a regular file"*) : ;;
-    *) echo "FAIL: format_untracked_entry FIFO case: $out"; fail=1 ;;
-  esac
-
-  # --- collect_untracked_diff: aggregate deadline + accumulation ---
-
-  mkdir -p "$tmp/proj2"
-  printf 'content' > "$tmp/proj2/onlyfile.txt"
-  printf 'onlyfile.txt\000' > "$tmp/proj2_list.txt"
-
-  # Case 19: b4 regression guard -- an already-expired deadline must return
-  # non-zero (incomplete), not silently succeed as if nothing were missed.
-  : > "$tmp/case19_out.txt"
-  collect_untracked_diff "$tmp/proj2" "$tmp/proj2_list.txt" -1 "$tmp/case19_out.txt"
-  case19_status=$?
-  [ "$case19_status" -ne 0 ] || { echo "FAIL: collect_untracked_diff did not report incomplete on an expired deadline"; fail=1; }
-
-  # Case 20: sufficient deadline -> file collected, exit status 0.
-  : > "$tmp/case20_out.txt"
-  collect_untracked_diff "$tmp/proj2" "$tmp/proj2_list.txt" 30 "$tmp/case20_out.txt"
-  case20_status=$?
-  out="$(cat "$tmp/case20_out.txt")"
-  [ "$case20_status" -eq 0 ] || { echo "FAIL: collect_untracked_diff falsely reported incomplete with a sufficient budget (status $case20_status)"; fail=1; }
-  case "$out" in
-    *"onlyfile.txt"*"content"*) : ;;
-    *) echo "FAIL: collect_untracked_diff did not collect the file: $out"; fail=1 ;;
-  esac
-
-  # Case 20b: same expired-deadline scenario as case 19, called a second
-  # time with a fresh outfile, to confirm the file-append design behaves
-  # consistently across separate invocations.
-  : > "$tmp/case20b_out.txt"
-  collect_untracked_diff "$tmp/proj2" "$tmp/proj2_list.txt" -1 "$tmp/case20b_out.txt"
-  case20b_status=$?
-  [ "$case20b_status" -ne 0 ] || { echo "FAIL: collect_untracked_diff lost the incomplete signal on a repeat call"; fail=1; }
-
-  # Case 22: structural guard -- format_untracked_entry/collect_untracked_diff
-  # must NEVER be invoked via $(...) (command substitution forks a subshell,
-  # which broke on_signal's cleanup visibility for READ_PID/UNTRACKED_TMPOUT
-  # once already -- see their own function comments). Grep the script's own
-  # source for that exact regression shape.
-  if grep -nE '\$\([[:space:]]*(collect_untracked_diff|format_untracked_entry)\b' "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
-    echo "FAIL: found format_untracked_entry/collect_untracked_diff invoked via \$(...) -- this reintroduces the signal-cleanup regression, see their function comments"
-    fail=1
-  fi
-
-  # Case 23: live signal-safety regression test. Confirms that when
-  # read_bounded is invoked the SAME way format_untracked_entry invokes it
-  # (a direct call, global UNTRACKED_TMPOUT, no $(...) anywhere in the
-  # chain), an external SIGTERM to the enclosing process still correctly
-  # kills the backgrounded `head`. This is the exact mechanism that broke
-  # (orphaned `head`, confirmed via live SIGTERM reproduction during
-  # development) when these functions first communicated via $(...) instead
-  # of a file parameter.
-  #
-  # Process detection is scoped to THIS test's own child process tree via
-  # `pgrep -P` (direct children of case_signal_pid) rather than a global
-  # `pgrep -f`/`pkill -f` command-line pattern match -- an earlier revision
-  # used a global pattern match, which Codex correctly flagged as able to
-  # match (and pkill -KILL) an unrelated host process that happened to share
-  # the same command line. Waiting for the actual head child to appear
-  # (bounded by its own timeout, failing loudly if it never does) replaces a
-  # blind fixed sleep, which under system load could let SIGTERM arrive
-  # before read_bounded even started, silently passing without ever
-  # exercising a blocked read.
-  # Send TERM first (giving case_signal_pid's own trap a chance to clean up
-  # its READ_PID/UNTRACKED_TMPOUT/fifo_dir) and only escalate to KILL if it
-  # doesn't die promptly -- an earlier revision jumped straight to KILL in
-  # the "head never started" fail path, which bypasses a TERM-only trap
-  # entirely (SIGKILL is never catchable) and could leave BOTH a leaked
-  # temp file and a genuinely orphaned `head` process that nothing is left
-  # alive to ever clean up. Same TERM-then-KILL idiom this file already
-  # uses for CODEX_PID below.
-  terminate_case23_subshell() {
-    [ -n "${case_signal_pid:-}" ] || return 0
-    kill -TERM "$case_signal_pid" 2>/dev/null
-    local deadline=$((SECONDS + 2))
-    while [ "$SECONDS" -lt "$deadline" ] && kill -0 "$case_signal_pid" 2>/dev/null; do
-      sleep 0.1
-    done
-    kill -KILL "$case_signal_pid" 2>/dev/null
-  }
-  # `--selftest` exits before the main script's own on_signal/trap setup
-  # ever runs, so without this, an external INT/TERM to the whole
-  # `--selftest` invocation while Case 23 is mid-flight has nothing to
-  # clean up case_signal_pid or its background `head` at all -- live
-  # confirmed with a parent-only SIGTERM leaving the child running. Scoped
-  # tightly to this case and restored right after.
-  trap 'terminate_case23_subshell; for j in $(jobs -p 2>/dev/null); do kill -KILL "$j" 2>/dev/null; done; exit 1' INT TERM
-
-  fifo_dir="$(mktemp -d)"
-  (
-    trap 'kill -KILL "${READ_PID:-}" 2>/dev/null; rm -f "${UNTRACKED_TMPOUT:-}"; rm -rf "${fifo_dir:-}"; exit 1' TERM
-    mkfifo "$fifo_dir/blocking" || exit 1
-    UNTRACKED_TMPOUT="$(mktemp)"
-    read_bounded "$fifo_dir/blocking" "$UNTRACKED_TMPOUT" 30 1048576
-    rm -rf "$fifo_dir"
-  ) &
-  case_signal_pid=$!
-
-  head_pid=""
-  wait_deadline=$((SECONDS + 5))
-  while [ "$SECONDS" -lt "$wait_deadline" ]; do
-    head_pid="$(pgrep -P "$case_signal_pid" 2>/dev/null | head -1)"
-    [ -n "$head_pid" ] && break
-    sleep 0.1
-  done
-
-  if [ -z "$head_pid" ]; then
-    echo "FAIL: read_bounded's background head never started within 5s (cannot verify signal cleanup)"
-    fail=1
-  else
-    kill -TERM "$case_signal_pid" 2>/dev/null
-    cleanup_deadline=$((SECONDS + 5))
-    while [ "$SECONDS" -lt "$cleanup_deadline" ] && kill -0 "$head_pid" 2>/dev/null; do
-      sleep 0.1
-    done
-    if kill -0 "$head_pid" 2>/dev/null; then
-      echo "FAIL: read_bounded left an orphaned head process (PID $head_pid) after SIGTERM (signal-cleanup regression)"
-      fail=1
-      kill -KILL "$head_pid" 2>/dev/null
-    fi
-  fi
-  terminate_case23_subshell
-  wait "$case_signal_pid" 2>/dev/null
-  rm -rf "$fifo_dir"
-  trap - INT TERM
-
-  # --- enumerate_untracked_files: real git integration ---
-
-  # Case 21: a real repo's untracked file is listed, with exit status 0
-  mkdir -p "$tmp/gitrepo"
-  (
-    cd "$tmp/gitrepo" && git init -q && git config user.email t@t.com && git config user.name t \
-      && echo readme > README.md && git add README.md && git commit -q -m init \
-      && printf 'content' > realfile.txt
-  ) >/dev/null 2>&1
-  enumerate_untracked_files "$tmp/gitrepo" "$tmp/enum_list.txt" "$tmp/enum_stderr.txt"
-  enum_status=$?
-  [ "$enum_status" -eq 0 ] || { echo "FAIL: enumerate_untracked_files exit status on a real repo: $enum_status"; fail=1; }
-  found=0
-  while IFS= read -r -d '' f; do
-    [ "$f" = "realfile.txt" ] && found=1
-  done < "$tmp/enum_list.txt"
-  [ "$found" -eq 1 ] || { echo "FAIL: enumerate_untracked_files did not list realfile.txt"; fail=1; }
-
   rm -rf "$tmp"
 
   if [ "$fail" -eq 0 ]; then
@@ -664,18 +229,14 @@ if [ -z "$CWD" ] || [ -z "$SCOPE" ]; then
   exit 1
 fi
 
-# Installed here, before ANY background process (including read_bounded's
-# internal reads during untracked-file gathering below), not just around the
-# codex exec call -- an earlier revision installed this trap right before
-# spawning codex, which left every background read in the untracked-file
-# loop unsupervised: interrupting the wrapper while read_bounded's own
-# background `head` was blocked on a FIFO orphaned it, the exact class of
-# gap this trap exists to close. READ_PID and CODEX_PID are both checked
-# with `${VAR:-}` since at any given moment only one (or neither) is set.
+# Installed here, before ANY background process (including the untracked-file
+# collection subprocess spawned below), not just around the codex exec call
+# -- an earlier revision installed this trap right before spawning codex,
+# which left the untracked-file collection step unsupervised: interrupting
+# the wrapper while it was blocked on that subprocess left it orphaned, the
+# exact class of gap this trap exists to close. CODEX_PID is checked with
+# `${VAR:-}` since it may not be set yet when the signal arrives.
 on_signal() {
-  if [ -n "${READ_PID:-}" ]; then
-    kill -KILL "$READ_PID" 2>/dev/null
-  fi
   if [ -n "${CODEX_PID:-}" ]; then
     kill -TERM -"$CODEX_PID" 2>/dev/null
     sleep 1
@@ -765,40 +326,37 @@ case "$SCOPE" in
       # files ourselves so --uncommitted actually matches its documented
       # "staged + unstaged + untracked" scope, without mutating the index
       # (no `git add -N`, which /cc's own Phase 0 already avoids for the
-      # same reason). Enumerate into a temp file (not process substitution)
-      # so its own exit status is actually captured -- process substitution
-      # silently discarded a failure here (e.g. a bad core.excludesFile
-      # config), leaving untracked files unexamined with no error surfaced.
-      # Stderr goes to GIT_STDERR_FILE (already allocated above, and the
-      # preceding `git diff` already succeeded so its old contents are no
-      # longer needed) -- see enumerate_untracked_files above for why it must
-      # stay separate from UNTRACKED_LIST_FILE.
-      mktemp_registered UNTRACKED_LIST_FILE
-      enumerate_untracked_files "$CWD" "$UNTRACKED_LIST_FILE" "$GIT_STDERR_FILE"
-      UNTRACKED_LIST_STATUS=$?
-      if [ "$UNTRACKED_LIST_STATUS" -ne 0 ]; then
-        DETAIL_JSON="$(head -1 "$GIT_STDERR_FILE" 2>/dev/null | jq -Rs '"failed to enumerate untracked files: " + .')"
-        rm -f "$UNTRACKED_LIST_FILE" "$GIT_STDERR_FILE"
-        printf '{"ok":false,"reason":"git_error","detail":%s}\n' "$DETAIL_JSON"
-        exit 1
-      fi
-      # Aggregate budget for the whole loop (see collect_untracked_diff
-      # above), separate from each file's own 3s cap -- many untracked
-      # files, each individually bounded, could otherwise still add up to a
-      # long delay before the main --timeout deadline (set up much further
-      # down) is even in effect. Called DIRECTLY (never via `$(...)`) so
-      # read_bounded's READ_PID and format_untracked_entry's UNTRACKED_TMPOUT
-      # stay visible to on_signal in THIS process, not a forked subshell.
-      mktemp_registered UNTRACKED_DIFF_FILE
-      collect_untracked_diff "$CWD" "$UNTRACKED_LIST_FILE" 30 "$UNTRACKED_DIFF_FILE"
-      UNTRACKED_COLLECTION_STATUS=$?
-      DIFF_TEXT="$DIFF_TEXT$(cat "$UNTRACKED_DIFF_FILE" 2>/dev/null)"
-      rm -f "$UNTRACKED_LIST_FILE" "$UNTRACKED_DIFF_FILE"
-      if [ "$UNTRACKED_COLLECTION_STATUS" -ne 0 ]; then
-        rm -f "$GIT_STDERR_FILE"
-        printf '{"ok":false,"reason":"incomplete_collection","detail":"untracked-file collection exceeded its 30s aggregate budget; --uncommitted scope was not fully examined"}\n'
-        exit 1
-      fi
+      # same reason). Untracked-file collection is delegated to a Python
+      # subprocess (see collect_untracked_files.py's own module docstring
+      # for why) -- backgrounded via `&` + `wait` (matching the CODEX_PID
+      # pattern below), not `$(...)`, so the existing `jobs -p` catch-all in
+      # on_signal already covers killing it on an interrupt without any
+      # bespoke PID tracking.
+      mktemp_registered UNTRACKED_OUT_FILE
+      mktemp_registered UNTRACKED_ERR_FILE
+      python3 "$SCRIPT_DIR/collect_untracked_files.py" "$CWD" --deadline-secs 30 --max-bytes 1048576 \
+        > "$UNTRACKED_OUT_FILE" 2>"$UNTRACKED_ERR_FILE" &
+      UNTRACKED_PID=$!
+      wait "$UNTRACKED_PID"
+      UNTRACKED_STATUS=$?
+      case "$UNTRACKED_STATUS" in
+        0)
+          DIFF_TEXT="$DIFF_TEXT$(cat "$UNTRACKED_OUT_FILE" 2>/dev/null)"
+          ;;
+        2)
+          DETAIL_JSON="$(cat "$UNTRACKED_ERR_FILE" 2>/dev/null | jq -Rs .)"
+          rm -f "$UNTRACKED_OUT_FILE" "$UNTRACKED_ERR_FILE" "$GIT_STDERR_FILE"
+          printf '{"ok":false,"reason":"incomplete_collection","detail":%s}\n' "$DETAIL_JSON"
+          exit 1
+          ;;
+        *)
+          DETAIL_JSON="$(cat "$UNTRACKED_ERR_FILE" 2>/dev/null | jq -Rs .)"
+          rm -f "$UNTRACKED_OUT_FILE" "$UNTRACKED_ERR_FILE" "$GIT_STDERR_FILE"
+          printf '{"ok":false,"reason":"git_error","detail":%s}\n' "$DETAIL_JSON"
+          exit 1
+          ;;
+      esac
+      rm -f "$UNTRACKED_OUT_FILE" "$UNTRACKED_ERR_FILE"
     fi
     ;;
   base)
