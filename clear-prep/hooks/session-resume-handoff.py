@@ -7,6 +7,7 @@ or when no handoff file exists.
 """
 import json
 import os
+import stat
 import sys
 
 HANDOFF_REL_PATH = os.path.join(".claude", "handoff", "latest.md")
@@ -20,21 +21,26 @@ def build_output(payload):
     if not cwd:
         return None
     handoff_path = os.path.join(cwd, HANDOFF_REL_PATH)
-    if os.path.islink(handoff_path):
-        # Never follow this path if it's a symlink -- it could point at an
-        # arbitrary readable file outside the project (e.g. ~/.ssh/id_rsa),
-        # whose content would otherwise get injected straight into the
-        # fresh session's context.
-        return None
-    if not os.path.isfile(handoff_path):
-        return None
+    # Open with O_NOFOLLOW first, then stat/read the already-open descriptor
+    # -- checking islink()/getsize() on the *path* and only afterward
+    # opening it leaves a race window where the path could be swapped for a
+    # symlink (or a larger file) in between. An open file descriptor always
+    # refers to the one inode we actually validate below, regardless of
+    # what happens to the path afterward.
     try:
-        if os.path.getsize(handoff_path) > MAX_HANDOFF_BYTES:
-            return None
+        fd = os.open(handoff_path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
         return None
-    with open(handoff_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_HANDOFF_BYTES:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            fd = None  # ownership transferred to the file object
+            content = f.read(MAX_HANDOFF_BYTES).strip()
+    finally:
+        if fd is not None:
+            os.close(fd)
     if not content:
         return None
     return f"[clear-prep handoff — {handoff_path}]\n\n{content}"

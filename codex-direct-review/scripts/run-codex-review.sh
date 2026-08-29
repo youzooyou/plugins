@@ -37,7 +37,7 @@ judge_result() {
         (.findings | type == "array") and
         (.findings | all(
           (has("file") and (.file | type) == "string") and
-          (has("line") and (.line == null or (.line | type) == "number")) and
+          (has("line") and (.line == null or ((.line | type) == "number" and (.line | floor) == .line))) and
           (has("severity") and (.severity == null or (.severity | type) == "string")) and
           (has("summary") and (.summary | type) == "string") and
           (has("evidence") and (.evidence | type) == "string") and
@@ -226,7 +226,8 @@ case "$SCOPE" in
           # block, letting a review pass CLEAN without ever having actually
           # seen that file.
           UNTRACKED_SIZE="$(wc -c < "$CWD/$UNTRACKED_FILE" 2>/dev/null | tr -d ' ')"
-          if [ -z "$UNTRACKED_SIZE" ]; then
+          UNTRACKED_INODE_BEFORE="$(stat -f%i "$CWD/$UNTRACKED_FILE" 2>/dev/null)"
+          if [ -z "$UNTRACKED_SIZE" ] || [ -z "$UNTRACKED_INODE_BEFORE" ]; then
             DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE (could not be read; contents omitted) ---"
           elif [ "$UNTRACKED_SIZE" -gt 1048576 ]; then
@@ -234,9 +235,20 @@ case "$SCOPE" in
 --- new untracked file: $UNTRACKED_FILE (${UNTRACKED_SIZE} bytes, over 1MB cap; contents omitted) ---"
           else
             UNTRACKED_CONTENT="$(cat "$CWD/$UNTRACKED_FILE" 2>/dev/null)"
-            if [ $? -ne 0 ]; then
+            CAT_STATUS=$?
+            # Re-check identity after the read: the earlier -L/-f/size checks
+            # and this cat are separate operations on the same path, with a
+            # window between them where the path could be swapped for a
+            # symlink or a different file (classic check-then-use race).
+            # Bash has no portable no-follow-open primitive, so this detects
+            # a swap after the fact (via inode + re-checked -L) rather than
+            # preventing it outright -- proportional to this being a local
+            # developer tool, not a hardened multi-tenant service.
+            UNTRACKED_INODE_AFTER="$(stat -f%i "$CWD/$UNTRACKED_FILE" 2>/dev/null)"
+            if [ "$CAT_STATUS" -ne 0 ] || [ -L "$CWD/$UNTRACKED_FILE" ] || \
+               [ "$UNTRACKED_INODE_AFTER" != "$UNTRACKED_INODE_BEFORE" ]; then
               DIFF_TEXT="$DIFF_TEXT
---- new untracked file: $UNTRACKED_FILE (could not be read; contents omitted) ---"
+--- new untracked file: $UNTRACKED_FILE (could not be safely read; contents omitted) ---"
             else
               DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE ---
