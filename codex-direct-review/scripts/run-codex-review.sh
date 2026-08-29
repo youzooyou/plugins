@@ -229,19 +229,36 @@ if [ -z "$CWD" ] || [ -z "$SCOPE" ]; then
   exit 1
 fi
 
+# kill_process_group PID -> TERM, brief wait, then escalate to KILL --
+# targeting the whole process GROUP (negative PID), not just the single
+# process. A plain `kill <pid>` only reaches that exact process: if it has
+# already spawned a child of its own (e.g. the untracked-file collector's
+# `git ls-files` subprocess, or codex's own MCP host process), killing only
+# the parent leaves that child running as an orphan -- live-confirmed with
+# a direct parent-only kill on a two-process chain with no job control
+# enabled. `set -m` (enabled once, right after the trap below is
+# installed, before anything is ever backgrounded) gives every subsequent
+# `&` job its own process group, which is what makes the negative-PID form
+# here actually reach those children.
+kill_process_group() {
+  local pid="$1"
+  [ -n "$pid" ] || return 0
+  kill -TERM -"$pid" 2>/dev/null
+  sleep 1
+  kill -KILL -"$pid" 2>/dev/null
+}
+
 # Installed here, before ANY background process (including the untracked-file
 # collection subprocess spawned below), not just around the codex exec call
 # -- an earlier revision installed this trap right before spawning codex,
 # which left the untracked-file collection step unsupervised: interrupting
 # the wrapper while it was blocked on that subprocess left it orphaned, the
-# exact class of gap this trap exists to close. CODEX_PID is checked with
-# `${VAR:-}` since it may not be set yet when the signal arrives.
+# exact class of gap this trap exists to close. UNTRACKED_PID/CODEX_PID are
+# read with `${VAR:-}` since at most one is set at any given moment (and
+# possibly neither, early on).
 on_signal() {
-  if [ -n "${CODEX_PID:-}" ]; then
-    kill -TERM -"$CODEX_PID" 2>/dev/null
-    sleep 1
-    kill -KILL -"$CODEX_PID" 2>/dev/null
-  fi
+  kill_process_group "${UNTRACKED_PID:-}"
+  kill_process_group "${CODEX_PID:-}"
   # Catch-all for the narrow fork-to-assignment race: `( cmd ) &` followed by
   # `PID=$!` on the next line has a gap where a signal could arrive after the
   # fork but before the variable is set, so the checks above would see it as
@@ -288,6 +305,12 @@ cleanup_temp_files() {
 TEMP_FILE_REGISTRY="$(mktemp)"
 trap cleanup_temp_files EXIT
 trap on_signal INT TERM
+# Enabled here, before the FIRST background job is ever spawned (the
+# untracked-file collector, further down) -- not just before the codex exec
+# job further still -- so kill_process_group's negative-PID form reaches
+# every backgrounded job's own children throughout the whole script, not
+# only codex's.
+set -m
 
 # Gather the diff ourselves. codex exec review does not honor --output-schema
 # (see design doc's Revision section) -- so we never call the review
@@ -430,7 +453,9 @@ mktemp_registered PROMPT_FILE
 mktemp_registered EVENTLOG
 mktemp_registered OUTFILE
 
-set -m
+# `set -m` was already enabled earlier (right after the trap installation,
+# before the untracked-file collector), so this job also gets its own
+# process group -- see kill_process_group's comment above.
 (
   cd "$CWD" || exit 127
   codex exec --ephemeral --sandbox read-only --skip-git-repo-check --json \
