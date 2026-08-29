@@ -446,10 +446,55 @@ BOUNDARY="DIFF_$$_${RANDOM}${RANDOM}"
 
 mktemp_registered PROMPT_FILE
 {
-  echo "Review the following git diff for correctness bugs, security issues, and reuse/simplification opportunities."
+  # $FOCUS is not "extra nitpicks" -- it is the caller's (Claude's) own
+  # briefing: why this change exists, what problem it solves, what was
+  # already tried/found/rejected in prior rounds, and what to specifically
+  # verify given that history. A reviewer handed a diff with no context
+  # behaves differently than one told what the change is actually FOR --
+  # the same way a human reviewer given only a raw diff, with no PR
+  # description or history, reviews shallower than one given the full
+  # story. This section is placed first and labeled explicitly so it reads
+  # as essential background, not an afterthought appended to the task line.
   if [ -n "$FOCUS" ]; then
-    echo "Additional focus: $FOCUS"
+    echo "## Context: why this review is being requested"
+    echo ""
+    echo "$FOCUS"
+    echo ""
   fi
+  echo "## How to review"
+  echo ""
+  echo "Review the diff below for correctness bugs, security issues, and reuse/simplification"
+  echo "opportunities, using the context above to understand INTENT -- code that looks locally correct"
+  echo "can still be wrong given what problem it was actually meant to solve."
+  echo ""
+  # Without this, a review can degrade into judging the diff as isolated
+  # text -- --sandbox read-only already grants real read access to the
+  # repository, but nothing in the prompt previously told the model to
+  # actually use it, or what kind of verification actually counts as
+  # evidence here.
+  echo "You have read-only shell access to this repository's current working tree (grep, cat, ls, git log,"
+  echo "git blame, running existing tests, etc. -- anything that does not modify files). USE IT. Do not judge"
+  echo "this diff as isolated text divorced from the actual codebase. Review the way a careful human"
+  echo "reviewer does: start at the specific changed lines (narrow), zoom OUT to the whole file/module and"
+  echo "the broader flow it participates in -- callers, callees, related tests, sibling code paths that"
+  echo "handle similar cases (wide) -- then zoom back IN to the changed lines with that fuller picture to"
+  echo "judge whether they actually hold up (narrow again). A finding produced only by reading the diff"
+  echo "hunk in isolation, without that widen-then-narrow pass, is exactly the kind of review that misses"
+  echo "real problems -- and is exactly what a plain diff-only review degrades into without this instruction."
+  echo "Concretely:"
+  echo "- Read the FULL current content of every changed file, not just the diff hunks -- a hunk can look"
+  echo "  correct or incorrect depending on surrounding code the hunk alone does not show you."
+  echo "- If the diff changes a function/method/class signature, exported symbol, config key, or any other"
+  echo "  public/shared contract, grep the repository for every caller or usage and check each one still holds."
+  echo "- If the diff touches concurrency, signal/process handling, resource cleanup, or external"
+  echo "  command/subprocess invocation, trace the actual control flow through the real files -- do not infer"
+  echo "  behavior from the diff text alone when the real files are available to check."
+  echo "- Verify any factual claim you are about to make (a function exists, a caller passes N arguments, a"
+  echo "  file does X) against the actual files before stating it as evidence, not from memory or assumption."
+  echo "A finding backed by this kind of direct verification (cite the specific file/command you checked) is"
+  echo "what this review needs -- a finding based only on reading the diff text, when the surrounding"
+  echo "repository was available to check and would have confirmed or refuted it, is weaker and should be"
+  echo "verified before you report it."
   echo ""
   echo "Respond with ONLY valid JSON matching this exact shape, no prose, no markdown code fences."
   echo "line, severity, and the top-level summary are ALWAYS present keys -- use null for any of them"
@@ -477,7 +522,17 @@ mktemp_registered OUTFILE
 # process group -- see kill_process_group's comment above.
 (
   cd "$CWD" || exit 127
+  # --model is intentionally left unset -- which model to use is the
+  # user's own choice via ~/.codex/config.toml, not something this wrapper
+  # should override. Reasoning effort is different: review quality is
+  # unusually sensitive to it, and a user's ambient config may reasonably
+  # be tuned lower for everyday (cost-sensitive) use without realizing it
+  # also silently weakens THIS review-quality-critical path. `-c` forces a
+  # floor of "xhigh" (the highest tier this CLI exposes) regardless of
+  # config.toml, so review quality never silently degrades below that
+  # floor -- while still respecting whatever model the user has chosen.
   codex exec --ephemeral --sandbox read-only --skip-git-repo-check --json \
+    -c model_reasoning_effort="xhigh" \
     --output-schema "$SCHEMA" --output-last-message "$OUTFILE" \
     < "$PROMPT_FILE" > "$EVENTLOG" 2>&1
 ) &
