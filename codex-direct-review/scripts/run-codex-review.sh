@@ -265,9 +265,13 @@ on_signal() {
   # still empty. `jobs -p` reads bash's own job table, populated synchronously
   # at fork time -- it sees a just-backgrounded process even before `$!` has
   # been assigned anywhere, closing the race regardless of variable timing.
+  # Negative PID (whole process group, same as kill_process_group above) --
+  # this exact race window is also exactly when the job might already have
+  # spawned its own child (git, or an MCP host), which a plain same-PID
+  # kill here would leave orphaned.
   local job_pid
   for job_pid in $(jobs -p 2>/dev/null); do
-    kill -KILL "$job_pid" 2>/dev/null
+    kill -KILL -"$job_pid" 2>/dev/null
   done
   # Temp-file registry cleanup is handled by cleanup_temp_files, installed as
   # an EXIT trap -- bash's EXIT pseudo-signal trap fires after this function's
@@ -362,6 +366,12 @@ case "$SCOPE" in
       UNTRACKED_PID=$!
       wait "$UNTRACKED_PID"
       UNTRACKED_STATUS=$?
+      # Reset immediately after use -- on_signal reads this on ANY later
+      # interrupt (e.g. during the codex exec phase that follows), and a
+      # stale PID left here after this job has already exited risks the OS
+      # reusing that PID/process-group id for a completely unrelated
+      # process by then, which kill_process_group would happily TERM/KILL.
+      UNTRACKED_PID=""
       case "$UNTRACKED_STATUS" in
         0)
           DIFF_TEXT="$DIFF_TEXT$(cat "$UNTRACKED_OUT_FILE" 2>/dev/null)"
@@ -483,6 +493,10 @@ while kill -0 "$CODEX_PID" 2>/dev/null; do
 done
 wait "$CODEX_PID" 2>/dev/null
 EXIT_CODE=$?
+# Reset for the same reason UNTRACKED_PID is reset above -- this is the
+# last background job in the script, but leaving a stale value costs
+# nothing to avoid and keeps the invariant uniform.
+CODEX_PID=""
 
 rm -f "$PROMPT_FILE"
 

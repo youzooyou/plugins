@@ -80,13 +80,23 @@ def read_with_timeout(f, max_bytes):
     """f.read(), bounded by a wall-clock SIGALRM in addition to whatever
     byte cap the caller passes -- protects against a single pathologically
     slow read (e.g. a stalled network filesystem) that the aggregate
-    between-files deadline check alone cannot interrupt."""
+    between-files deadline check alone cannot interrupt.
+
+    The handler-install and the alarm arm/disarm are each in their OWN
+    try/finally, nested, rather than one try starting only after both setup
+    calls -- an earlier revision's `try` started after `signal.alarm(...)`,
+    so an exception raised between installing the handler and entering the
+    try (however unlikely) would skip the `finally` entirely, leaving the
+    alarm armed (it would later fire and raise _ReadTimeout somewhere
+    completely unrelated) and the old handler never restored."""
     old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-    signal.alarm(PER_FILE_TIMEOUT_SECS)
     try:
-        return f.read(max_bytes + 1)
+        signal.alarm(PER_FILE_TIMEOUT_SECS)
+        try:
+            return f.read(max_bytes + 1)
+        finally:
+            signal.alarm(0)
     finally:
-        signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
 
 
@@ -141,10 +151,24 @@ def open_nofollow_chain(cwd_bytes, rel_path_bytes):
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
         if not is_last:
             flags |= os.O_DIRECTORY
+        # Two failure points, each needing its own cleanup target: if
+        # os.open itself fails, only `fd` (the parent, still open) needs
+        # closing -- `next_fd` was never created. If os.open SUCCEEDS but
+        # the subsequent close of the old `fd` then fails (rare, but
+        # os.close is not guaranteed to succeed), `next_fd` is a live,
+        # newly-opened descriptor with no other reference anywhere -- an
+        # earlier revision's single `try/finally: os.close(fd)` around just
+        # the open call left exactly this second case leaking `next_fd`.
         try:
             next_fd = os.open(part, flags, dir_fd=fd)
-        finally:
+        except OSError:
             os.close(fd)
+            raise
+        try:
+            os.close(fd)
+        except OSError:
+            os.close(next_fd)
+            raise
         fd = next_fd
     return fd
 
@@ -273,6 +297,7 @@ def _parts_to_text(parts):
 
 
 def _selftest():
+    import shutil
     import tempfile
 
     failures = []
@@ -316,17 +341,35 @@ def _selftest():
         out = fmt(proj, "big.bin")
         check("over 1MB cap" in out, "oversize case: wrong marker")
 
-    # Case 5: FIFO -> marker only, and MUST NOT block (O_NONBLOCK); wrapped
-    # in a wall-clock guard so a future regression that makes this open
-    # fails the test instead of hanging the whole selftest run.
+    # Case 5: FIFO -> marker only, and MUST NOT block (O_NONBLOCK). Wrapped
+    # in an ACTUALLY ENFORCED wall-clock guard via signal.alarm (matching
+    # this project's session-resume-handoff.py, which uses the identical
+    # technique for the identical reason) -- an earlier revision only
+    # measured elapsed time AFTER the call returned, which is not a guard
+    # at all: if a future regression made the open block forever, that
+    # version would hang the whole selftest suite indefinitely instead of
+    # failing after a bounded wait.
     with tempfile.TemporaryDirectory() as proj:
         fifo_path = os.path.join(proj, "fifo_entry")
         os.mkfifo(fifo_path)
-        start = time.monotonic()
-        out = fmt(proj, "fifo_entry")
-        elapsed = time.monotonic() - start
-        check("not a regular file" in out, "FIFO case: wrong marker")
-        check(elapsed < 5, f"FIFO case: took {elapsed:.1f}s, should be instant (O_NONBLOCK regression)")
+
+        def _fifo_hang_handler(signum, frame):
+            raise TimeoutError("format_entry blocked on a FIFO open -- O_NONBLOCK regression")
+
+        old_handler = signal.signal(signal.SIGALRM, _fifo_hang_handler)
+        signal.alarm(5)
+        try:
+            start = time.monotonic()
+            out = fmt(proj, "fifo_entry")
+            elapsed = time.monotonic() - start
+        except TimeoutError as exc:
+            check(False, str(exc))
+        else:
+            check("not a regular file" in out, "FIFO case: wrong marker")
+            check(elapsed < 5, f"FIFO case: took {elapsed:.1f}s, should be near-instant")
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
     # Case 6: vanished file (listed by git, deleted before we get to it) ->
     # graceful "could not be safely read", not a crash
@@ -395,6 +438,60 @@ def _selftest():
         out = fmt(proj, "dir/file.txt")
         check("SECRET_VIA_INTERMEDIATE_SYMLINK" not in out, "intermediate-symlink case: leaked outside content")
         check("could not be safely read" in out, "intermediate-symlink case: wrong marker")
+
+    # Case 10b: the same attack, but as a GENUINE concurrent race rather
+    # than a pre-existing symlink -- a child process repeatedly swaps
+    # `proj/dir` between a real directory (harmless decoy content) and a
+    # symlink to the outside secret, while the parent repeatedly reads
+    # `dir/file.txt`. Case 10 alone only proves the code rejects an
+    # ALREADY-symlinked path; it does not exercise a live swap, so it would
+    # also pass a flawed check-then-open implementation that is vulnerable
+    # to a swap happening strictly between its own check and its own open.
+    # This case proves the ATOMIC per-component open (no separate check
+    # step for intermediate directories at all, unlike bash's original
+    # design, which had no dir_fd primitive and HAD to check-then-open)
+    # actually holds under real concurrent swapping, not just against a
+    # static fixture.
+    with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as outside:
+        os.makedirs(os.path.join(outside, "dir"))
+        with open(os.path.join(outside, "dir", "file.txt"), "w", encoding="utf-8") as f:
+            f.write("SECRET_VIA_RACE")
+        proj_dir_path = os.path.join(proj, "dir")
+        outside_target = os.path.join(outside, "dir")
+
+        pid = os.fork()
+        if pid == 0:
+            end = time.monotonic() + 1.0
+            toggle = 0
+            while time.monotonic() < end:
+                try:
+                    if os.path.islink(proj_dir_path):
+                        os.unlink(proj_dir_path)
+                    elif os.path.exists(proj_dir_path):
+                        shutil.rmtree(proj_dir_path)
+                    if toggle % 2 == 0:
+                        os.makedirs(proj_dir_path)
+                        with open(os.path.join(proj_dir_path, "file.txt"), "w", encoding="utf-8") as f:
+                            f.write("decoy")
+                    else:
+                        os.symlink(outside_target, proj_dir_path)
+                except OSError:
+                    pass
+                toggle += 1
+            os._exit(0)
+
+        try:
+            leaked = False
+            end = time.monotonic() + 1.0
+            while time.monotonic() < end:
+                out = fmt(proj, "dir/file.txt")
+                if "SECRET_VIA_RACE" in out:
+                    leaked = True
+                    break
+            check(not leaked, "intermediate-symlink RACE case: secret leaked under genuine concurrent directory swapping")
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
 
     # Case 11: valid-but-non-UTF-8, NUL-free content -> passed through byte
     # for byte, never corrupted via errors="replace" (the medium finding
