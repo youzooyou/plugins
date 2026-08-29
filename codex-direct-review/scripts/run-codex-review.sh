@@ -63,20 +63,38 @@ register_temp_file() {
   [ -n "${TEMP_FILE_REGISTRY:-}" ] && printf '%s\0' "$1" >> "$TEMP_FILE_REGISTRY"
 }
 
-# mktemp_registered -> creates a temp file via mktemp AND registers it for
-# cleanup in one call, printing its path. This does not fully close the gap
-# between file creation and registration (bash has no atomic
-# "create+register" primitive), but it removes the "a new mktemp call site
-# forgot to also call register_temp_file" failure mode entirely, and
-# narrows the residual race to one place instead of one per call site. The
-# residual risk -- at most one small leaked temp file, only if a signal
-# lands in this exact one-line-wide gap -- is accepted as proportional to
-# this being a local developer tool, not a hardened service.
+# mktemp_registered VARNAME -> creates a temp file via mktemp, registers it
+# for cleanup, and assigns its path to the variable NAMED by VARNAME (via
+# `printf -v`, bash 3.1+) -- takes an output variable name rather than
+# printing to stdout for the caller to capture with `$(...)`.
+#
+# An earlier revision printed to stdout so call sites read
+# `VAR="$(mktemp_registered)"` -- but that wraps the ENTIRE function,
+# including its own `register_temp_file` call, in a command-substitution
+# subshell. `on_signal`'s cleanup then races that subshell: a live Bash 3.2
+# check confirmed the INT/TERM trap can run in the PARENT while the child
+# subshell is still executing (command-substitution children aren't part of
+# `jobs -p`'s catch-all, unlike a `&`-backgrounded job), so
+# cleanup_temp_files could unlink TEMP_FILE_REGISTRY at the exact moment the
+# child is still appending to (or, if already unlinked, silently
+# recreating) that same path -- a genuinely NEW concurrent-file-access race
+# this consolidation introduced, worse than the plain "not registered yet"
+# gap it was meant to reduce. Passing the output variable name instead
+# keeps `register_temp_file` running in the CALLER's own process (never a
+# subshell), so cleanup and registration are never concurrent on the same
+# file again. The internal `f="$(mktemp)"` still forks a child for the
+# external `mktemp` command itself -- unavoidable (capturing its stdout
+# requires some form of command substitution) and no worse than the
+# original, pre-hardening exposure every mktemp call in this file has
+# always had: if a signal lands there, the created file is simply not yet
+# registered (the original, smaller, accepted residual risk), since
+# `mktemp` itself never touches TEMP_FILE_REGISTRY.
 mktemp_registered() {
+  local __mktemp_registered_var="$1"
   local f
   f="$(mktemp)"
   register_temp_file "$f"
-  printf '%s' "$f"
+  printf -v "$__mktemp_registered_var" '%s' "$f"
 }
 
 # is_binary_content FILE -> exit 0 if FILE contains any NUL byte, 1 otherwise.
@@ -153,7 +171,7 @@ format_untracked_entry() {
     # below ever gets a chance to run. This ONLY works because this
     # function is called directly (never via `$(...)`) -- see the block
     # comment above.
-    UNTRACKED_TMPOUT="$(mktemp_registered)"
+    mktemp_registered UNTRACKED_TMPOUT
     read_bounded "$path" "$UNTRACKED_TMPOUT" 3 1048576
     read_status=$?
     # Re-check identity after the read: the earlier -L/-f checks and this
@@ -731,7 +749,7 @@ esac
 # live on this machine) polluted DIFF_TEXT with non-diff text, which could
 # both defeat the empty-diff CLEAN shortcut and get sent to Codex as if it
 # were reviewable content.
-GIT_STDERR_FILE="$(mktemp_registered)"
+mktemp_registered GIT_STDERR_FILE
 
 case "$SCOPE" in
   uncommitted)
@@ -755,7 +773,7 @@ case "$SCOPE" in
       # preceding `git diff` already succeeded so its old contents are no
       # longer needed) -- see enumerate_untracked_files above for why it must
       # stay separate from UNTRACKED_LIST_FILE.
-      UNTRACKED_LIST_FILE="$(mktemp_registered)"
+      mktemp_registered UNTRACKED_LIST_FILE
       enumerate_untracked_files "$CWD" "$UNTRACKED_LIST_FILE" "$GIT_STDERR_FILE"
       UNTRACKED_LIST_STATUS=$?
       if [ "$UNTRACKED_LIST_STATUS" -ne 0 ]; then
@@ -771,7 +789,7 @@ case "$SCOPE" in
       # down) is even in effect. Called DIRECTLY (never via `$(...)`) so
       # read_bounded's READ_PID and format_untracked_entry's UNTRACKED_TMPOUT
       # stay visible to on_signal in THIS process, not a forked subshell.
-      UNTRACKED_DIFF_FILE="$(mktemp_registered)"
+      mktemp_registered UNTRACKED_DIFF_FILE
       collect_untracked_diff "$CWD" "$UNTRACKED_LIST_FILE" 30 "$UNTRACKED_DIFF_FILE"
       UNTRACKED_COLLECTION_STATUS=$?
       DIFF_TEXT="$DIFF_TEXT$(cat "$UNTRACKED_DIFF_FILE" 2>/dev/null)"
@@ -826,7 +844,7 @@ fi
 # can't be pre-guessed and embedded in a crafted diff ahead of time.
 BOUNDARY="DIFF_$$_${RANDOM}${RANDOM}"
 
-PROMPT_FILE="$(mktemp_registered)"
+mktemp_registered PROMPT_FILE
 {
   echo "Review the following git diff for correctness bugs, security issues, and reuse/simplification opportunities."
   if [ -n "$FOCUS" ]; then
@@ -851,8 +869,8 @@ PROMPT_FILE="$(mktemp_registered)"
   echo "</$BOUNDARY>"
 } > "$PROMPT_FILE"
 
-EVENTLOG="$(mktemp_registered)"
-OUTFILE="$(mktemp_registered)"
+mktemp_registered EVENTLOG
+mktemp_registered OUTFILE
 
 set -m
 (
