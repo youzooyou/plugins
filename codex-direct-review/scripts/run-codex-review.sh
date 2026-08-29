@@ -32,9 +32,17 @@ judge_result() {
 
   if ! jq -e '
         (.verdict == "CLEAN" or .verdict == "ISSUES") and
-        has("summary") and
+        has("summary") and (.summary == null or (.summary | type) == "string") and
+        ((keys_unsorted - ["verdict","findings","summary"]) == []) and
         (.findings | type == "array") and
-        (.findings | all(has("file") and has("summary") and has("evidence")))
+        (.findings | all(
+          (has("file") and (.file | type) == "string") and
+          (has("line") and (.line == null or (.line | type) == "number")) and
+          (has("severity") and (.severity == null or (.severity | type) == "string")) and
+          (has("summary") and (.summary | type) == "string") and
+          (has("evidence") and (.evidence | type) == "string") and
+          ((keys_unsorted - ["file","line","severity","summary","evidence"]) == [])
+        ))
       ' "$outfile" >/dev/null 2>&1; then
     printf '{"ok":false,"reason":"schema_mismatch","detail":"output JSON does not match review-verdict schema"}\n'
     return 1
@@ -78,6 +86,12 @@ run_selftest() {
   echo '{"verdict":"MAYBE","findings":"not-an-array"}' > "$tmp/wrong_shape.json"
   out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/wrong_shape.json")"
   echo "$out" | jq -e '.reason == "schema_mismatch"' >/dev/null 2>&1 || { echo "FAIL: schema_mismatch case: $out"; fail=1; }
+
+  # Case 7: keys present but wrong types / extra root key -- the check must
+  # verify types and reject unknown properties, not just key presence.
+  echo '{"verdict":"CLEAN","findings":[{"file":false,"summary":0,"evidence":[],"line":null,"severity":null}],"summary":null,"unexpected":true}' > "$tmp/wrong_types.json"
+  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/wrong_types.json")"
+  echo "$out" | jq -e '.reason == "schema_mismatch"' >/dev/null 2>&1 || { echo "FAIL: wrong_types case: $out"; fail=1; }
 
   rm -rf "$tmp"
 
@@ -179,7 +193,12 @@ esac
 
 case "$SCOPE" in
   uncommitted)
-    DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff HEAD 2>&1)"
+    # --no-ext-diff --no-textconv: git diff/show otherwise honor an inherited
+    # GIT_EXTERNAL_DIFF env var or a repo-configured diff/textconv driver,
+    # letting an untrusted repo run arbitrary commands here -- well before
+    # the read-only sandbox (which only wraps the later `codex exec` call)
+    # is anywhere near relevant.
+    DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv HEAD 2>&1)"
     GIT_STATUS=$?
     if [ "$GIT_STATUS" -eq 0 ]; then
       # git diff HEAD only covers tracked files -- also pull in untracked
@@ -200,9 +219,30 @@ case "$SCOPE" in
           DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE (symlink -> $LINK_TARGET; target contents not read) ---"
         elif [ -f "$CWD/$UNTRACKED_FILE" ]; then
-          DIFF_TEXT="$DIFF_TEXT
+          # Check size before reading (avoids buffering an unbounded amount
+          # of content into memory/the prompt) and check cat's own exit
+          # status -- an unreadable (permission-denied) or raced (deleted
+          # mid-loop) file previously degraded silently to an empty content
+          # block, letting a review pass CLEAN without ever having actually
+          # seen that file.
+          UNTRACKED_SIZE="$(wc -c < "$CWD/$UNTRACKED_FILE" 2>/dev/null | tr -d ' ')"
+          if [ -z "$UNTRACKED_SIZE" ]; then
+            DIFF_TEXT="$DIFF_TEXT
+--- new untracked file: $UNTRACKED_FILE (could not be read; contents omitted) ---"
+          elif [ "$UNTRACKED_SIZE" -gt 1048576 ]; then
+            DIFF_TEXT="$DIFF_TEXT
+--- new untracked file: $UNTRACKED_FILE (${UNTRACKED_SIZE} bytes, over 1MB cap; contents omitted) ---"
+          else
+            UNTRACKED_CONTENT="$(cat "$CWD/$UNTRACKED_FILE" 2>/dev/null)"
+            if [ $? -ne 0 ]; then
+              DIFF_TEXT="$DIFF_TEXT
+--- new untracked file: $UNTRACKED_FILE (could not be read; contents omitted) ---"
+            else
+              DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE ---
-$(cat "$CWD/$UNTRACKED_FILE" 2>/dev/null)"
+$UNTRACKED_CONTENT"
+            fi
+          fi
         else
           # Whitelist regular files only -- anything else (FIFO, device,
           # socket) is read here, not just symlinks. `cat` on an untracked
@@ -215,8 +255,8 @@ $(cat "$CWD/$UNTRACKED_FILE" 2>/dev/null)"
       done < <(cd "$CWD" 2>/dev/null && git ls-files -z --others --exclude-standard 2>/dev/null)
     fi
     ;;
-  base)   DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff "${SCOPE_VALUE}...HEAD" 2>&1)"; GIT_STATUS=$? ;;
-  commit) DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git show "$SCOPE_VALUE" 2>&1)"; GIT_STATUS=$? ;;
+  base)   DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv "${SCOPE_VALUE}...HEAD" 2>&1)"; GIT_STATUS=$? ;;
+  commit) DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git show --no-ext-diff --no-textconv "$SCOPE_VALUE" 2>&1)"; GIT_STATUS=$? ;;
 esac
 
 if [ "$GIT_STATUS" -ne 0 ]; then
@@ -262,6 +302,23 @@ PROMPT_FILE="$(mktemp)"
 
 EVENTLOG="$(mktemp)"
 OUTFILE="$(mktemp)"
+
+# If the wrapper itself is interrupted (Ctrl-C, a parent process killing it,
+# an early shell exit), the timeout branch below never runs -- without this
+# trap, the backgrounded codex process group would keep running as a true
+# orphan with nothing left to enforce any timeout on it at all. Verified live:
+# without this trap, SIGTERM to the wrapper kills the wrapper but leaves the
+# codex child running; with it, the child is confirmed terminated.
+on_signal() {
+  if [ -n "${CODEX_PID:-}" ]; then
+    kill -TERM -"$CODEX_PID" 2>/dev/null
+    sleep 1
+    kill -KILL -"$CODEX_PID" 2>/dev/null
+  fi
+  printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
+  exit 1
+}
+trap on_signal INT TERM
 
 set -m
 (

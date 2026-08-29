@@ -10,6 +10,7 @@ import os
 import sys
 
 HANDOFF_REL_PATH = os.path.join(".claude", "handoff", "latest.md")
+MAX_HANDOFF_BYTES = 262144  # 256 KiB -- generous for a handoff note, bounded
 
 
 def build_output(payload):
@@ -19,7 +20,18 @@ def build_output(payload):
     if not cwd:
         return None
     handoff_path = os.path.join(cwd, HANDOFF_REL_PATH)
+    if os.path.islink(handoff_path):
+        # Never follow this path if it's a symlink -- it could point at an
+        # arbitrary readable file outside the project (e.g. ~/.ssh/id_rsa),
+        # whose content would otherwise get injected straight into the
+        # fresh session's context.
+        return None
     if not os.path.isfile(handoff_path):
+        return None
+    try:
+        if os.path.getsize(handoff_path) > MAX_HANDOFF_BYTES:
+            return None
+    except OSError:
         return None
     with open(handoff_path, "r", encoding="utf-8") as f:
         content = f.read().strip()
