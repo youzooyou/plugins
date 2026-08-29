@@ -242,7 +242,8 @@ on_signal() {
   for job_pid in $(jobs -p 2>/dev/null); do
     kill -KILL "$job_pid" 2>/dev/null
   done
-  rm -f "${PROMPT_FILE:-}" "${EVENTLOG:-}" "${OUTFILE:-}" "${UNTRACKED_TMPOUT:-}" 2>/dev/null
+  rm -f "${PROMPT_FILE:-}" "${EVENTLOG:-}" "${OUTFILE:-}" "${UNTRACKED_TMPOUT:-}" \
+        "${GIT_STDERR_FILE:-}" "${UNTRACKED_LIST_FILE:-}" 2>/dev/null
   printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
   exit 1
 }
@@ -263,6 +264,14 @@ case "$SCOPE" in
     ;;
 esac
 
+# Stderr is captured into its own file, never merged into DIFF_TEXT --
+# merging it (an earlier revision's `2>&1`) meant a successful git call that
+# still emits a warning (e.g. an fsmonitor or xcrun cache warning, observed
+# live on this machine) polluted DIFF_TEXT with non-diff text, which could
+# both defeat the empty-diff CLEAN shortcut and get sent to Codex as if it
+# were reviewable content.
+GIT_STDERR_FILE="$(mktemp)"
+
 case "$SCOPE" in
   uncommitted)
     # --no-ext-diff --no-textconv: git diff/show otherwise honor an inherited
@@ -270,19 +279,42 @@ case "$SCOPE" in
     # letting an untrusted repo run arbitrary commands here -- well before
     # the read-only sandbox (which only wraps the later `codex exec` call)
     # is anywhere near relevant.
-    DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv HEAD 2>&1)"
+    DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv HEAD 2>"$GIT_STDERR_FILE")"
     GIT_STATUS=$?
     if [ "$GIT_STATUS" -eq 0 ]; then
       # git diff HEAD only covers tracked files -- also pull in untracked
       # files ourselves so --uncommitted actually matches its documented
       # "staged + unstaged + untracked" scope, without mutating the index
       # (no `git add -N`, which /cc's own Phase 0 already avoids for the
-      # same reason). Use -z (NUL-delimited) output: git C-quotes unusual
-      # filenames (non-ASCII, tabs, quotes, newlines) in its normal output,
-      # which a plain line-based read would otherwise treat as a literal
-      # (wrong, quote-mark-and-all) path.
+      # same reason). Enumerate into a temp file (not process substitution)
+      # so its own exit status is actually captured -- process substitution
+      # silently discarded a failure here (e.g. a bad core.excludesFile
+      # config), leaving untracked files unexamined with no error surfaced.
+      UNTRACKED_LIST_FILE="$(mktemp)"
+      ( cd "$CWD" 2>/dev/null && git ls-files -z --others --exclude-standard > "$UNTRACKED_LIST_FILE" 2>&1 )
+      UNTRACKED_LIST_STATUS=$?
+      if [ "$UNTRACKED_LIST_STATUS" -ne 0 ]; then
+        DETAIL_JSON="$(head -1 "$UNTRACKED_LIST_FILE" 2>/dev/null | jq -Rs '"failed to enumerate untracked files: " + .')"
+        rm -f "$UNTRACKED_LIST_FILE" "$GIT_STDERR_FILE"
+        printf '{"ok":false,"reason":"git_error","detail":%s}\n' "$DETAIL_JSON"
+        exit 1
+      fi
+      # Aggregate budget for the whole loop, separate from each file's own
+      # 3s cap -- many untracked files, each individually bounded, could
+      # otherwise still add up to a long delay before the main --timeout
+      # deadline (set up much further down) is even in effect.
+      UNTRACKED_LOOP_DEADLINE=$((SECONDS + 30))
+      # Use -z (NUL-delimited) output: git C-quotes unusual filenames
+      # (non-ASCII, tabs, quotes, newlines) in its normal output, which a
+      # plain line-based read would otherwise treat as a literal (wrong,
+      # quote-mark-and-all) path.
       while IFS= read -r -d '' UNTRACKED_FILE; do
         [ -n "$UNTRACKED_FILE" ] || continue
+        if [ "$SECONDS" -ge "$UNTRACKED_LOOP_DEADLINE" ]; then
+          DIFF_TEXT="$DIFF_TEXT
+--- untracked-file collection stopped after a 30s aggregate budget; remaining untracked files not examined ---"
+          break
+        fi
         if [ -L "$CWD/$UNTRACKED_FILE" ]; then
           # Never dereference an untracked symlink -- `cat` would follow it
           # and could leak the contents of an arbitrary file outside the
@@ -331,18 +363,40 @@ $(cat "$UNTRACKED_TMPOUT" 2>/dev/null)"
           DIFF_TEXT="$DIFF_TEXT
 --- new untracked file: $UNTRACKED_FILE (not a regular file; contents not read) ---"
         fi
-      done < <(cd "$CWD" 2>/dev/null && git ls-files -z --others --exclude-standard 2>/dev/null)
+      done < "$UNTRACKED_LIST_FILE"
+      rm -f "$UNTRACKED_LIST_FILE"
     fi
     ;;
-  base)   DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv "${SCOPE_VALUE}...HEAD" 2>&1)"; GIT_STATUS=$? ;;
-  commit) DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git show --no-ext-diff --no-textconv "$SCOPE_VALUE" 2>&1)"; GIT_STATUS=$? ;;
+  base)
+    DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv "${SCOPE_VALUE}...HEAD" 2>"$GIT_STDERR_FILE")"
+    GIT_STATUS=$?
+    ;;
+  commit)
+    # git show on a MERGE commit prints only metadata (author/date/message),
+    # no actual patch, unless told otherwise -- verified live against a real
+    # merge commit in this repo. That metadata text is non-empty, so the
+    # empty-diff shortcut below never fires, and Codex would be asked to
+    # review commit trivia instead of real changes, silently able to return
+    # a meaningless CLEAN. Detect a merge (2+ parents) and diff explicitly
+    # against its first parent instead, so --commit on a merge still yields
+    # its actual code changes.
+    PARENT_COUNT="$(cd "$CWD" 2>/dev/null && git show -s --format=%P --no-ext-diff --no-textconv "$SCOPE_VALUE" 2>/dev/null | wc -w | tr -d ' ')"
+    if [ -n "$PARENT_COUNT" ] && [ "$PARENT_COUNT" -ge 2 ]; then
+      DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv "${SCOPE_VALUE}^1" "$SCOPE_VALUE" 2>"$GIT_STDERR_FILE")"
+    else
+      DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git show --no-ext-diff --no-textconv "$SCOPE_VALUE" 2>"$GIT_STDERR_FILE")"
+    fi
+    GIT_STATUS=$?
+    ;;
 esac
 
 if [ "$GIT_STATUS" -ne 0 ]; then
-  DETAIL_JSON="$(printf '%s' "$DIFF_TEXT" | head -1 | jq -Rs --arg scope "$SCOPE" '"git command failed for scope " + $scope + ": " + .')"
+  DETAIL_JSON="$(head -1 "$GIT_STDERR_FILE" 2>/dev/null | jq -Rs --arg scope "$SCOPE" '"git command failed for scope " + $scope + ": " + .')"
+  rm -f "$GIT_STDERR_FILE"
   printf '{"ok":false,"reason":"git_error","detail":%s}\n' "$DETAIL_JSON"
   exit 1
 fi
+rm -f "$GIT_STDERR_FILE"
 
 if [ -z "$DIFF_TEXT" ]; then
   printf '{"ok":true,"verdict":{"verdict":"CLEAN","findings":[],"summary":null}}\n'

@@ -31,7 +31,7 @@ Write a project-local note capturing THIS work's state — not durable facts:
 - Concrete next steps
 - Relevant file:line references
 
-Target path: `<project-root>/.claude/handoff/latest.md`, where project-root is the current working directory. **Always overwrite** — this file holds only the latest state, and it's the exact path the `session-resume-handoff.py` hook reads after `/clear`. Never move it elsewhere. Run this skill (and `/clear` afterward) from that same project-root directory — the hook looks the file up by the exact `cwd` it's given.
+Target path: `<project-root>/.claude/handoff/latest.md`, where project-root is the current working directory. **Always overwrite** — this file holds only the latest state, and it's the exact path the `session-resume-handoff.py` hook reads after `/clear`. Never move it elsewhere. Run this skill (and `/clear` afterward) from that same project-root directory — the hook looks the file up by the exact `cwd` it's given. Before writing, check the path isn't a symlink (`.claude`, `.claude/handoff`, or `latest.md` itself) — the hook refuses to follow one on read, and writing through one would put the note somewhere other than the project-local location this whole mechanism assumes.
 
 If the project already has an existing progress-doc convention (e.g. `.claude/plans/`), also copy the same content verbatim to `.claude/plans/handoff-<YYYY-MM-DD>.md` (dated, never overwritten) for human reference. Write the canonical `.claude/handoff/latest.md` first regardless — that's the only path the hook ever reads.
 
