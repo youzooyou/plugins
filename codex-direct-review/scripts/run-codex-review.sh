@@ -374,7 +374,16 @@ case "$SCOPE" in
       UNTRACKED_PID=""
       case "$UNTRACKED_STATUS" in
         0)
-          DIFF_TEXT="$DIFF_TEXT$(cat "$UNTRACKED_OUT_FILE" 2>/dev/null)"
+          # Plain `$(cat FILE)` strips ALL trailing newline bytes -- a
+          # universal bash command-substitution behavior, not specific to
+          # `cat` -- which would silently drop the last untracked file's
+          # own trailing blank line(s) from what Codex actually reviews,
+          # undercutting the raw-byte-preservation the Python side already
+          # guarantees. Append a non-newline sentinel, capture that too,
+          # then strip only the sentinel: any REAL trailing newlines from
+          # the collector's own output survive intact.
+          UNTRACKED_CAPTURE="$(cat "$UNTRACKED_OUT_FILE" 2>/dev/null; printf 'x')"
+          DIFF_TEXT="$DIFF_TEXT${UNTRACKED_CAPTURE%x}"
           ;;
         2)
           DETAIL_JSON="$(cat "$UNTRACKED_ERR_FILE" 2>/dev/null | jq -Rs .)"

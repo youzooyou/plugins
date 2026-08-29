@@ -255,6 +255,15 @@ def collect(cwd_bytes, deadline_secs, max_bytes):
         if time.monotonic() >= deadline:
             return parts, True, None
         parts.extend(format_entry(cwd_bytes, rel_path_bytes, max_bytes))
+    # The deadline check above only gates whether a file's processing
+    # STARTS within budget -- a single file's own read can still take up
+    # to PER_FILE_TIMEOUT_SECS, which can push the loop's total elapsed
+    # time past `deadline` even though every per-file check passed. Check
+    # once more after the loop finishes normally, so "incomplete" reflects
+    # whether the WHOLE collection finished within its aggregate budget,
+    # not just whether every file happened to start in time.
+    if time.monotonic() >= deadline:
+        return parts, True, None
     return parts, False, None
 
 
@@ -408,6 +417,44 @@ def _selftest():
         check(incomplete is True, "deadline case: did not report incomplete")
         check(error_detail is None, f"deadline case: unexpected error {error_detail}")
 
+    # Case 8b: the aggregate deadline is ALSO checked after the loop
+    # finishes, not just before each file starts -- a single file's own
+    # processing time can push total elapsed time past the deadline even
+    # though every per-file pre-check passed (the medium finding from
+    # round 3's review). Verified by monkey-patching format_entry (via
+    # sys.modules[__name__], same technique as the PER_FILE_TIMEOUT_SECS
+    # patch above -- a fresh `import` here would hit the same separate-
+    # module-object trap) to simulate a file whose processing alone
+    # exceeds a very short deadline.
+    this_module = sys.modules[__name__]
+    original_format_entry = this_module.format_entry
+
+    def _slow_format_entry(cwd_bytes, rel_path_bytes, max_bytes):
+        time.sleep(0.2)
+        return ["\n--- new untracked file: slow (simulated) ---"]
+
+    this_module.format_entry = _slow_format_entry
+    try:
+        with tempfile.TemporaryDirectory() as repo:
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+            with open(os.path.join(repo, "README.md"), "w", encoding="utf-8") as f:
+                f.write("readme\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+            with open(os.path.join(repo, "onlyfile.txt"), "w", encoding="utf-8") as f:
+                f.write("content")
+            # 0.1s passes the PRE-file check (the loop has barely started),
+            # but the single (patched, 0.2s) file read alone exceeds it.
+            parts, incomplete, error_detail = collect(os.fsencode(repo), deadline_secs=0.1, max_bytes=DEFAULT_MAX_BYTES)
+            check(
+                incomplete is True,
+                "post-loop deadline case: did not report incomplete when the last file's own processing exceeded the aggregate budget",
+            )
+    finally:
+        this_module.format_entry = original_format_entry
+
     # Case 9: sufficient deadline -> file collected, not flagged incomplete
     with tempfile.TemporaryDirectory() as repo:
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
@@ -452,17 +499,29 @@ def _selftest():
     # design, which had no dir_fd primitive and HAD to check-then-open)
     # actually holds under real concurrent swapping, not just against a
     # static fixture.
+    #
+    # The child reports back how many swaps it actually performed (via a
+    # plain file, written once at the end -- not a live handshake, but
+    # enough to prove the race was meaningfully exercised) and its exit
+    # status is checked, so a "no leak" result cannot come from a child
+    # that crashed immediately or somehow performed zero swaps -- a real
+    # gap Codex found in an earlier revision of this exact test (it
+    # suppressed every child-side OSError and never checked the child's
+    # outcome at all, so a "no leak" could trivially mean "the race never
+    # actually happened").
     with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as outside:
         os.makedirs(os.path.join(outside, "dir"))
         with open(os.path.join(outside, "dir", "file.txt"), "w", encoding="utf-8") as f:
             f.write("SECRET_VIA_RACE")
         proj_dir_path = os.path.join(proj, "dir")
         outside_target = os.path.join(outside, "dir")
+        swap_count_path = os.path.join(proj, ".swap_count")
 
         pid = os.fork()
         if pid == 0:
             end = time.monotonic() + 1.0
             toggle = 0
+            swaps = 0
             while time.monotonic() < end:
                 try:
                     if os.path.islink(proj_dir_path):
@@ -475,9 +534,15 @@ def _selftest():
                             f.write("decoy")
                     else:
                         os.symlink(outside_target, proj_dir_path)
+                    swaps += 1
                 except OSError:
                     pass
                 toggle += 1
+            try:
+                with open(swap_count_path, "w", encoding="utf-8") as f:
+                    f.write(str(swaps))
+            except OSError:
+                pass
             os._exit(0)
 
         try:
@@ -490,8 +555,25 @@ def _selftest():
                     break
             check(not leaked, "intermediate-symlink RACE case: secret leaked under genuine concurrent directory swapping")
         finally:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
+            _, wait_status = os.waitpid(pid, 0)
+            check(
+                os.WIFEXITED(wait_status) and os.WEXITSTATUS(wait_status) == 0,
+                f"intermediate-symlink RACE case: child did not exit cleanly (wait status {wait_status})",
+            )
+
+        try:
+            with open(swap_count_path, "r", encoding="utf-8") as f:
+                swap_count = int(f.read().strip())
+        except (OSError, ValueError):
+            swap_count = 0
+        # A conservative floor (not e.g. 100+) so this stays reliable on a
+        # slow/loaded machine -- each swap is only a few syscalls, so even
+        # under heavy contention, ten full swaps in a whole second would be
+        # an extreme, most-likely-broken slowdown, not normal variance.
+        check(
+            swap_count > 10,
+            f"intermediate-symlink RACE case: child only performed {swap_count} swaps -- race was not meaningfully exercised",
+        )
 
     # Case 11: valid-but-non-UTF-8, NUL-free content -> passed through byte
     # for byte, never corrupted via errors="replace" (the medium finding
