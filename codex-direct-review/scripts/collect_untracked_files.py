@@ -76,11 +76,16 @@ def _alarm_handler(signum, frame):
     raise _ReadTimeout()
 
 
-def read_with_timeout(f, max_bytes):
-    """f.read(), bounded by a wall-clock SIGALRM in addition to whatever
-    byte cap the caller passes -- protects against a single pathologically
-    slow read (e.g. a stalled network filesystem) that the aggregate
-    between-files deadline check alone cannot interrupt.
+def run_with_timeout(func, *args, timeout_secs=PER_FILE_TIMEOUT_SECS, **kwargs):
+    """Runs func(*args, **kwargs) under a SIGALRM-based wall-clock timeout
+    covering the ENTIRE call. Raises _ReadTimeout if it fires before func
+    returns.
+
+    An earlier revision only wrapped the final `.read()` call this way,
+    leaving the preceding open()/fstat() completely unbounded -- a stalled
+    filesystem's metadata lookups can hang exactly like its data reads can,
+    so the timeout needs to cover the whole per-file operation, not just
+    the read at the end of it.
 
     The handler-install and the alarm arm/disarm are each in their OWN
     try/finally, nested, rather than one try starting only after both setup
@@ -91,16 +96,16 @@ def read_with_timeout(f, max_bytes):
     completely unrelated) and the old handler never restored."""
     old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
     try:
-        signal.alarm(PER_FILE_TIMEOUT_SECS)
+        signal.alarm(timeout_secs)
         try:
-            return f.read(max_bytes + 1)
+            return func(*args, **kwargs)
         finally:
             signal.alarm(0)
     finally:
         signal.signal(signal.SIGALRM, old_handler)
 
 
-def list_untracked_files(cwd_bytes):
+def list_untracked_files(cwd_bytes, timeout_secs):
     """Returns (files_bytes, error_detail). error_detail is None on
     success. files_bytes is a list of raw path bytes -- NOT decoded, so
     filesystem operations on them can never diverge from what git actually
@@ -109,14 +114,23 @@ def list_untracked_files(cwd_bytes):
     Uses subprocess.run with no shell involved -- argument-array exec, not
     a shell command string, so there is no injection risk and no way for
     stdout/stderr to be accidentally merged (the exact c1 bug this file's
-    bash predecessor once had via `2>&1`)."""
+    bash predecessor once had via `2>&1`). Bounded by `timeout_secs` (the
+    caller's aggregate deadline) -- an earlier revision had no timeout at
+    all here, so a stalled `git ls-files` (e.g. a lock file, a pathological
+    repo state) could hang the entire collection indefinitely, before the
+    deadline-tracking loop even started. subprocess.run's own timeout
+    handling kills the child process itself on expiry, so a timed-out git
+    process is not left running either."""
     try:
         result = subprocess.run(
             ["git", "ls-files", "-z", "--others", "--exclude-standard"],
             cwd=cwd_bytes,
             capture_output=True,
             check=False,
+            timeout=timeout_secs,
         )
+    except subprocess.TimeoutExpired:
+        return None, f"git ls-files did not complete within {timeout_secs}s"
     except OSError as exc:
         return None, f"failed to run git: {exc}"
     if result.returncode != 0:
@@ -159,14 +173,21 @@ def open_nofollow_chain(cwd_bytes, rel_path_bytes):
         # newly-opened descriptor with no other reference anywhere -- an
         # earlier revision's single `try/finally: os.close(fd)` around just
         # the open call left exactly this second case leaking `next_fd`.
+        #
+        # `except BaseException` (not just OSError) at both points: this
+        # chain runs inside run_with_timeout's SIGALRM window when called
+        # from format_entry, and a timeout firing WHILE blocked inside one
+        # of these os.open() calls raises _ReadTimeout (not an OSError) at
+        # that exact point -- narrower exception handling here would skip
+        # the fd cleanup entirely on that path and leak it.
         try:
             next_fd = os.open(part, flags, dir_fd=fd)
-        except OSError:
+        except BaseException:
             os.close(fd)
             raise
         try:
             os.close(fd)
-        except OSError:
+        except BaseException:
             os.close(next_fd)
             raise
         fd = next_fd
@@ -179,13 +200,25 @@ def format_entry(cwd_bytes, rel_path_bytes, max_bytes):
     content never has to be decoded (and potentially corrupted) to be
     concatenated with the surrounding marker text. Never dereferences a
     symlink at any path component, never blocks on a FIFO, never embeds
-    NUL/binary content as text, never silently rewrites non-UTF-8 content."""
-    rel_display = rel_path_bytes.decode("utf-8", errors="replace")
+    NUL/binary content as text, never silently rewrites non-UTF-8 content.
 
+    The entire body runs under run_with_timeout -- an earlier revision only
+    wrapped the final read() call, leaving the preceding open()/fstat()
+    completely unbounded. A stalled filesystem (e.g. a hung network mount)
+    can make the OPEN or the metadata lookup hang just as easily as the
+    data read, and this must be bounded the same way either can."""
+    rel_display = rel_path_bytes.decode("utf-8", errors="replace")
+    try:
+        return run_with_timeout(_format_entry_body, cwd_bytes, rel_path_bytes, rel_display, max_bytes)
+    except _ReadTimeout:
+        return [f"\n--- new untracked file: {rel_display} (could not be safely read; contents omitted) ---"]
+
+
+def _format_entry_body(cwd_bytes, rel_path_bytes, rel_display, max_bytes):
     fd = None
     try:
         fd = open_nofollow_chain(cwd_bytes, rel_path_bytes)
-    except OSError as exc:
+    except OSError:
         abs_path = os.path.join(cwd_bytes, rel_path_bytes)
         # A simple, common case -- the leaf itself is (still) a plain
         # symlink -- gets a specific, informative marker via a read-only
@@ -221,10 +254,7 @@ def format_entry(cwd_bytes, rel_path_bytes, max_bytes):
             return [f"\n--- new untracked file: {rel_display} (over 1MB cap or unreadable; contents omitted) ---"]
         with os.fdopen(fd, "rb") as f:
             fd = None  # ownership transferred to the file object
-            try:
-                data = read_with_timeout(f, max_bytes)
-            except _ReadTimeout:
-                return [f"\n--- new untracked file: {rel_display} (could not be safely read; contents omitted) ---"]
+            data = f.read(max_bytes + 1)
         if len(data) > max_bytes:
             # Grew between fstat and read (rare, e.g. a concurrent writer).
             return [f"\n--- new untracked file: {rel_display} (over 1MB cap or unreadable; contents omitted) ---"]
@@ -244,13 +274,22 @@ def format_entry(cwd_bytes, rel_path_bytes, max_bytes):
 
 def collect(cwd_bytes, deadline_secs, max_bytes):
     """Returns (parts, incomplete, error_detail). parts is a flat list of
-    str/bytes fragments, in the same mixed-type shape format_entry returns."""
-    files, error_detail = list_untracked_files(cwd_bytes)
+    str/bytes fragments, in the same mixed-type shape format_entry returns.
+
+    `deadline` is computed ONCE, here, before `git ls-files` even runs, and
+    the TIME REMAINING against that single deadline is what bounds the git
+    call -- not a fresh `deadline_secs`-sized budget of its own. An earlier
+    revision computed the per-file-loop deadline only after `git ls-files`
+    returned, which gave git an ADDITIONAL, separate `deadline_secs` on top
+    of whatever the loop later got -- silently doubling the true aggregate
+    budget this function is documented to enforce."""
+    deadline = time.monotonic() + deadline_secs
+    remaining = max(0, deadline - time.monotonic())
+    files, error_detail = list_untracked_files(cwd_bytes, remaining)
     if error_detail is not None:
         return [], False, error_detail
 
     parts = []
-    deadline = time.monotonic() + deadline_secs
     for rel_path_bytes in files:
         if time.monotonic() >= deadline:
             return parts, True, None
@@ -397,12 +436,35 @@ def _selftest():
         subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
         with open(os.path.join(repo, "realfile.txt"), "w", encoding="utf-8") as f:
             f.write("content")
-        files, error_detail = list_untracked_files(os.fsencode(repo))
+        files, error_detail = list_untracked_files(os.fsencode(repo), DEFAULT_DEADLINE_SECS)
         check(error_detail is None, f"real repo case: unexpected error {error_detail}")
         check(files == [b"realfile.txt"], f"real repo case: wrong file list {files}")
 
-    # Case 8: deadline exceeded -> incomplete=True, real files not silently
-    # skipped without a signal (the b4 regression class)
+    # Case 7b: git ls-files itself is bounded by the aggregate deadline --
+    # an earlier revision had no timeout on this subprocess call at all, so
+    # a hung git process (e.g. a lock file, a pathological repo state)
+    # could block the entire collection indefinitely before the
+    # deadline-tracking loop even started.
+    with tempfile.TemporaryDirectory() as repo:
+        files, error_detail = list_untracked_files(os.fsencode(repo), timeout_secs=0)
+        check(files is None, "git-timeout case: expected no file list on timeout")
+        check(
+            error_detail is not None and "did not complete" in error_detail,
+            f"git-timeout case: wrong error detail {error_detail!r}",
+        )
+
+    # Case 8: an already-past deadline (before git even runs) never
+    # silently succeeds -- real files are not silently skipped without ANY
+    # signal (the b4 regression class). Since `collect` now computes ONE
+    # deadline up front and gives git ls-files only the time REMAINING
+    # against it (see collect's own comment on why -- an earlier revision
+    # gave git a full separate deadline_secs budget of its own, silently
+    # doubling the true aggregate), an already-negative deadline means git
+    # itself gets essentially zero time and fails fast with error_detail
+    # set, rather than reaching the per-file loop at all. Either way
+    # (error_detail set, or incomplete=True) is an acceptable, honest
+    # signal that examination did not complete -- what matters is that it
+    # is never silently False/None on both.
     with tempfile.TemporaryDirectory() as repo:
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
         subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True)
@@ -414,8 +476,10 @@ def _selftest():
         with open(os.path.join(repo, "onlyfile.txt"), "w", encoding="utf-8") as f:
             f.write("content")
         parts, incomplete, error_detail = collect(os.fsencode(repo), deadline_secs=-1, max_bytes=DEFAULT_MAX_BYTES)
-        check(incomplete is True, "deadline case: did not report incomplete")
-        check(error_detail is None, f"deadline case: unexpected error {error_detail}")
+        check(
+            incomplete is True or error_detail is not None,
+            f"deadline case: silently succeeded (incomplete={incomplete}, error_detail={error_detail!r}) with a real untracked file present",
+        )
 
     # Case 8b: the aggregate deadline is ALSO checked after the loop
     # finishes, not just before each file starts -- a single file's own
@@ -611,40 +675,32 @@ def _selftest():
             out = _parts_to_text(format_entry(os.fsencode(proj), bad_name, DEFAULT_MAX_BYTES))
             check("content for the odd-named file" in out, "non-UTF-8 filename case: wrong file opened or not found")
 
-    # Case 13: read_with_timeout actually bounds a slow read, tested
-    # directly against a synthetic slow file-like object rather than
-    # trying to force a real slow read through the filesystem. A FIFO
-    # cannot be used for this: its fd is opened with O_NONBLOCK (needed so
-    # opening one with no writer never blocks), and O_NONBLOCK makes reads
-    # on it non-blocking too -- confirmed live, a read against a FIFO with
-    # some data already written but not yet closed returns that data
+    # Case 13: run_with_timeout actually bounds a slow call, tested
+    # directly against a synthetic slow function rather than trying to
+    # force a real slow read through the filesystem. A FIFO cannot be used
+    # for this: its fd is opened with O_NONBLOCK (needed so opening one
+    # with no writer never blocks), and O_NONBLOCK makes reads on it
+    # non-blocking too -- confirmed live, a read against a FIFO with some
+    # data already written but not yet closed returns that data
     # immediately rather than blocking for more, so it can never exercise
-    # this alarm at all. Patches PER_FILE_TIMEOUT_SECS via
-    # `sys.modules[__name__]` (not a fresh `import`, which -- run this way,
-    # as `__main__` -- would create a SEPARATE module object with its own
-    # independent globals that read_with_timeout never actually reads from).
-    class _SlowFile:
-        def read(self, n):
-            time.sleep(5)
-            return b"should never be returned"
+    # this alarm at all. Uses an explicit `timeout_secs=1` argument rather
+    # than patching PER_FILE_TIMEOUT_SECS (run_with_timeout takes the
+    # timeout directly; only format_entry defaults to the module constant).
+    def _slow_call():
+        time.sleep(5)
+        return "should never be returned"
 
-    this_module = sys.modules[__name__]
-    original_timeout = this_module.PER_FILE_TIMEOUT_SECS
-    this_module.PER_FILE_TIMEOUT_SECS = 1
+    start = time.monotonic()
     try:
-        start = time.monotonic()
-        try:
-            read_with_timeout(_SlowFile(), DEFAULT_MAX_BYTES)
-            check(False, "per-file timeout case: read_with_timeout did not raise on a slow read")
-        except _ReadTimeout:
-            pass
-        elapsed = time.monotonic() - start
-        check(
-            elapsed < 3,
-            f"per-file timeout case: took {elapsed:.1f}s, expected ~1s bound (PER_FILE_TIMEOUT_SECS regression)",
-        )
-    finally:
-        this_module.PER_FILE_TIMEOUT_SECS = original_timeout
+        run_with_timeout(_slow_call, timeout_secs=1)
+        check(False, "per-file timeout case: run_with_timeout did not raise on a slow call")
+    except _ReadTimeout:
+        pass
+    elapsed = time.monotonic() - start
+    check(
+        elapsed < 3,
+        f"per-file timeout case: took {elapsed:.1f}s, expected ~1s bound",
+    )
 
     if failures:
         for msg in failures:
