@@ -102,7 +102,7 @@ unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_TEMPLATE_DIR
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORPUS_DIR="$SCRIPT_DIR/corpus"
 REVIEW_SCRIPT="$SCRIPT_DIR/../scripts/run-codex-review.sh"
-RUNS_PER_FIXTURE=3
+DEFAULT_RUNS_PER_FIXTURE=3
 
 # Raw per-run artifacts (full wrapper JSON + a small manifest) are saved for
 # post-hoc audit -- e.g. distinguishing "the reviewer genuinely missed this"
@@ -139,6 +139,9 @@ echo "Raw per-run results for this sweep: $SUITE_DIR" >&2
 
 ONLY=""
 CORPUS_DIR_OVERRIDE=""
+PAIR_A=""
+PAIR_B=""
+RUNS_OVERRIDE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --only)
@@ -151,11 +154,59 @@ while [ $# -gt 0 ]; do
       # with no way to point at a different tree at all.
       [ $# -ge 2 ] || { echo "error: --corpus-dir requires a path" >&2; exit 1; }
       CORPUS_DIR_OVERRIDE="$2"; shift 2 ;;
+    --pair)
+      # Runs a blind/focused fixture PAIR interleaved (member-A run 1,
+      # member-B run 1, member-A run 2, ...) sharing ONE isolation snapshot,
+      # instead of the main loop's sequential all-runs-then-next-fixture
+      # order -- see run_pair_mode below for why interleaving and a shared
+      # snapshot both matter for this specific comparison.
+      [ $# -ge 3 ] || { echo "error: --pair requires two fixture slugs (blind then focused)" >&2; exit 1; }
+      # An empty "$2"/"$3" (e.g. --pair "" foo) would otherwise satisfy the
+      # count check above yet leave PAIR_A/PAIR_B empty -- every later
+      # dispatch check in this script is `[ -n "$PAIR_A" ]`, so an empty
+      # PAIR_A doesn't error at all, it silently skips run_pair_mode
+      # entirely and runs the normal full-corpus sweep instead. Caught here
+      # (not inside run_pair_mode, which would never even be reached).
+      if [ -z "$2" ] || [ -z "$3" ]; then
+        echo "error: --pair requires two NON-EMPTY fixture slugs" >&2
+        exit 1
+      fi
+      PAIR_A="$2"; PAIR_B="$3"; shift 3 ;;
+    --runs)
+      # Overrides the default 3 runs/fixture -- needed for (a) cheaply
+      # smoke-testing --pair/--only with 1 run instead of spending a full
+      # 3, and (b) the higher-N (15-20) single-fixture sampling an
+      # ensemble/variance probe needs, which 3 runs can't support at all.
+      [ $# -ge 2 ] || { echo "error: --runs requires a positive integer" >&2; exit 1; }
+      # A `case`/glob pattern is the WRONG tool here and was tried twice:
+      # the negation '*[!0-9]*|0' only rejected a literal "0", not "00"/
+      # "007" (both fed straight to `seq 1 000`, which this host's Apple
+      # `seq` live-confirmed prints as TWO lines, "1" then "0" -- silently
+      # running 2 iterations instead of rejecting); the follow-up accept-
+      # list '[1-9]|[1-9][0-9]*' looked like "no leading zero" but a glob's
+      # trailing `*` matches ANY character, not "more digits" -- live-
+      # confirmed it also accepted "12abc", "12 34", and "12;3", which then
+      # break `seq` in the same silent-zero-iterations way. `[[ =~ ]]`
+      # (true regex, available since bash 3.0) is the actual fix: `$` anchors
+      # the match so nothing after the digits can sneak through unchecked.
+      if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+        echo "error: --runs must be a positive integer with no leading zero, got: $2" >&2
+        exit 1
+      fi
+      RUNS_OVERRIDE="$2"; shift 2 ;;
     *)
       echo "error: unknown argument: $1" >&2
       exit 1 ;;
   esac
 done
+if [ -n "$PAIR_A" ] && [ -n "$ONLY" ]; then
+  echo "error: --pair and --only are mutually exclusive" >&2
+  exit 1
+fi
+RUNS_PER_FIXTURE="$DEFAULT_RUNS_PER_FIXTURE"
+if [ -n "$RUNS_OVERRIDE" ]; then
+  RUNS_PER_FIXTURE="$RUNS_OVERRIDE"
+fi
 if [ -n "$CORPUS_DIR_OVERRIDE" ]; then
   CORPUS_DIR="$CORPUS_DIR_OVERRIDE"
 fi
@@ -449,6 +500,405 @@ ARTIFACT_WRITE_FAILURES=0
 # complete one.
 CONFIG_ERROR_COUNT=0
 
+# score_pair_member SLUG MUST_FILE FOCUS SNAPSHOT_REPO SNAPSHOT_SHA RUN_N [KEYWORD ...]
+# Runs ONE review call for one blind/focused pair member against the
+# SHARED snapshot built by run_pair_mode, saves the same result.json/
+# manifest.json artifacts the main loop saves, scores it via the bug-
+# fixture (file+keyword) branch only -- run_pair_mode has already asserted
+# should_flag=="true" for both members before this is ever called, so the
+# control-group judge_finding branch never applies here. Sets the global
+# PAIR_RUN_OUTCOME to exactly one of: hit | miss | error. Any keywords are
+# trailing positional args (possibly zero of them), NOT a global array like
+# judge_finding's JUDGE_VERDICT -- unlike a single scalar result (which
+# bash 3.2, this script's stated compatibility floor, has no
+# `local -n`/nameref to return by reference), an array of caller-owned
+# strings passes through "$@" natively and needs no such workaround.
+score_pair_member() {
+  local slug="$1" must_file="$2" focus="$3" snapshot_repo="$4" snapshot_sha="$5" run_n="$6"
+  shift 6
+
+  REVIEW_OUT="$(mktemp)"
+  if [ -z "$REVIEW_OUT" ]; then
+    echo "  [$slug] run $run_n: ERROR (mktemp failed) -- excluded from scoring" >&2
+    PAIR_RUN_OUTCOME="error"
+    return
+  fi
+  if [ -n "$focus" ]; then
+    "$REVIEW_SCRIPT" --cwd "$snapshot_repo" --commit "$snapshot_sha" --focus "$focus" > "$REVIEW_OUT" 2>&1 &
+  else
+    "$REVIEW_SCRIPT" --cwd "$snapshot_repo" --commit "$snapshot_sha" > "$REVIEW_OUT" 2>&1 &
+  fi
+  wait "$!"
+  local result
+  result="$(cat "$REVIEW_OUT")"
+  rm -f "$REVIEW_OUT"
+  REVIEW_OUT=""
+
+  local run_id run_dir
+  run_id="${slug}-run${run_n}"
+  run_dir="$SUITE_DIR/$run_id"
+  mkdir "$run_dir" || { echo "error: run-id collision at $run_dir" >&2; exit 1; }
+  if ! printf '%s' "$result" > "$run_dir/result.json"; then
+    echo "  warning: failed to write raw result artifact for $run_id (disk full/permission?)" >&2
+    ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 1))
+  fi
+  local focus_sha256=""
+  if [ -n "$focus" ]; then
+    focus_sha256="$(printf '%s' "$focus" | shasum -a 256 | awk '{print $1}')"
+  fi
+  if ! jq -n \
+    --arg fixture "$slug" \
+    --argjson run "$run_n" \
+    --arg snapshot_sha "$snapshot_sha" \
+    --arg corpus_version "$CORPUS_VERSION" \
+    --arg focus_sha256 "$focus_sha256" \
+    --arg timestamp_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg reasoning_effort "xhigh (fixed by run-codex-review.sh, not configurable from here)" \
+    '{fixture: $fixture, run: $run, snapshot_sha: $snapshot_sha, corpus_version: $corpus_version,
+      focus_sha256: (if $focus_sha256 == "" then null else $focus_sha256 end),
+      timestamp_utc: $timestamp_utc, reasoning_effort: $reasoning_effort}' \
+    > "$run_dir/manifest.json"; then
+    echo "  warning: failed to write manifest for $run_id (disk full/permission?)" >&2
+    ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 1))
+  fi
+
+  local ok
+  ok="$(printf '%s' "$result" | jq -r '.ok')"
+  if [ "$ok" != "true" ]; then
+    local reason
+    reason="$(printf '%s' "$result" | jq -r '.reason // "unknown"')"
+    echo "  [$slug] run $run_n: ERROR (wrapper failure: $reason) -- excluded from scoring"
+    PAIR_RUN_OUTCOME="error"
+    return
+  fi
+
+  local verdict
+  verdict="$(printf '%s' "$result" | jq -r '.verdict.verdict')"
+  local file_hit
+  file_hit="$(printf '%s' "$result" | jq -r --arg f "$must_file" '
+    [.verdict.findings[] | select(.file | contains($f))] | length > 0
+  ')"
+  local is_hit="false"
+  if [ "$file_hit" = "true" ]; then
+    if [ "$#" -eq 0 ]; then
+      is_hit="true"
+    else
+      local kw match
+      for kw in "$@"; do
+        match="$(printf '%s' "$result" | jq -r --arg f "$must_file" --arg kw "$kw" '
+          [.verdict.findings[]
+           | select(.file | contains($f))
+           | select(((.summary // "") + " " + (.evidence // "")) | ascii_downcase | contains($kw | ascii_downcase))
+          ] | length > 0
+        ')"
+        if [ "$match" = "true" ]; then
+          is_hit="true"
+          break
+        fi
+      done
+    fi
+  fi
+  if [ "$is_hit" = "true" ]; then
+    echo "  [$slug] run $run_n: HIT (verdict=$verdict)"
+    PAIR_RUN_OUTCOME="hit"
+  else
+    echo "  [$slug] run $run_n: miss (verdict=$verdict)"
+    PAIR_RUN_OUTCOME="miss"
+  fi
+}
+
+# run_pair_mode SLUG_A SLUG_B
+# Compares a blind/focused fixture pair under two controls the main loop's
+# per-fixture-in-isolation execution can't provide: (1) both members share
+# ONE isolation snapshot (same --cwd, same commit SHA, same fixed commit
+# metadata) instead of each building its own -- this eliminates a spurious
+# extra variable in the comparison (the plan's own round-12 finding: with
+# separate mktemp -d snapshots the two calls' CWD path strings differ, which
+# a sufficiently thorough --sandbox read-only review could in principle
+# notice, however unlikely). (2) runs are INTERLEAVED (member-A run 1,
+# member-B run 1, member-A run 2, ...) rather than all-of-A-then-all-of-B,
+# reducing any time-based confound (model/backend state drift between the
+# two members' full run sequences).
+#
+# Exits non-zero on any pair-invariant violation (missing fixture, a nested
+# .git under before/, before/ content differing between members, or
+# must_mention_file/keywords_any/should_flag differing between members) --
+# a broken pair produces a meaningless comparison, so this refuses to run
+# rather than silently scoring one anyway.
+run_pair_mode() {
+  local slug_a="$1" slug_b="$2"
+  # A slug is a bare corpus/ directory NAME, never a path -- reject anything
+  # containing a "/" (which would let a value like "../../etc" resolve
+  # dir_a/before_a OUTSIDE $CORPUS_DIR below) or "." / ".." themselves
+  # (which resolve to CORPUS_DIR itself or its parent). Also blocks the
+  # same characters from later reaching run_id ("$slug-run$run_n") and
+  # escaping $SUITE_DIR when score_pair_member creates its run_dir.
+  local s
+  for s in "$slug_a" "$slug_b"; do
+    case "$s" in
+      */*|.|..)
+        echo "error: --pair argument must be a bare fixture directory name, not a path: $s" >&2
+        exit 1 ;;
+    esac
+  done
+  local dir_a="$CORPUS_DIR/$slug_a" dir_b="$CORPUS_DIR/$slug_b"
+  local exp_a="$dir_a/expected.json" exp_b="$dir_b/expected.json"
+  local before_a="$dir_a/before" before_b="$dir_b/before"
+
+  local d
+  for d in "$dir_a" "$dir_b"; do
+    # `[ -d ]` alone FOLLOWS a symlink -- the slug-shape check above blocks
+    # a lexical path-escape ("../etc") but not a fixture-root name that is
+    # itself a symlink pointing outside $CORPUS_DIR (relevant mainly with
+    # --corpus-dir pointing at an arbitrary tree, not this repo's own
+    # hand-authored corpus/, which has no such symlinks). `-L` rejects that
+    # case outright rather than silently following it.
+    if [ -L "$d" ]; then
+      echo "error: --pair fixture directory is a symlink, refusing to follow: $d" >&2
+      exit 1
+    fi
+    [ -d "$d" ] || { echo "error: --pair fixture not found: $d" >&2; exit 1; }
+  done
+  local f
+  for f in "$exp_a" "$exp_b"; do
+    # Same reasoning as the fixture-root check above -- the root itself
+    # being a real directory doesn't guarantee expected.json inside it
+    # isn't ITSELF a symlink to something outside $CORPUS_DIR.
+    if [ -L "$f" ]; then
+      echo "error: --pair fixture's expected.json is a symlink, refusing to follow: $f" >&2
+      exit 1
+    fi
+    [ -f "$f" ] || { echo "error: --pair fixture missing expected.json: $f" >&2; exit 1; }
+  done
+  local b
+  for b in "$before_a" "$before_b"; do
+    if [ -L "$b" ]; then
+      echo "error: --pair fixture's before/ is a symlink, refusing to follow: $b" >&2
+      exit 1
+    fi
+    [ -d "$b" ] || { echo "error: --pair fixture missing before/: $b" >&2; exit 1; }
+    # Same corpus-format invariant the main loop enforces (see its own
+    # comment for the two distinct gitlink-related risks this closes).
+    local found_nested_git
+    found_nested_git="$(find "$b" -name '.git' -print -quit 2>/dev/null)"
+    if [ -n "$found_nested_git" ]; then
+      echo "error: --pair fixture before/ contains a .git at '$found_nested_git'" >&2
+      exit 1
+    fi
+  done
+
+  for f in "$exp_a" "$exp_b"; do
+    # must_mention_file: trimmed non-empty (gsub("\\s";"") | length > 0), not
+    # plain length > 0 -- matches safeguard_assertion's existing whitespace-
+    # only guard below, closing the same class of gap for this field: a
+    # value that is JSON-valid and non-empty (e.g. a lone "\n") but decodes
+    # via `jq -r`+command-substitution to bash as an EMPTY variable (command
+    # substitution silently strips trailing newlines) would otherwise slip
+    # through as must_file="", and `contains("")` matches every string --
+    # turning "any finding on any file" into a fabricated hit for every run.
+    # Also NUL-free (same codepoint check as keywords_any below) -- a value
+    # with an embedded NUL would decode to a shorter, different bash string
+    # than the fixture author wrote, and could fabricate a hit the same way.
+    if ! jq -e '(.category | type == "string" and ((gsub("\\s"; "")) | length > 0)) and (.difficulty == null or .difficulty == "easy" or .difficulty == "subtle") and (.should_flag | type == "boolean") and (.must_mention_file | type == "string" and (explode | any(. == 0) | not) and ((gsub("\\s"; "")) | length > 0))' "$f" >/dev/null 2>&1; then
+      echo "error: --pair fixture expected.json malformed or missing required fields: $f" >&2
+      exit 1
+    fi
+    # keywords_any: each entry must be a string with real (non-whitespace)
+    # content, same reasoning as must_mention_file above, AND must not
+    # contain a NUL byte -- Bash variables cannot represent NUL at all
+    # (live-confirmed: a NUL inside a captured string is silently dropped,
+    # not preserved or erred on), so a keyword whose JSON value is
+    # "a" + NUL + "b" would reach scoring as plain "ab" -- a keyword the
+    # fixture author never actually wrote.
+    if ! jq -e '.keywords_any == null or (.keywords_any | type == "array" and all(.[]; type == "string" and ((explode | any(. == 0) | not)) and ((gsub("\\s"; "")) | length > 0)))' "$f" >/dev/null 2>&1; then
+      echo "error: --pair fixture expected.json keywords_any must be null or an array of non-empty, NUL-free strings: $f" >&2
+      exit 1
+    fi
+    # Pair mode's blind/focused labeling is a stronger contract than the
+    # main loop's plain optional-context use of "focus" -- a non-string
+    # value here (e.g. JSON `true`) would still be silently coerced to
+    # text by `jq -r '.focus // empty'` below and pass the later non-
+    # whitespace role check, mislabeling a malformed fixture as a valid
+    # "focused" member. Caught here instead, before that coercion happens.
+    # Also NUL-free (same codepoint check as must_mention_file/keywords_any)
+    # -- Bash's command-substitution capture below truncates at a NUL, so a
+    # fixture could specify one briefing while the reviewer actually
+    # receives a shorter, silently different one.
+    if ! jq -e '.focus == null or (.focus | type == "string" and (explode | any(. == 0) | not))' "$f" >/dev/null 2>&1; then
+      echo "error: --pair fixture expected.json focus must be null or a NUL-free string: $f" >&2
+      exit 1
+    fi
+  done
+
+  # Pair invariant #1: before/ must be byte-identical -- otherwise a recall
+  # difference could come from the code differing, not from --focus.
+  if ! diff -rq "$before_a" "$before_b" >/dev/null 2>&1; then
+    echo "error: --pair fixtures' before/ directories differ -- this pair is not a valid blind/focused" >&2
+    echo "comparison (recall differences would be confounded with code differences). diff -rq:" >&2
+    diff -rq "$before_a" "$before_b" >&2
+    exit 1
+  fi
+
+  # Pair invariant #2: the scoring contract itself must be identical -- a
+  # `diff -rq` above only proves the SOURCE is identical, not that both
+  # members would be scored the same way (round-9 plan finding).
+  local fields_a fields_b
+  fields_a="$(jq -Sc '{must_mention_file, keywords_any, should_flag}' "$exp_a")"
+  fields_b="$(jq -Sc '{must_mention_file, keywords_any, should_flag}' "$exp_b")"
+  if [ "$fields_a" != "$fields_b" ]; then
+    echo "error: --pair fixtures' must_mention_file/keywords_any/should_flag differ:" >&2
+    echo "  $slug_a: $fields_a" >&2
+    echo "  $slug_b: $fields_b" >&2
+    exit 1
+  fi
+
+  local should_flag must_file focus_a focus_b
+  should_flag="$(jq -r '.should_flag' "$exp_a")"
+  must_file="$(jq -r '.must_mention_file' "$exp_a")"
+  focus_a="$(jq -r '.focus // empty' "$exp_a")"
+  focus_b="$(jq -r '.focus // empty' "$exp_b")"
+  if [ "$should_flag" != "true" ]; then
+    echo "error: --pair mode only supports should_flag==true (bug) fixture pairs; got should_flag=$should_flag" >&2
+    exit 1
+  fi
+  # Pair invariant #3: the CLI's own contract is "--pair BLIND FOCUSED" (see
+  # its own help text above and the "blind"/"focused" labels in the
+  # scorecard below) -- nothing enforced that ordering until now, so
+  # --pair X X (same fixture twice) or two focused/two blind members would
+  # have silently passed every check above and produced a meaningless
+  # comparison mislabeled as blind-vs-focused. focus_b's side additionally
+  # requires at least one NON-whitespace character (`[^[:space:]]`), not
+  # just "non-empty" (`-n`) -- a whitespace-only focus like "   " passes
+  # `-n` (live-confirmed) despite supplying no actual briefing, which would
+  # have let a focused member with a blank/whitespace focus still pass this
+  # guard and be scored as a real blind-vs-focused comparison. focus_a's
+  # side needs no matching whitespace-only case: `-n` on "   " is already
+  # true (any non-empty string, whitespace or not), so a whitespace-only
+  # focus_a already correctly fails "must have no focus" via the same `-n`
+  # check used today.
+  if [ -n "$focus_a" ] || ! [[ "$focus_b" =~ [^[:space:]] ]]; then
+    echo "error: --pair requires the FIRST fixture ($slug_a) to have no focus (blind) and the" >&2
+    echo "SECOND ($slug_b) to have a non-empty, non-whitespace focus (focused); got focus_a=$([ -n "$focus_a" ] && echo "set" || echo "empty"), focus_b=$([[ "$focus_b" =~ [^[:space:]] ]] && echo "set" || echo "empty/whitespace-only")" >&2
+    exit 1
+  fi
+
+  # Keywords are passed to score_pair_member as TRAILING positional args
+  # (after its six fixed params), not a global array -- unlike JUDGE_VERDICT
+  # (a genuinely scalar per-call result judge_finding has no other way to
+  # return under bash 3.2, which lacks nameref/`local -n`), an array of
+  # keyword strings passes through "$@"/"${@:N}" natively, live-confirmed on
+  # this host's bash 3.2.57 to preserve each keyword (including ones
+  # containing spaces) as a distinct argument.
+  # `jq -c` (compact JSON, one array element per line), not `jq -r` (raw
+  # unescaped text) -- a keyword string containing a literal embedded
+  # newline would print as a raw newline under `-r`, which `read` (line-
+  # delimited) then splits into two shorter keywords instead of one. `-c`
+  # keeps the JSON string escaping (embedded "\n" stays as the two
+  # characters backslash-n, never a real line break) so each array element
+  # is guaranteed to occupy exactly one line regardless of its content.
+  #
+  # Decoding that one line back to the real string needs `jq -j` (no
+  # trailing newline of its own), NOT `jq -r` (which DOES append one) --
+  # `$(...)` unconditionally strips ALL trailing newlines from a command
+  # substitution's output, live-confirmed to silently: (a) drop a keyword
+  # that is nothing but a newline down to an empty string (which
+  # `[ -n "$kw" ]` then discards entirely -- if that were the fixture's
+  # ONLY keyword, the whole array goes empty, which this scoring treats as
+  # "any file match is a hit"), and (b) strip a real trailing newline off
+  # the END of an otherwise-normal keyword. Appending a literal "x" right
+  # after jq's (newline-free, via -j) output and stripping it back off
+  # with `${raw%x}` works around this: the substitution's last character is
+  # always "x", never a newline, so nothing gets silently eaten regardless
+  # of how many (if any) real newlines the decoded string starts or ends
+  # with. Live-confirmed exact round-trip for a plain keyword, one ending
+  # in "\n", one that IS "\n", and one with an embedded "\n" in the middle.
+  local pair_keywords=()
+  local kw_json_line kw_raw kw
+  while IFS= read -r kw_json_line; do
+    kw_raw="$(jq -j '.' <<< "$kw_json_line"; printf 'x')"
+    kw="${kw_raw%x}"
+    [ -n "$kw" ] && pair_keywords+=("$kw")
+  done < <(jq -c '(.keywords_any // [])[]' "$exp_a")
+
+  # Shared isolation snapshot, built once from before_a (already verified
+  # byte-identical to before_b above). Reuses the exact same construction
+  # the main loop uses (see its own "Isolation snapshot" comment for the
+  # reasoning behind each step) via the same FAKE_GIT_HOME/traps already
+  # set up before this function is ever called -- GIT_ISOLATED_ENV itself
+  # is redefined locally rather than shared with the main loop's copy since
+  # the main loop only ever defines it INSIDE its own per-fixture iteration
+  # (never before it, so there is nothing global to reuse here) and this
+  # function's dispatch site runs before that loop even starts.
+  local git_isolated_env
+  git_isolated_env=(env -i "PATH=$PATH" "HOME=$FAKE_GIT_HOME" "GIT_CONFIG_NOSYSTEM=1")
+
+  CURRENT_TMP_REPO="$(mktemp -d)"
+  if [ -z "$CURRENT_TMP_REPO" ] || [ ! -d "$CURRENT_TMP_REPO" ]; then
+    echo "error: --pair mktemp -d failed, refusing to build isolation snapshot" >&2
+    CURRENT_TMP_REPO=""
+    exit 1
+  fi
+  if ! cp -R "${before_a}/." "$CURRENT_TMP_REPO/"; then
+    echo "error: --pair failed to copy before/ into isolation snapshot" >&2
+    rm -rf "$CURRENT_TMP_REPO"
+    CURRENT_TMP_REPO=""
+    exit 1
+  fi
+  "${git_isolated_env[@]}" git -C "$CURRENT_TMP_REPO" init -q -b main
+  "${git_isolated_env[@]}" git -C "$CURRENT_TMP_REPO" config user.email "eval@example.com"
+  "${git_isolated_env[@]}" git -C "$CURRENT_TMP_REPO" config user.name "Eval Corpus"
+  "${git_isolated_env[@]}" git -C "$CURRENT_TMP_REPO" add -A -f
+  if ! env -i "PATH=$PATH" "HOME=$FAKE_GIT_HOME" "GIT_CONFIG_NOSYSTEM=1" \
+    "GIT_AUTHOR_DATE=2026-01-01T00:00:00+0000" "GIT_COMMITTER_DATE=2026-01-01T00:00:00+0000" \
+    git -C "$CURRENT_TMP_REPO" commit -q --no-verify -m "fixture snapshot"; then
+    echo "error: --pair git commit failed -- before/ may be empty" >&2
+    rm -rf "$CURRENT_TMP_REPO"
+    CURRENT_TMP_REPO=""
+    exit 1
+  fi
+  local snapshot_sha
+  snapshot_sha="$(git -C "$CURRENT_TMP_REPO" rev-parse HEAD)"
+
+  echo "=== PAIR: $slug_a (blind) vs $slug_b (focused) -- shared snapshot $snapshot_sha ==="
+
+  local hits_a=0 valid_a=0 errors_a=0
+  local hits_b=0 valid_b=0 errors_b=0
+  local run_n
+  for run_n in $(seq 1 "$RUNS_PER_FIXTURE"); do
+    score_pair_member "$slug_a" "$must_file" "$focus_a" "$CURRENT_TMP_REPO" "$snapshot_sha" "$run_n" "${pair_keywords[@]}"
+    case "$PAIR_RUN_OUTCOME" in
+      hit) hits_a=$((hits_a + 1)); valid_a=$((valid_a + 1)) ;;
+      miss) valid_a=$((valid_a + 1)) ;;
+      error) errors_a=$((errors_a + 1)) ;;
+    esac
+    score_pair_member "$slug_b" "$must_file" "$focus_b" "$CURRENT_TMP_REPO" "$snapshot_sha" "$run_n" "${pair_keywords[@]}"
+    case "$PAIR_RUN_OUTCOME" in
+      hit) hits_b=$((hits_b + 1)); valid_b=$((valid_b + 1)) ;;
+      miss) valid_b=$((valid_b + 1)) ;;
+      error) errors_b=$((errors_b + 1)) ;;
+    esac
+  done
+
+  rm -rf "$CURRENT_TMP_REPO"
+  CURRENT_TMP_REPO=""
+
+  echo ""
+  echo "=== PAIR SCORECARD: $slug_a vs $slug_b ==="
+  printf '  %-40s %d/%d hits (%d errors)\n' "$slug_a (blind)" "$hits_a" "$valid_a" "$errors_a"
+  printf '  %-40s %d/%d hits (%d errors)\n' "$slug_b (focused)" "$hits_b" "$valid_b" "$errors_b"
+  echo ""
+  if [ "$ARTIFACT_WRITE_FAILURES" -eq 0 ]; then
+    echo "Raw per-run results and manifests saved to: $SUITE_DIR"
+  else
+    echo "Raw per-run results saved to: $SUITE_DIR (INCOMPLETE -- $ARTIFACT_WRITE_FAILURES artifact write(s) failed, see warnings above)"
+  fi
+}
+
+if [ -n "$PAIR_A" ]; then
+  run_pair_mode "$PAIR_A" "$PAIR_B"
+  exit $?
+fi
+
 for fixture_dir in "$CORPUS_DIR"/*/; do
   slug="$(basename "$fixture_dir")"
   if [ -n "$ONLY" ] && [ "$slug" != "$ONLY" ]; then
@@ -457,6 +907,15 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
 
   expected_file="${fixture_dir}expected.json"
   before_dir="${fixture_dir}before"
+  # `[ -f ]`/`[ -d ]` alone FOLLOW a symlink -- relevant only with
+  # --corpus-dir pointing at an arbitrary tree (this repo's own corpus/ has
+  # no such symlinks), matching run_pair_mode's identical defense (same
+  # file, its own comment has the full reasoning).
+  if [ -L "$expected_file" ] || [ -L "$before_dir" ]; then
+    echo "skip: $slug (expected.json or before/ is a symlink, refusing to follow)" >&2
+    CONFIG_ERROR_COUNT=$((CONFIG_ERROR_COUNT + 1))
+    continue
+  fi
   if [ ! -f "$expected_file" ] || [ ! -d "$before_dir" ]; then
     echo "skip: $slug (missing expected.json or before/)" >&2
     continue
@@ -496,8 +955,14 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
   # branch with an EMPTY must_file -- and `contains("")` is true for every
   # string (live-confirmed), so every finding would spuriously "match" and
   # get fabricated scoring instead of the fixture being rejected outright.
-  if ! jq -e '(.category | type == "string") and (.should_flag | type == "boolean") and (.must_mention_file | type == "string" and length > 0)' "$expected_file" >/dev/null 2>&1; then
-    echo "skip: $slug (expected.json malformed or missing required fields: category/should_flag/must_mention_file)" >&2
+  # must_mention_file: trimmed non-empty, not plain length > 0 -- see
+  # run_pair_mode's identical check (same file) for why: a JSON-valid,
+  # non-empty value (e.g. a lone newline) can still decode to an EMPTY bash
+  # variable further down (command substitution strips trailing newlines),
+  # and `contains("")` matches every string -- silently fabricating a hit
+  # on every file for a fixture that should have been rejected outright.
+  if ! jq -e '(.category | type == "string" and ((gsub("\\s"; "")) | length > 0)) and (.difficulty == null or .difficulty == "easy" or .difficulty == "subtle") and (.should_flag | type == "boolean") and (.must_mention_file | type == "string" and (explode | any(. == 0) | not) and ((gsub("\\s"; "")) | length > 0))' "$expected_file" >/dev/null 2>&1; then
+    echo "skip: $slug (expected.json malformed or missing required fields: category/difficulty/should_flag/must_mention_file)" >&2
     CONFIG_ERROR_COUNT=$((CONFIG_ERROR_COUNT + 1))
     continue
   fi
@@ -511,9 +976,25 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
   # matches, by design), but here it would be a MISCONFIGURED fixture
   # masquerading as one with no keyword requirement, silently turning any
   # file-only match into a hit for a bug fixture that was supposed to be
-  # keyword-checked.
-  if ! jq -e '.keywords_any == null or (.keywords_any | type == "array" and all(.[]; type == "string" and length > 0))' "$expected_file" >/dev/null 2>&1; then
-    echo "skip: $slug (expected.json keywords_any must be null or an array of non-empty strings)" >&2
+  # keyword-checked. Each entry additionally requires trimmed non-empty
+  # content (same must_mention_file reasoning) and must contain no NUL
+  # character (checked via character codepoints, not a literal NUL/escape
+  # in this source file) -- Bash cannot represent NUL in a variable at all,
+  # so a keyword containing one would silently score as a shorter, different
+  # string than the fixture author actually wrote.
+  if ! jq -e '.keywords_any == null or (.keywords_any | type == "array" and all(.[]; type == "string" and ((explode | any(. == 0) | not)) and ((gsub("\\s"; "")) | length > 0)))' "$expected_file" >/dev/null 2>&1; then
+    echo "skip: $slug (expected.json keywords_any must be null or an array of non-empty, NUL-free strings)" >&2
+    CONFIG_ERROR_COUNT=$((CONFIG_ERROR_COUNT + 1))
+    continue
+  fi
+  # focus: unlike pair mode's stronger blind/focused-role contract, the
+  # main loop treats focus as purely optional context, so a malformed
+  # (non-string) value doesn't misrepresent a comparison the way it would
+  # in --pair -- but it should still be rejected outright rather than
+  # silently coerced (JSON `true` becoming the literal briefing text
+  # "true") or silently treated as absent (JSON `false` becoming empty).
+  if ! jq -e '.focus == null or (.focus | type == "string" and (explode | any(. == 0) | not))' "$expected_file" >/dev/null 2>&1; then
+    echo "skip: $slug (expected.json focus must be null or a string)" >&2
     CONFIG_ERROR_COUNT=$((CONFIG_ERROR_COUNT + 1))
     continue
   fi
@@ -541,7 +1022,11 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
     # string like "   " (live-confirmed: `jq -en '"   " | (type == "string"
     # and length > 0)'` returns true), which is not a meaningful assertion
     # and would otherwise be fed as-is into every judge_finding prompt below.
-    if ! jq -e '.safeguard_assertion | (type == "string" and ((gsub("\\s"; "")) | length > 0))' "$expected_file" >/dev/null 2>&1; then
+    # Also NUL-free (same codepoint check used elsewhere in this file) --
+    # Bash's capture of this value a few lines down truncates at a NUL, so
+    # judge_finding would silently receive a different, shorter assertion
+    # than the fixture actually specifies.
+    if ! jq -e '.safeguard_assertion | (type == "string" and (explode | any(. == 0) | not) and ((gsub("\\s"; "")) | length > 0))' "$expected_file" >/dev/null 2>&1; then
       echo "skip: $slug (control-group fixture missing/invalid safeguard_assertion in expected.json)" >&2
       CONFIG_ERROR_COUNT=$((CONFIG_ERROR_COUNT + 1))
       continue
@@ -550,9 +1035,19 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
   fi
 
   keywords=()
-  while IFS= read -r kw; do
+  # `jq -c` + a `jq -j` (not `jq -r`) decode per line -- see run_pair_mode's
+  # identical fix (same file, its own comment has the full reasoning) for
+  # why both matter: `-c` keeps an embedded newline JSON-escaped so `read`
+  # never splits one keyword into two on it, and `-j` (rather than `-r`,
+  # which appends its own trailing newline) plus the "x"-sentinel/strip
+  # trick works around `$(...)` unconditionally eating trailing newlines --
+  # without it, a keyword ending in (or consisting only of) a newline
+  # would be silently truncated or dropped entirely.
+  while IFS= read -r kw_json_line; do
+    kw_raw="$(jq -j '.' <<< "$kw_json_line"; printf 'x')"
+    kw="${kw_raw%x}"
     [ -n "$kw" ] && keywords+=("$kw")
-  done < <(jq -r '(.keywords_any // [])[]' "$expected_file")
+  done < <(jq -c '(.keywords_any // [])[]' "$expected_file")
 
   # Isolation snapshot: codex's --sandbox read-only blocks writes but NOT
   # reads -- it can read anywhere on disk, not just $CWD. `before/` itself
@@ -955,17 +1450,17 @@ echo "Wrapper-level errors (excluded from all scoring above): $total_errors"
 echo ""
 if [ "$CONFIG_ERROR_COUNT" -gt 0 ]; then
   # Deliberately does not name a single cause -- CONFIG_ERROR_COUNT is
-  # incremented for FOUR distinct validation failures (malformed required
-  # fields, invalid keywords_any, a nested .git corpus-format violation,
-  # invalid/missing safeguard_assertion); an earlier version of this message
-  # named only the first three (and before that, only one), each time
-  # falling behind as a new validation check was added elsewhere in this
-  # same review round. Keep this list in sync whenever a new
-  # CONFIG_ERROR_COUNT increment site is added.
+  # incremented for SIX distinct validation failures (a symlinked
+  # expected.json/before/, a nested .git corpus-format violation, malformed
+  # required fields, invalid keywords_any, invalid focus,
+  # invalid/missing safeguard_assertion); this message has fallen behind
+  # the actual increment-site count more than once already as new
+  # validation checks were added elsewhere in this file. Keep this list in
+  # sync whenever a new CONFIG_ERROR_COUNT increment site is added.
   echo "WARNING: $CONFIG_ERROR_COUNT fixture(s) skipped entirely due to a configuration error"
-  echo "(malformed expected.json, invalid keywords_any, a nested .git under before/, or"
-  echo "missing/invalid safeguard_assertion -- see the skip: messages earlier in this output"
-  echo "for which one) -- NOT counted in any denominator above."
+  echo "(a symlinked expected.json/before/, a nested .git under before/, malformed expected.json,"
+  echo "invalid keywords_any, invalid focus, or missing/invalid safeguard_assertion -- see the"
+  echo "skip: messages earlier in this output for which one) -- NOT counted in any denominator above."
   echo ""
 fi
 if [ "$ARTIFACT_WRITE_FAILURES" -eq 0 ]; then
