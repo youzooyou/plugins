@@ -37,8 +37,8 @@ cross-verification — this is the lightweight, single-shot version.
      fields plainly. **Never** describe a failed run as "no issues found" — those are different
      things and must not be conflated.
    - `"ok":true` → present `verdict.verdict` and `verdict.findings` (file, line if present,
-     severity if present, summary, evidence), most severe first. If `findings` is empty, say so
-     explicitly.
+     severity if present, summary, evidence, verification), most severe first. If `findings` is
+     empty, say so explicitly.
 
 5. **Stop after presenting findings.** Do not make any code changes. Ask the user which findings,
    if any, they want fixed before touching a single file — the same rule the existing
