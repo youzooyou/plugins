@@ -56,6 +56,7 @@ change). Exit codes:
 """
 import argparse
 import errno
+import json
 import os
 import signal
 import stat
@@ -66,6 +67,27 @@ import time
 DEFAULT_DEADLINE_SECS = 30
 DEFAULT_MAX_BYTES = 1024 * 1024
 PER_FILE_TIMEOUT_SECS = 3
+
+# Set by format_entry/_format_entry_body immediately before each of their
+# returns (never derived by pattern-matching the marker TEXT they also
+# return -- an earlier version of this file did exactly that, anchored on
+# each marker's trailing "(<reason>) ---" suffix, and a /cc review round
+# proved that unreliable two different ways: (1) an actual regular file
+# whose OWN NAME happens to end in one of those exact reason phrases (e.g.
+# a real, fully-included file literally named "ordinary (binary content;
+# not embedded as text)") produces a normal-inclusion marker string that
+# is byte-for-byte indistinguishable from a genuine omission marker by
+# suffix alone, live-confirmed to misclassify it as omitted; (2) the
+# regex's `.*` for a symlink target does not span an embedded newline in
+# the target path without re.DOTALL, silently failing to classify that
+# case at all. Both failure modes exist because the filename is untrusted,
+# caller-controlled content concatenated into the very same string being
+# pattern-matched -- no fixed suffix pattern can be made robust against a
+# file deliberately or coincidentally named to end in it.  Reading this
+# side-channel global instead is correct regardless of what any filename
+# contains, because it is set directly by the CODE PATH that decided the
+# outcome, never inferred from rendered text.
+LAST_ENTRY_OMISSION_REASON = None
 
 
 class _ReadTimeout(Exception):
@@ -211,10 +233,24 @@ def format_entry(cwd_bytes, rel_path_bytes, max_bytes):
     try:
         return run_with_timeout(_format_entry_body, cwd_bytes, rel_path_bytes, rel_display, max_bytes)
     except _ReadTimeout:
+        # _format_entry_body was interrupted mid-execution -- whatever it
+        # last set LAST_ENTRY_OMISSION_REASON to is not trustworthy (it may
+        # not have reached any return site at all), so this is set
+        # explicitly here rather than relying on whatever state the
+        # interrupted call left behind.
+        global LAST_ENTRY_OMISSION_REASON
+        LAST_ENTRY_OMISSION_REASON = "unreadable"
         return [f"\n--- new untracked file: {rel_display} (could not be safely read; contents omitted) ---"]
 
 
 def _format_entry_body(cwd_bytes, rel_path_bytes, rel_display, max_bytes):
+    global LAST_ENTRY_OMISSION_REASON
+    # Reset at the top of every call, before any return path -- every
+    # return below sets this explicitly anyway, but resetting here too
+    # means a future return site that forgets to set it fails safe (stays
+    # "unreadable"-like/omitted, the conservative direction) rather than
+    # silently inheriting the PREVIOUS file's classification.
+    LAST_ENTRY_OMISSION_REASON = "unreadable"
     fd = None
     try:
         fd = open_nofollow_chain(cwd_bytes, rel_path_bytes)
@@ -239,7 +275,9 @@ def _format_entry_body(cwd_bytes, rel_path_bytes, rel_display, max_bytes):
                 target = os.readlink(abs_path).decode("utf-8", errors="replace")
             except OSError:
                 target = "?"
+            LAST_ENTRY_OMISSION_REASON = "symlink"
             return [f"\n--- new untracked file: {rel_display} (symlink -> {target}; target contents not read) ---"]
+        LAST_ENTRY_OMISSION_REASON = "unreadable"
         return [f"\n--- new untracked file: {rel_display} (could not be safely read; contents omitted) ---"]
 
     try:
@@ -249,32 +287,49 @@ def _format_entry_body(cwd_bytes, rel_path_bytes, rel_display, max_bytes):
             # socket) that made it through the O_NOFOLLOW chain (i.e. was
             # never rejected as a symlink at any level) is rejected here
             # instead of ever being read.
+            LAST_ENTRY_OMISSION_REASON = "not_regular_file"
             return [f"\n--- new untracked file: {rel_display} (not a regular file; contents not read) ---"]
         if st.st_size > max_bytes:
+            LAST_ENTRY_OMISSION_REASON = "over_size_limit"
             return [f"\n--- new untracked file: {rel_display} (over 1MB cap or unreadable; contents omitted) ---"]
         with os.fdopen(fd, "rb") as f:
             fd = None  # ownership transferred to the file object
             data = f.read(max_bytes + 1)
         if len(data) > max_bytes:
             # Grew between fstat and read (rare, e.g. a concurrent writer).
+            LAST_ENTRY_OMISSION_REASON = "over_size_limit"
             return [f"\n--- new untracked file: {rel_display} (over 1MB cap or unreadable; contents omitted) ---"]
         if b"\x00" in data:
             # Matches how `git diff` itself represents a binary file (a
             # marker, not corrupted "text").
+            LAST_ENTRY_OMISSION_REASON = "binary"
             return [f"\n--- new untracked file: {rel_display} (binary content; not embedded as text) ---"]
         # Raw bytes, never decoded -- valid-but-non-UTF-8 NUL-free content
         # (e.g. a legacy-encoded source file) is passed through byte for
         # byte instead of being silently rewritten with U+FFFD replacement
         # characters.
+        LAST_ENTRY_OMISSION_REASON = None
         return [f"\n--- new untracked file: {rel_display} ---\n", data]
     finally:
         if fd is not None:
             os.close(fd)
 
 
+def _empty_coverage():
+    return {"reviewed_file_count": 0, "omitted": []}
+
+
 def collect(cwd_bytes, deadline_secs, max_bytes):
-    """Returns (parts, incomplete, error_detail). parts is a flat list of
-    str/bytes fragments, in the same mixed-type shape format_entry returns.
+    """Returns (parts, incomplete, error_detail, coverage). parts is a flat
+    list of str/bytes fragments, in the same mixed-type shape format_entry
+    returns. coverage is {"reviewed_file_count": <int>, "omitted":
+    [{"path": <str>, "reason": <str>}, ...]} -- one "omitted" entry per
+    untracked file whose content was NOT included (reason vocabulary: see
+    LAST_ENTRY_OMISSION_REASON's set sites in _format_entry_body/
+    format_entry); reviewed_file_count counts every OTHER untracked file
+    (content fully included). Always the zero-value shape from
+    _empty_coverage() when error_detail is not None (collection never got
+    far enough to process any file).
 
     `deadline` is computed ONCE, here, before `git ls-files` even runs, and
     the TIME REMAINING against that single deadline is what bounds the git
@@ -287,13 +342,25 @@ def collect(cwd_bytes, deadline_secs, max_bytes):
     remaining = max(0, deadline - time.monotonic())
     files, error_detail = list_untracked_files(cwd_bytes, remaining)
     if error_detail is not None:
-        return [], False, error_detail
+        return [], False, error_detail, _empty_coverage()
 
     parts = []
+    coverage = _empty_coverage()
     for rel_path_bytes in files:
         if time.monotonic() >= deadline:
-            return parts, True, None
-        parts.extend(format_entry(cwd_bytes, rel_path_bytes, max_bytes))
+            return parts, True, None, coverage
+        entry_parts = format_entry(cwd_bytes, rel_path_bytes, max_bytes)
+        # Read the side-channel global format_entry/_format_entry_body just
+        # set (see LAST_ENTRY_OMISSION_REASON's own comment for why this,
+        # not text-parsing entry_parts, is the only reliable way to learn
+        # the outcome) -- captured immediately, before anything else can
+        # run and potentially change it.
+        reason = LAST_ENTRY_OMISSION_REASON
+        if reason is not None:
+            coverage["omitted"].append({"path": rel_path_bytes.decode("utf-8", errors="replace"), "reason": reason})
+        else:
+            coverage["reviewed_file_count"] += 1
+        parts.extend(entry_parts)
     # The deadline check above only gates whether a file's processing
     # STARTS within budget -- a single file's own read can still take up
     # to PER_FILE_TIMEOUT_SECS, which can push the loop's total elapsed
@@ -302,8 +369,8 @@ def collect(cwd_bytes, deadline_secs, max_bytes):
     # whether the WHOLE collection finished within its aggregate budget,
     # not just whether every file happened to start in time.
     if time.monotonic() >= deadline:
-        return parts, True, None
-    return parts, False, None
+        return parts, True, None, coverage
+    return parts, False, None, coverage
 
 
 def main():
@@ -311,10 +378,17 @@ def main():
     parser.add_argument("cwd")
     parser.add_argument("--deadline-secs", type=int, default=DEFAULT_DEADLINE_SECS)
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    parser.add_argument(
+        "--coverage-out",
+        default=None,
+        help="optional path to write a JSON {reviewed_file_count, omitted} summary to, "
+        "for the caller to surface as wrapper-owned coverage metadata -- never written "
+        "on a hard failure (exit 1/2), since there is nothing truthful to report then.",
+    )
     args = parser.parse_args()
 
     cwd_bytes = os.fsencode(args.cwd)
-    parts, incomplete, error_detail = collect(cwd_bytes, args.deadline_secs, args.max_bytes)
+    parts, incomplete, error_detail, coverage = collect(cwd_bytes, args.deadline_secs, args.max_bytes)
     if error_detail is not None:
         print(error_detail, file=sys.stderr)
         sys.exit(1)
@@ -325,6 +399,26 @@ def main():
             file=sys.stderr,
         )
         sys.exit(2)
+    if args.coverage_out is not None:
+        # A live review of this very change caught that an unhandled write
+        # failure here (confirmed with a real OSError writing to /dev/full)
+        # crashes this whole process with an uncaught traceback, which the
+        # wrapper's own exit-code handling maps to a hard `git_error` --
+        # discarding an otherwise fully successful collection (the real
+        # diff/untracked content in `parts` below, already gathered)
+        # entirely just because this OPTIONAL diagnostic sidecar could not
+        # be written. This is exactly the failure this feature's own
+        # design intends to tolerate (the wrapper's own coverage-file READ
+        # already degrades gracefully to "no coverage metadata" on a
+        # missing/malformed file) -- it was only ever handled on the READ
+        # side, not here on the WRITE side where the actual crash occurs.
+        # Best-effort: on any failure, skip writing coverage entirely and
+        # continue with the real content below rather than losing it.
+        try:
+            with open(args.coverage_out, "w", encoding="utf-8") as f:
+                json.dump(coverage, f)
+        except OSError as exc:
+            print(f"warning: failed to write --coverage-out ({exc}); continuing without it", file=sys.stderr)
     for part in parts:
         if isinstance(part, str):
             sys.stdout.buffer.write(part.encode("utf-8"))
@@ -364,6 +458,7 @@ def _selftest():
         out = fmt(proj, "bin.dat")
         check("binary content; not embedded as text" in out, "binary case: wrong marker")
         check("leftright" not in out, "binary case: leaked corrupted content")
+        check(LAST_ENTRY_OMISSION_REASON == "binary", f"binary case: coverage reason wrong: {LAST_ENTRY_OMISSION_REASON!r}")
 
     # Case 2: plain text -> content embedded verbatim
     with tempfile.TemporaryDirectory() as proj:
@@ -371,6 +466,28 @@ def _selftest():
             f.write("hello from collect_untracked_files test")
         out = fmt(proj, "plain.txt")
         check("hello from collect_untracked_files test" in out, "plain text case: content missing")
+        check(LAST_ENTRY_OMISSION_REASON is None, f"plain text case: fully-included file wrongly marked omitted: {LAST_ENTRY_OMISSION_REASON!r}")
+
+    # Case 2b: a fully-included file whose OWN NAME happens to end in an
+    # omission-marker phrase must NOT be misclassified as omitted -- an
+    # earlier revision derived the coverage reason by pattern-matching the
+    # rendered marker TEXT (which embeds the filename), and a /cc review
+    # round proved that unreliable: live-confirmed a real, fully-included
+    # file literally named to end in "(binary content; not embedded as
+    # text)" produced a marker string indistinguishable-by-suffix from a
+    # genuine omission. Reading LAST_ENTRY_OMISSION_REASON instead is
+    # correct regardless of the filename, since it is set by the CODE PATH
+    # taken, never inferred from rendered text.
+    with tempfile.TemporaryDirectory() as proj:
+        tricky_name = "ordinary (binary content; not embedded as text)"
+        with open(os.path.join(proj, tricky_name), "w", encoding="utf-8") as f:
+            f.write("small content, well under the cap, not binary at all")
+        out = fmt(proj, tricky_name)
+        check("small content, well under the cap" in out, "marker-lookalike-filename case: content missing")
+        check(
+            LAST_ENTRY_OMISSION_REASON is None,
+            f"marker-lookalike-filename case: fully-included file misclassified as omitted: {LAST_ENTRY_OMISSION_REASON!r}",
+        )
 
     # Case 3: symlink -> marker only, target never read (the original a4/c2
     # class of bug this design closes for good via O_NOFOLLOW)
@@ -381,6 +498,7 @@ def _selftest():
         out = fmt(proj, "link.txt")
         check("symlink ->" in out and "target contents not read" in out, "symlink case: wrong marker")
         check("SECRET_VIA_SYMLINK" not in out, "symlink case: leaked target contents")
+        check(LAST_ENTRY_OMISSION_REASON == "symlink", f"symlink case: coverage reason wrong: {LAST_ENTRY_OMISSION_REASON!r}")
 
     # Case 4: oversized file -> capped before ever being read into memory
     with tempfile.TemporaryDirectory() as proj:
@@ -388,6 +506,10 @@ def _selftest():
             f.write(b"\x00" * (DEFAULT_MAX_BYTES + 1000))
         out = fmt(proj, "big.bin")
         check("over 1MB cap" in out, "oversize case: wrong marker")
+        check(
+            LAST_ENTRY_OMISSION_REASON == "over_size_limit",
+            f"oversize case: coverage reason wrong: {LAST_ENTRY_OMISSION_REASON!r}",
+        )
 
     # Case 5: FIFO -> marker only, and MUST NOT block (O_NONBLOCK). Wrapped
     # in an ACTUALLY ENFORCED wall-clock guard via signal.alarm (matching
@@ -415,6 +537,10 @@ def _selftest():
         else:
             check("not a regular file" in out, "FIFO case: wrong marker")
             check(elapsed < 5, f"FIFO case: took {elapsed:.1f}s, should be near-instant")
+            check(
+                LAST_ENTRY_OMISSION_REASON == "not_regular_file",
+                f"FIFO case: coverage reason wrong: {LAST_ENTRY_OMISSION_REASON!r}",
+            )
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old_handler)
@@ -424,6 +550,10 @@ def _selftest():
     with tempfile.TemporaryDirectory() as proj:
         out = fmt(proj, "does_not_exist.txt")
         check("could not be safely read" in out, "vanished-file case: wrong marker")
+        check(
+            LAST_ENTRY_OMISSION_REASON == "unreadable",
+            f"vanished-file case: coverage reason wrong: {LAST_ENTRY_OMISSION_REASON!r}",
+        )
 
     # Case 7: real git integration -- list_untracked_files against a real repo
     with tempfile.TemporaryDirectory() as repo:
@@ -475,7 +605,7 @@ def _selftest():
         subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
         with open(os.path.join(repo, "onlyfile.txt"), "w", encoding="utf-8") as f:
             f.write("content")
-        parts, incomplete, error_detail = collect(os.fsencode(repo), deadline_secs=-1, max_bytes=DEFAULT_MAX_BYTES)
+        parts, incomplete, error_detail, _coverage = collect(os.fsencode(repo), deadline_secs=-1, max_bytes=DEFAULT_MAX_BYTES)
         check(
             incomplete is True or error_detail is not None,
             f"deadline case: silently succeeded (incomplete={incomplete}, error_detail={error_detail!r}) with a real untracked file present",
@@ -511,7 +641,7 @@ def _selftest():
                 f.write("content")
             # 0.1s passes the PRE-file check (the loop has barely started),
             # but the single (patched, 0.2s) file read alone exceeds it.
-            parts, incomplete, error_detail = collect(os.fsencode(repo), deadline_secs=0.1, max_bytes=DEFAULT_MAX_BYTES)
+            parts, incomplete, error_detail, _coverage = collect(os.fsencode(repo), deadline_secs=0.1, max_bytes=DEFAULT_MAX_BYTES)
             check(
                 incomplete is True,
                 "post-loop deadline case: did not report incomplete when the last file's own processing exceeded the aggregate budget",
@@ -530,10 +660,36 @@ def _selftest():
         subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
         with open(os.path.join(repo, "onlyfile.txt"), "w", encoding="utf-8") as f:
             f.write("content")
-        parts, incomplete, error_detail = collect(os.fsencode(repo), deadline_secs=30, max_bytes=DEFAULT_MAX_BYTES)
+        parts, incomplete, error_detail, coverage = collect(os.fsencode(repo), deadline_secs=30, max_bytes=DEFAULT_MAX_BYTES)
         out = _parts_to_text(parts)
         check(incomplete is False, "sufficient-deadline case: falsely reported incomplete")
         check("onlyfile.txt" in out and "content" in out, "sufficient-deadline case: file not collected")
+        check(
+            coverage == {"reviewed_file_count": 1, "omitted": []},
+            f"sufficient-deadline case: coverage wrong for one fully-included file: {coverage!r}",
+        )
+
+    # Case 9b: end-to-end through collect() (not just format_entry directly,
+    # unlike Case 2b above) -- a fully-included file whose NAME happens to
+    # contain a reason phrase must still come out of the FULL collection
+    # pipeline correctly classified via LAST_ENTRY_OMISSION_REASON, not
+    # just in isolation.
+    with tempfile.TemporaryDirectory() as repo:
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        with open(os.path.join(repo, "README.md"), "w", encoding="utf-8") as f:
+            f.write("readme\n")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+        tricky_name = "over 1MB cap or unreadable; contents omitted.txt"
+        with open(os.path.join(repo, tricky_name), "w", encoding="utf-8") as f:
+            f.write("small content, well under the cap")
+        parts, incomplete, error_detail, coverage = collect(os.fsencode(repo), deadline_secs=30, max_bytes=DEFAULT_MAX_BYTES)
+        check(
+            coverage == {"reviewed_file_count": 1, "omitted": []},
+            f"marker-lookalike-filename case: a fully-included file was misclassified as omitted: {coverage!r}",
+        )
 
     # Case 10: intermediate-directory symlink TOCTOU (the c1/high finding
     # this whole rewrite exists to close) -- git lists `dir/file.txt`, but
@@ -701,6 +857,42 @@ def _selftest():
         elapsed < 3,
         f"per-file timeout case: took {elapsed:.1f}s, expected ~1s bound",
     )
+
+    # Case 14: a --coverage-out write failure must NOT crash the whole
+    # process -- a live review of this exact feature (a real Codex CLI run,
+    # not a synthetic test) caught that an earlier version let an uncaught
+    # OSError from this write propagate and kill the process with a
+    # traceback, which the wrapper's own exit-code handling maps to a hard
+    # git_error -- discarding an otherwise fully successful collection
+    # (real, already-gathered file content) entirely just because this
+    # OPTIONAL diagnostic sidecar could not be written. Exercised via an
+    # actual subprocess invocation of this script (not a direct function
+    # call), since that boundary -- argparse, main()'s own sys.exit calls --
+    # is exactly what the live review's reproduction went through and what
+    # a direct call to collect()/main() in-process would not exercise the
+    # same way. A directory path is used as --coverage-out's target (opening
+    # a directory for writing raises IsADirectoryError, a portable, always-
+    # reproducible OSError, unlike a platform-specific device like
+    # /dev/full).
+    with tempfile.TemporaryDirectory() as proj:
+        subprocess.run(["git", "init", "-q"], cwd=proj, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=proj, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=proj, check=True)
+        with open(os.path.join(proj, "normal.txt"), "w", encoding="utf-8") as f:
+            f.write("this content must still reach stdout")
+        result = subprocess.run(
+            [sys.executable, __file__, proj, "--coverage-out", proj],
+            capture_output=True,
+            timeout=10,
+        )
+        check(
+            result.returncode == 0,
+            f"coverage-out write-failure case: process exited {result.returncode}, expected 0 (degrade, don't crash); stderr={result.stderr!r}",
+        )
+        check(
+            b"this content must still reach stdout" in result.stdout,
+            f"coverage-out write-failure case: real file content missing from stdout: {result.stdout!r}",
+        )
 
     if failures:
         for msg in failures:

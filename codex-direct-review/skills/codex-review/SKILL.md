@@ -39,6 +39,17 @@ cross-verification — this is the lightweight, single-shot version.
    - `"ok":true` → present `verdict.verdict` and `verdict.findings` (file, line if present,
      severity if present, summary, evidence, verification), most severe first. If `findings` is
      empty, say so explicitly.
+   - **Check for a top-level `coverage.source` object** (present only for `--uncommitted`; absent
+     for `--base`/`--commit`). If `coverage.source.status` is `"partial"`, say so **prominently,
+     before or alongside the verdict** — e.g. "⚠️ Source coverage partial: N file(s) were not fully
+     reviewed" — and list each `coverage.source.omitted` entry (`path` + `reason`: `symlink`,
+     `not_regular_file`, `over_size_limit`, `binary`, `unreadable`). **Never present a `CLEAN` verdict as if it
+     were a complete review when `coverage.source.status` is `"partial"`** — a clean verdict only
+     means no defects were found in the material that WAS reviewed; say plainly that some source
+     was not inspected (e.g. an oversized or binary file) rather than letting "CLEAN" imply nothing
+     was missed. If `coverage` is absent entirely (e.g. a `--base`/`--commit` scope, or the wrapper
+     could not determine coverage for this run), do not claim either complete or partial coverage —
+     just present the verdict normally, since there is nothing to report either way.
 
 5. **Stop after presenting findings.** Do not make any code changes. Ask the user which findings,
    if any, they want fixed before touching a single file — the same rule the existing

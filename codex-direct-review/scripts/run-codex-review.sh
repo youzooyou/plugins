@@ -113,6 +113,52 @@ judge_result() {
   return 0
 }
 
+# emit_final_output JSON_TEXT
+# Prints JSON_TEXT to stdout, splicing in a coverage.source object first if
+# the global $SOURCE_COVERAGE_JSON is present and well-typed (empty for
+# base/commit scope, or if the collector's coverage file failed to write --
+# degrades to "no coverage metadata" in either case, never an error).
+# `status` is derived here, not asked of the collector: "partial" iff at
+# least one file was omitted, "complete" otherwise -- deterministic
+# wrapper-owned bookkeeping, never something the model declares itself.
+#
+# Shared by BOTH the empty-diff fast path and the normal judge_result path
+# so the two can never drift out of sync on this -- a /cc review round
+# caught exactly that drift: the fast path originally printed its own
+# literal CLEAN JSON directly and never called this logic at all, so a
+# genuinely empty-but-fully-collected uncommitted review (reviewed_file_
+# count 0, omitted []) silently lost its coverage object.
+#
+# JSON_TEXT must already represent a successful result the caller has
+# independently decided is safe to enrich -- this function does not itself
+# gate on any exit/result code, since the empty-diff fast path has no such
+# code to check at all.
+emit_final_output() {
+  local json_text="$1" spliced
+  if printf '%s' "$SOURCE_COVERAGE_JSON" | jq -e '(.reviewed_file_count | type == "number") and (.omitted | type == "array")' >/dev/null 2>&1; then
+    # Captured, not streamed straight to stdout -- a /cc review round
+    # found that a value passing the check above but NOT accepted by
+    # `--argjson` (e.g. multiple concatenated JSON values in one string,
+    # which `jq -e` can still evaluate truthy against but `--argjson`
+    # rejects outright as "not a single JSON value") makes this whole
+    # pipeline print NOTHING: the caller's `exit "$RESULT"` would then
+    # still exit 0 with empty stdout, the worst possible outcome for a
+    # tool whose entire contract is one JSON line per successful run.
+    # Falling back to the original, already-valid json_text on ANY splice
+    # failure guarantees this function always emits something, even if
+    # that something has to be the un-enriched result.
+    spliced="$(printf '%s' "$json_text" | jq -c --argjson cov "$SOURCE_COVERAGE_JSON" \
+      '. + {coverage: {source: ($cov + {status: (if ($cov.omitted | length) > 0 then "partial" else "complete" end)})}}' 2>/dev/null)"
+    if [ -n "$spliced" ]; then
+      printf '%s\n' "$spliced"
+    else
+      printf '%s\n' "$json_text"
+    fi
+  else
+    printf '%s\n' "$json_text"
+  fi
+}
+
 run_selftest() {
   local tmp
   tmp="$(mktemp -d)"
@@ -203,6 +249,60 @@ run_selftest() {
   out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/whitespace_verification.json")"
   echo "$out" | jq -e '.reason == "schema_mismatch"' >/dev/null 2>&1 || { echo "FAIL: whitespace_verification case: $out"; fail=1; }
 
+  # Case 16: emit_final_output's coverage-splicing -- exercised directly
+  # (not through a full review run) since it is now shared by both the
+  # empty-diff fast path and the normal judge_result path, and a /cc
+  # review round caught that the fast path originally skipped this logic
+  # entirely, silently losing coverage on an empty-but-fully-collected
+  # uncommitted review.
+  SOURCE_COVERAGE_JSON='{"reviewed_file_count":2,"omitted":[]}'
+  out="$(emit_final_output '{"ok":true,"verdict":{"verdict":"CLEAN","findings":[],"summary":null}}')"
+  echo "$out" | jq -e '.coverage.source.status == "complete" and .coverage.source.reviewed_file_count == 2' >/dev/null 2>&1 \
+    || { echo "FAIL: emit_final_output complete case: $out"; fail=1; }
+
+  SOURCE_COVERAGE_JSON='{"reviewed_file_count":1,"omitted":[{"path":"big.bin","reason":"over_size_limit"}]}'
+  out="$(emit_final_output '{"ok":true,"verdict":{"verdict":"CLEAN","findings":[],"summary":null}}')"
+  echo "$out" | jq -e '.coverage.source.status == "partial" and (.coverage.source.omitted | length) == 1' >/dev/null 2>&1 \
+    || { echo "FAIL: emit_final_output partial case: $out"; fail=1; }
+
+  SOURCE_COVERAGE_JSON=""
+  out="$(emit_final_output '{"ok":true,"verdict":{"verdict":"CLEAN","findings":[],"summary":null}}')"
+  echo "$out" | jq -e 'has("coverage") | not' >/dev/null 2>&1 \
+    || { echo "FAIL: emit_final_output no-coverage case unexpectedly added a coverage field: $out"; fail=1; }
+
+  # Malformed coverage JSON (not valid JSON at all) must degrade the same
+  # way an empty SOURCE_COVERAGE_JSON does -- no coverage field added,
+  # never an error surfaced to the caller.
+  SOURCE_COVERAGE_JSON="not-json"
+  out="$(emit_final_output '{"ok":true,"verdict":{"verdict":"CLEAN","findings":[],"summary":null}}')"
+  echo "$out" | jq -e 'has("coverage") | not' >/dev/null 2>&1 \
+    || { echo "FAIL: emit_final_output malformed-JSON case unexpectedly added a coverage field: $out"; fail=1; }
+
+  # Valid JSON, but wrong field types (the fail-closed validation this
+  # function's own jq -e check exists for, not just "is it JSON at all").
+  SOURCE_COVERAGE_JSON='{"reviewed_file_count":"two","omitted":"not-an-array"}'
+  out="$(emit_final_output '{"ok":true,"verdict":{"verdict":"CLEAN","findings":[],"summary":null}}')"
+  echo "$out" | jq -e 'has("coverage") | not' >/dev/null 2>&1 \
+    || { echo "FAIL: emit_final_output wrong-types case unexpectedly added a coverage field: $out"; fail=1; }
+
+  # Two concatenated valid JSON values -- `jq -e '<predicate>'` evaluates
+  # truthy against each of a multi-value input stream and (per jq's -e
+  # semantics) exits 0 if the LAST one is truthy, so the validation check
+  # alone would wrongly accept this; but `--argjson` requires EXACTLY one
+  # JSON value and rejects it outright ("invalid JSON text passed to
+  # --argjson", live-confirmed). Without the fallback this function's fix
+  # adds, that combination would make the whole splice pipeline print
+  # NOTHING -- the caller would then exit 0 with completely empty stdout,
+  # the worst possible failure mode for a tool whose contract is one JSON
+  # line per successful run. Confirms the function instead falls back to
+  # the original, unenriched json_text.
+  SOURCE_COVERAGE_JSON='{"reviewed_file_count":1,"omitted":[]}
+{"reviewed_file_count":2,"omitted":[]}'
+  out="$(emit_final_output '{"ok":true,"verdict":{"verdict":"CLEAN","findings":[],"summary":null}}')"
+  echo "$out" | jq -e '.ok == true and (has("coverage") | not)' >/dev/null 2>&1 \
+    || { echo "FAIL: emit_final_output multi-value-JSON case: expected fallback to original output, got: $out"; fail=1; }
+  SOURCE_COVERAGE_JSON=""
+
   rm -rf "$tmp"
 
   if [ "$fail" -eq 0 ]; then
@@ -224,6 +324,13 @@ SCOPE=""
 SCOPE_VALUE=""
 FOCUS=""
 TIMEOUT_SECS="$DEFAULT_TIMEOUT_SECS"
+# Only ever populated for the uncommitted scope (see that case branch) --
+# stays empty for base/commit, where the untracked-file collector never
+# runs and there is nothing for a source-coverage field to describe.
+# Declared here (not just assigned inside the case branch) so referencing
+# it in the final-output section below is well-defined under `set -u`
+# regardless of which scope actually ran.
+SOURCE_COVERAGE_JSON=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -403,8 +510,135 @@ case "$SCOPE" in
     # letting an untrusted repo run arbitrary commands here -- well before
     # the read-only sandbox (which only wraps the later `codex exec` call)
     # is anywhere near relevant.
-    DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv HEAD 2>"$GIT_STDERR_FILE")"
+    #
+    # A brand-new repository with zero commits has an "unborn" HEAD --
+    # `git diff ... HEAD` fails outright in that state (confirmed live:
+    # "fatal: ambiguous argument 'HEAD': unknown revision or path not in
+    # the working tree"), even though there can be real staged content
+    # worth reviewing (e.g. `git init && git add -A` before the first
+    # commit). `git rev-parse --verify -q HEAD` is how git itself
+    # distinguishes "no such commit" from "not a git repo at all" / other
+    # failures -- it fails only in the former case, so this branch is not
+    # taken for a CWD that merely doesn't exist or isn't a repo (that still
+    # correctly falls through to git_error below via the ordinary nonzero
+    # GIT_STATUS path, since the fallback git commands also fail there).
+    #
+    # The whole `cd "$CWD" && git rev-parse` probe runs inside `( )`, NOT
+    # directly in this script's own shell -- a /cc review round caught that
+    # an earlier version ran `cd` unparenthesized here, which changes THIS
+    # SCRIPT's own working directory for good (bash `cd` is never scoped to
+    # an `if`/`&&` chain on its own). A relative `--cwd` value would then
+    # break the SECOND `cd "$CWD"` a few lines down: it would try to
+    # descend into "$CWD" a second time, relative to the directory the
+    # first (leaked) `cd` had already moved into -- live-confirmed:
+    # `--cwd codex-direct-review` run from the repo root failed with
+    # "no such file or directory" on that second `cd` after the first one
+    # silently succeeded and changed the shell's real CWD. `( ... )` gives
+    # the probe its own subshell, so its `cd` can never escape back here.
+    #
+    # An earlier version diffed HEAD normally but, for the unborn-HEAD case,
+    # concatenated "git diff --cached" (staged) with plain "git diff"
+    # (unstaged) to approximate "staged + unstaged" the way a real
+    # `git diff HEAD` covers both at once. A /cc review round proved that
+    # concatenation approach unsound: for a file staged as A then edited to
+    # B, it shows BOTH the empty->A and A->B transitions as two separate
+    # patches -- an intermediate state that never meaningfully existed the
+    # way a real `git diff HEAD`'s single empty->B patch would show -- and
+    # could leave a binary-to-text edit represented only by binary markers
+    # on BOTH legs even though the true start-to-end diff is plain text. It
+    # also required a second numstat call for the same two-transition
+    # split, which then needed deduplicating (a further source of bugs
+    # fixed and re-fixed across several rounds).
+    #
+    # Replaced with a single real revision to diff against either way:
+    # normally "HEAD" itself; for an unborn branch, git's own EMPTY TREE
+    # object -- every git repository has exactly one, and `git hash-object
+    # -t tree /dev/null` computes ITS hash directly (matching the repo's
+    # own configured hash algorithm -- SHA-1 or the newer SHA-256 object
+    # format -- rather than hardcoding SHA-1's well-known constant, which
+    # would be wrong for a SHA-256 repository). Diffing against this real
+    # object gives ONE clean patch covering the CURRENT combined
+    # index+worktree state, exactly mirroring what `git diff HEAD` does for
+    # a normal repo -- live-verified: staging a file as "version A" then
+    # further editing it to "version A\nversion B" and diffing against the
+    # computed empty-tree hash produces a single addition patch showing
+    # only the final two-line content, not a spurious two-step history.
+    #
+    # If this hash-object call itself fails (e.g. CWD isn't a git repo at
+    # all), DIFF_BASE_REF is left empty and the diff call below fails
+    # naturally on that empty/invalid revision argument -- correctly
+    # propagating as git_error via the existing GIT_STATUS check, with no
+    # separate handling needed for that failure mode.
+    if (cd "$CWD" 2>/dev/null && git rev-parse --verify -q HEAD >/dev/null 2>&1); then
+      DIFF_BASE_REF="HEAD"
+    else
+      DIFF_BASE_REF="$(cd "$CWD" 2>/dev/null && git hash-object -t tree /dev/null 2>/dev/null)"
+    fi
+    # A /cc review round caught that coverage.source (see the untracked-file
+    # collection branch below) only ever accounted for the UNTRACKED side --
+    # a TRACKED file that changed but is binary produces git's own fixed
+    # "Binary files a/X and b/Y differ" line instead of real content (no
+    # `--textconv` to reinterpret it, per the flags above), which the model
+    # never actually sees, yet nothing marked that as an omission.
+    #
+    # A first version of this detected that by scanning DIFF_TEXT's rendered
+    # "Binary files ... differ" line with a greedy sed regex, which a /cc
+    # review round then proved unsafe: a real filename containing the
+    # literal text " and " or "b/" makes that regex capture the wrong
+    # substring as the path, live-confirmed to fabricate a garbled path.
+    # `--numstat`'s TAB-separated output ("<added>\t<deleted>\t<path>",
+    # "-\t-\t<path>" for binary) fixed that ambiguity, but a SECOND version
+    # then ran it as a SEPARATE git subprocess call from the main diff --
+    # another /cc review round caught that this leaves a real TOCTOU: two
+    # independent invocations against the same live worktree can observe
+    # different states if a concurrent process changes a tracked file's
+    # binary/text status in the narrow window between them.
+    #
+    # Fixed for real (not just documented as accepted) by combining `-p`
+    # (the normal patch text; `--patch` is `git diff`'s default when no
+    # other output-format flag is given, but is passed explicitly here
+    # since `--numstat` alone WOULD otherwise suppress it) with `--numstat`
+    # in ONE invocation -- live-verified this genuinely emits both: the
+    # numstat lines first (one per changed path), then exactly one blank
+    # line, then the full patch text starting with the first "diff --git".
+    # This is one atomic observation of the worktree, eliminating the race
+    # entirely rather than accepting it. Splitting on the FIRST blank line
+    # is safe even for a path containing an embedded literal newline byte:
+    # live-confirmed git quotes such a filename in C-style-escaped double
+    # quotes in BOTH the numstat and patch-header lines (the newline
+    # becomes the two characters backslash-n, never a real line break)
+    # whenever `-z` is not used, exactly as it already does for other
+    # special characters -- so the first genuine blank line in the output
+    # can only ever be the intended numstat/patch separator, never content
+    # from within a filename.
+    COMBINED_OUTPUT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv --patch --numstat "$DIFF_BASE_REF" 2>"$GIT_STDERR_FILE")"
     GIT_STATUS=$?
+    NUMSTAT_OUTPUT="${COMBINED_OUTPUT%%$'\n\n'*}"
+    DIFF_TEXT="${COMBINED_OUTPUT#*$'\n\n'}"
+    # An entirely empty COMBINED_OUTPUT (a real, empty diff) contains no
+    # blank-line separator at all -- both expansions above then leave their
+    # variable equal to the original (empty) string unchanged, which is
+    # exactly correct: no numstat lines and no patch text either.
+    TRACKED_BINARY_PATHS=()
+    # Counts every TRACKED changed path that was NOT binary -- i.e. real
+    # content the model actually received, the tracked-side counterpart to
+    # the untracked collector's own reviewed_file_count below. A /cc review
+    # round caught that coverage.source.reviewed_file_count previously only
+    # ever counted untracked files, so a review touching ONLY tracked text
+    # changes (no untracked files at all) reported reviewed_file_count: 0
+    # even though real tracked content was reviewed -- misleadingly
+    # suggesting nothing was inspected.
+    TRACKED_REVIEWED_COUNT=0
+    if [ "$GIT_STATUS" -eq 0 ]; then
+      while IFS=$'\t' read -r added deleted numstat_path; do
+        [ -z "$numstat_path" ] && continue
+        if [ "$added" = "-" ] && [ "$deleted" = "-" ]; then
+          TRACKED_BINARY_PATHS+=("$numstat_path")
+        else
+          TRACKED_REVIEWED_COUNT=$((TRACKED_REVIEWED_COUNT + 1))
+        fi
+      done < <(printf '%s\n' "$NUMSTAT_OUTPUT")
+    fi
     if [ "$GIT_STATUS" -eq 0 ]; then
       # git diff HEAD only covers tracked files -- also pull in untracked
       # files ourselves so --uncommitted actually matches its documented
@@ -418,7 +652,18 @@ case "$SCOPE" in
       # bespoke PID tracking.
       mktemp_registered UNTRACKED_OUT_FILE
       mktemp_registered UNTRACKED_ERR_FILE
+      # Deterministic, wrapper-owned source-coverage metadata (per-file
+      # counts of what was actually included vs. omitted and why) -- the
+      # collector already computes this while deciding what to skip
+      # (symlink, oversize, binary, unreadable), so this asks it to also
+      # write that accounting to its own file rather than the model ever
+      # being trusted to reconstruct or self-report it. Only ever read
+      # below on the collector's success path (status 0) -- on any failure
+      # there is nothing truthful yet to report, and the collector itself
+      # never writes this file in that case.
+      mktemp_registered UNTRACKED_COVERAGE_FILE
       python3 "$SCRIPT_DIR/collect_untracked_files.py" "$CWD" --deadline-secs 30 --max-bytes 1048576 \
+        --coverage-out "$UNTRACKED_COVERAGE_FILE" \
         > "$UNTRACKED_OUT_FILE" 2>"$UNTRACKED_ERR_FILE" &
       UNTRACKED_PID=$!
       wait "$UNTRACKED_PID"
@@ -441,21 +686,58 @@ case "$SCOPE" in
           # the collector's own output survive intact.
           UNTRACKED_CAPTURE="$(cat "$UNTRACKED_OUT_FILE" 2>/dev/null; printf 'x')"
           DIFF_TEXT="$DIFF_TEXT${UNTRACKED_CAPTURE%x}"
+          # Read as plain text, not `jq -e .`-validated here -- a malformed
+          # coverage file (write failure, truncated by disk full) should
+          # degrade to "no coverage metadata reported" further down (where
+          # it IS validated before being embedded in the final JSON),
+          # never abort a review that otherwise succeeded.
+          SOURCE_COVERAGE_JSON="$(cat "$UNTRACKED_COVERAGE_FILE" 2>/dev/null)"
+          # Merge in the TRACKED side (reviewed count and any binary
+          # omissions found earlier, before this untracked-file content
+          # was ever appended to DIFF_TEXT) -- computed from the SAME
+          # single combined diff+numstat call as DIFF_TEXT itself now (see
+          # that call's own comment for why this used to be two separate
+          # calls with their own failure-handling gap, no longer relevant
+          # since there is only one call and one GIT_STATUS to check now).
+          # If SOURCE_COVERAGE_JSON is itself malformed/empty here, this jq
+          # call simply produces no output, leaving SOURCE_COVERAGE_JSON
+          # empty -- which the validation right before final-output
+          # splicing already treats as "no coverage metadata to report",
+          # the same safe degradation as any other coverage-file problem.
+          #
+          # `"${TRACKED_BINARY_PATHS[@]}"` is guarded by a length check
+          # first, not expanded unconditionally -- live-confirmed on this
+          # bash (3.2.57, the project's stated compatibility floor) that
+          # `"${ARR[@]}"` on an array explicitly assigned `()` (empty, but
+          # genuinely assigned, not merely "declared and never touched")
+          # STILL raises "unbound variable" under `set -u`; only the
+          # `"${#ARR[@]}"` COUNT form is safe on an empty array. An earlier
+          # revision of this exact merge step had this guard for a
+          # different reason (a since-removed NUMSTAT_STATUS branch) and
+          # silently lost it as a side effect when that branch was
+          # simplified away -- restoring it here, now explicitly for this
+          # reason.
+          TRACKED_BINARY_JSON="[]"
+          if [ "${#TRACKED_BINARY_PATHS[@]}" -gt 0 ]; then
+            TRACKED_BINARY_JSON="$(printf '%s\n' "${TRACKED_BINARY_PATHS[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0)) | map({path: ., reason: "binary"})')"
+          fi
+          SOURCE_COVERAGE_JSON="$(printf '%s' "$SOURCE_COVERAGE_JSON" | jq -c --argjson extra "$TRACKED_BINARY_JSON" --argjson tracked_reviewed "$TRACKED_REVIEWED_COUNT" \
+            '.omitted += $extra | .reviewed_file_count += $tracked_reviewed' 2>/dev/null)"
           ;;
         2)
           DETAIL_JSON="$(cat "$UNTRACKED_ERR_FILE" 2>/dev/null | jq -Rs .)"
-          rm -f "$UNTRACKED_OUT_FILE" "$UNTRACKED_ERR_FILE" "$GIT_STDERR_FILE"
+          rm -f "$UNTRACKED_OUT_FILE" "$UNTRACKED_ERR_FILE" "$UNTRACKED_COVERAGE_FILE" "$GIT_STDERR_FILE"
           printf '{"ok":false,"reason":"incomplete_collection","detail":%s}\n' "$DETAIL_JSON"
           exit 1
           ;;
         *)
           DETAIL_JSON="$(cat "$UNTRACKED_ERR_FILE" 2>/dev/null | jq -Rs .)"
-          rm -f "$UNTRACKED_OUT_FILE" "$UNTRACKED_ERR_FILE" "$GIT_STDERR_FILE"
+          rm -f "$UNTRACKED_OUT_FILE" "$UNTRACKED_ERR_FILE" "$UNTRACKED_COVERAGE_FILE" "$GIT_STDERR_FILE"
           printf '{"ok":false,"reason":"git_error","detail":%s}\n' "$DETAIL_JSON"
           exit 1
           ;;
       esac
-      rm -f "$UNTRACKED_OUT_FILE" "$UNTRACKED_ERR_FILE"
+      rm -f "$UNTRACKED_OUT_FILE" "$UNTRACKED_ERR_FILE" "$UNTRACKED_COVERAGE_FILE"
     fi
     ;;
   base)
@@ -490,7 +772,7 @@ fi
 rm -f "$GIT_STDERR_FILE"
 
 if [ -z "$DIFF_TEXT" ] && [ -z "$FOCUS" ]; then
-  printf '{"ok":true,"verdict":{"verdict":"CLEAN","findings":[],"summary":null}}\n'
+  emit_final_output '{"ok":true,"verdict":{"verdict":"CLEAN","findings":[],"summary":null}}'
   exit 0
 fi
 
@@ -689,7 +971,22 @@ if [ "$TIMED_OUT" -eq 1 ]; then
   exit 1
 fi
 
-judge_result "$EXIT_CODE" "$EVENTLOG" "$OUTFILE"
+# Captured, not printed directly (judge_result has no global side effects
+# of its own, so capturing it via $(...) here is safe -- unlike
+# judge_finding's own doc comment elsewhere in this project about why a
+# side-effecting function must never be called this way) -- this needs the
+# JSON text in hand so a source-coverage field can be spliced in below,
+# not written to stdout before that decision is made.
+JUDGE_OUTPUT="$(judge_result "$EXIT_CODE" "$EVENTLOG" "$OUTFILE")"
 RESULT=$?
 rm -f "$EVENTLOG" "$OUTFILE"
-exit $RESULT
+# Only ever enrich with coverage when the review itself succeeded (RESULT
+# 0) -- a failed/malformed review has nothing truthful to attach coverage
+# to; emit_final_output's own internal check handles whether
+# $SOURCE_COVERAGE_JSON is actually usable.
+if [ "$RESULT" -eq 0 ]; then
+  emit_final_output "$JUDGE_OUTPUT"
+else
+  printf '%s\n' "$JUDGE_OUTPUT"
+fi
+exit "$RESULT"
