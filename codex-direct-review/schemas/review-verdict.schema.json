@@ -8,8 +8,8 @@
         "type": "object",
         "properties": {
           "file": { "type": "string" },
-          "line": { "type": ["integer", "null"] },
-          "severity": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"], "minimum": 1 },
+          "severity": { "type": ["string", "null"], "enum": ["low", "medium", "high", null] },
           "summary": { "type": "string" },
           "evidence": { "type": "string" }
         },
