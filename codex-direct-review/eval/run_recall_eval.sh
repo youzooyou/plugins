@@ -96,8 +96,28 @@ unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_TEMPLATE_DIR
 #     the specific protection must_mention_file provides (e.g. "concurrent
 #     writes ... are serialized by a mutex ..."). Used only by judge_finding
 #     to phrase each control-group finding's yes/no judgment call -- never
-#     read for bug fixtures (should_flag == true), which score via the
-#     existing file+keyword match instead.
+#     read for bug fixtures (should_flag == true), which score primarily via
+#     the file+keyword match instead (see "defect_assertion" immediately
+#     below for the one additional case where a bug fixture's assertion IS
+#     read).
+#   - "defect_assertion": REQUIRED for every bug fixture (should_flag ==
+#     true), validated before that fixture's runs execute (see the
+#     pre-validation check below) -- the should_flag==true counterpart to
+#     "safeguard_assertion" above. A plain-English description of the
+#     specific defect must_mention_file contains (e.g. "the check-then-act
+#     sequence ... has no lock, so two threads can both pass the membership
+#     check before either updates it"). The lexical file+keyword check (see
+#     the should_flag==true scoring branch below) runs FIRST and is never
+#     skipped; defect_assertion is read only as a semantic fallback, via
+#     judge_finding, when a finding names must_mention_file but no keyword
+#     matched -- covering the case (found via manual review of a full 63-run
+#     sweep: fixture 07's toctou bug described as "check-then-process"
+#     instead of the required "check-then-act"; fixture 11's reordered-params
+#     bug described via backtick-formatted `quantity`/`tax_rate` instead of
+#     the required literal substring "quantity and tax_rate") where the model
+#     genuinely identified the seeded defect but phrased it with a synonym
+#     the keyword list didn't anticipate. Never read for control-group
+#     fixtures, which use safeguard_assertion instead.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORPUS_DIR="$SCRIPT_DIR/corpus"
@@ -346,15 +366,19 @@ JUDGE_VERDICT=""
 # review call, which relies on $REVIEW_SCRIPT's own internal 1800s timeout).
 JUDGE_TIMEOUT_SECS=120
 
-# judge_finding ASSERTION FINDING_TEXT PROMPT_AUDIT_PATH RESPONSE_AUDIT_PATH
-# Control-group scoring cannot rely on keyword matching (three straight
-# rounds of design review each found a keyword set that either flagged a
-# safe sentence describing the safeguard, or missed a genuinely bug-claiming
-# one phrased differently -- natural-language polarity isn't reliably
-# separable by substring matching). Instead, each finding on a control
-# fixture's must_mention_file is judged individually by a separate,
-# lightweight codex exec call asking only whether THAT finding claims the
-# fixture's known-correct safeguard (ASSERTION) is missing or broken.
+# judge_finding CONTEXT_LABEL ASSERTION QUESTION FINDING_TEXT PROMPT_AUDIT_PATH RESPONSE_AUDIT_PATH
+# Neither control-group nor bug-fixture scoring can rely on keyword matching
+# alone (three straight rounds of design review each found a control-group
+# keyword set that either flagged a safe sentence describing the safeguard,
+# or missed a genuinely bug-claiming one phrased differently; a full 63-run
+# sweep separately found the SAME class of gap on the bug-fixture side --
+# a model that correctly identified and even live-verified the exact seeded
+# bug but phrased it with a synonym not in keywords_any was scored as a
+# miss). Instead, each finding is judged individually by a separate,
+# lightweight codex exec call asking only whether THAT finding matches the
+# fixture's known assertion (a safeguard for control-group fixtures, a
+# defect for bug fixtures) -- CONTEXT_LABEL and QUESTION let the same
+# mechanics serve both framings without duplicating them.
 # Sets the global JUDGE_VERDICT to exactly one of: yes | no | error. Also
 # writes the exact prompt sent and codex's raw last-message response to
 # PROMPT_AUDIT_PATH/RESPONSE_AUDIT_PATH (inside the run's own leak-safe
@@ -373,7 +397,7 @@ JUDGE_TIMEOUT_SECS=120
 # actually looks at. Matches the same reasoning already documented for
 # scripts/run-codex-review.sh's own mktemp_registered() helper.
 judge_finding() {
-  local assertion="$1" finding_text="$2" prompt_audit_path="$3" response_audit_path="$4"
+  local context_label="$1" assertion="$2" question="$3" finding_text="$4" prompt_audit_path="$5" response_audit_path="$6"
   JUDGE_PROMPT_FILE="$(mktemp)"
   JUDGE_EVENT_FILE="$(mktemp)"
   JUDGE_MSG_FILE="$(mktemp)"
@@ -400,7 +424,7 @@ judge_finding() {
   fi
 
   {
-    echo "This code is protected by the following safeguard, already verified correct:"
+    echo "This code $context_label:"
     echo "\"$assertion\""
     echo ""
     echo "A code review produced this finding about the same code:"
@@ -408,7 +432,7 @@ judge_finding() {
     printf '%s\n' "$finding_text"
     echo "---"
     echo ""
-    echo "Does this finding claim that the stated safeguard is missing, broken, or ineffective?"
+    echo "$question"
     echo "Reply with exactly one word, lowercase, no punctuation: yes or no."
   } > "$JUDGE_PROMPT_FILE"
   if ! cp "$JUDGE_PROMPT_FILE" "$prompt_audit_path" 2>/dev/null; then
@@ -485,7 +509,23 @@ FIXTURE_CATEGORIES=()
 FIXTURE_DIFFICULTY=()
 FIXTURE_SHOULD_FLAG=()
 FIXTURE_HITS=()
+# Lexical-only hit count, parallel to FIXTURE_HITS -- see the lexical_hits
+# local variable's own comment in the should_flag=="true" scoring branch
+# below for what distinguishes the two.
+FIXTURE_LEXICAL_HITS=()
 FIXTURE_VALID=()
+# Lexical metric's OWN denominator, parallel to FIXTURE_VALID -- a /cc
+# round-2 finding disproved this array's original comment here, which had
+# claimed lexical scoring could safely share FIXTURE_VALID with the
+# semantic metric ("a run is either scoreable or it isn't"). That's false:
+# lexical scoring is pure jq and always completes the moment the review
+# call itself succeeds, but the semantic judge fallback can independently
+# fail (timeout, non-yes/no response) on a run that was ALREADY a fully-
+# computed, genuine lexical miss -- decrementing the shared FIXTURE_VALID
+# in that case silently erased that miss from the lexical denominator too,
+# inflating lexical recall. See the lexical_valid local variable's own
+# comment for the fix.
+FIXTURE_LEXICAL_VALID=()
 FIXTURE_ERRORS=()
 MATCHED=0
 ARTIFACT_WRITE_FAILURES=0
@@ -500,22 +540,27 @@ ARTIFACT_WRITE_FAILURES=0
 # complete one.
 CONFIG_ERROR_COUNT=0
 
-# score_pair_member SLUG MUST_FILE FOCUS SNAPSHOT_REPO SNAPSHOT_SHA RUN_N [KEYWORD ...]
+# score_pair_member SLUG MUST_FILE DEFECT_ASSERTION FOCUS SNAPSHOT_REPO SNAPSHOT_SHA RUN_N [KEYWORD ...]
 # Runs ONE review call for one blind/focused pair member against the
 # SHARED snapshot built by run_pair_mode, saves the same result.json/
-# manifest.json artifacts the main loop saves, scores it via the bug-
-# fixture (file+keyword) branch only -- run_pair_mode has already asserted
-# should_flag=="true" for both members before this is ever called, so the
-# control-group judge_finding branch never applies here. Sets the global
-# PAIR_RUN_OUTCOME to exactly one of: hit | miss | error. Any keywords are
-# trailing positional args (possibly zero of them), NOT a global array like
-# judge_finding's JUDGE_VERDICT -- unlike a single scalar result (which
-# bash 3.2, this script's stated compatibility floor, has no
-# `local -n`/nameref to return by reference), an array of caller-owned
-# strings passes through "$@" natively and needs no such workaround.
+# manifest.json artifacts the main loop saves, scores it via the same
+# bug-fixture (file+keyword, falling back to judge_finding against
+# DEFECT_ASSERTION when the lexical check misses but a finding still names
+# MUST_FILE) logic as the main loop's should_flag=="true" branch -- a /cc
+# round-1 finding caught that this function had been left lexical-only
+# after R5 added the semantic fallback to the main loop but not here.
+# run_pair_mode has already asserted should_flag=="true" for both members
+# before this is ever called, so the control-group judge_finding branch
+# never applies here. Sets the global PAIR_RUN_OUTCOME to exactly one of:
+# hit | miss | error. Any keywords are trailing positional args (possibly
+# zero of them), NOT a global array like judge_finding's JUDGE_VERDICT --
+# unlike a single scalar result (which bash 3.2, this script's stated
+# compatibility floor, has no `local -n`/nameref to return by reference),
+# an array of caller-owned strings passes through "$@" natively and needs
+# no such workaround.
 score_pair_member() {
-  local slug="$1" must_file="$2" focus="$3" snapshot_repo="$4" snapshot_sha="$5" run_n="$6"
-  shift 6
+  local slug="$1" must_file="$2" defect_assertion="$3" focus="$4" snapshot_repo="$5" snapshot_sha="$6" run_n="$7"
+  shift 7
 
   REVIEW_OUT="$(mktemp)"
   if [ -z "$REVIEW_OUT" ]; then
@@ -598,6 +643,43 @@ score_pair_member() {
       done
     fi
   fi
+
+  if [ "$file_hit" = "true" ] && [ "$is_hit" != "true" ]; then
+    # Semantic fallback, mirroring the main loop's should_flag=="true"
+    # branch exactly (see its own comment for the full reasoning): the
+    # lexical keyword check above already ran and missed, but a finding
+    # still names must_file, so judge each such finding individually
+    # against defect_assertion rather than scoring this run a flat miss.
+    local matching_findings judge_idx any_yes any_error finding_json finding_text
+    matching_findings="$(printf '%s' "$result" | jq -c --arg f "$must_file" '
+      [.verdict.findings[] | select(.file | contains($f))]
+    ')"
+    judge_idx=0
+    any_yes="false"
+    any_error="false"
+    while IFS= read -r finding_json; do
+      judge_idx=$((judge_idx + 1))
+      finding_text="$(printf '%s' "$finding_json" | jq -r '(.summary // "") + "\n" + (.evidence // "")')"
+      judge_finding "has the following known defect" \
+        "$defect_assertion" \
+        "Does this finding identify the defect described above, even if phrased differently or using different terminology?" \
+        "$finding_text" \
+        "$run_dir/semantic-judge-${judge_idx}.prompt.txt" "$run_dir/semantic-judge-${judge_idx}.response.txt"
+      case "$JUDGE_VERDICT" in
+        yes) any_yes="true" ;;
+        error) any_error="true" ;;
+      esac
+    done < <(printf '%s' "$matching_findings" | jq -c '.[]')
+
+    if [ "$any_error" = "true" ]; then
+      echo "  [$slug] run $run_n: ERROR (semantic judge call failed or gave a non-yes/no response) -- excluded from scoring"
+      PAIR_RUN_OUTCOME="error"
+      return
+    elif [ "$any_yes" = "true" ]; then
+      is_hit="true"
+    fi
+  fi
+
   if [ "$is_hit" = "true" ]; then
     echo "  [$slug] run $run_n: HIT (verdict=$verdict)"
     PAIR_RUN_OUTCOME="hit"
@@ -728,6 +810,17 @@ run_pair_mode() {
       echo "error: --pair fixture expected.json focus must be null or a NUL-free string: $f" >&2
       exit 1
     fi
+    # defect_assertion: required for --pair too -- a /cc round-1 finding
+    # caught that this validation (and the semantic fallback it feeds) had
+    # been added to the main loop's should_flag=="true" scoring but never
+    # to run_pair_mode/score_pair_member, which also scores should_flag==
+    # true fixtures and had silently stayed lexical-only. Same contract as
+    # the main loop's own defect_assertion check (see its comment for why:
+    # type/NUL/whitespace-only guards).
+    if ! jq -e '.defect_assertion | (type == "string" and (explode | any(. == 0) | not) and ((gsub("\\s"; "")) | length > 0))' "$f" >/dev/null 2>&1; then
+      echo "error: --pair fixture expected.json missing/invalid defect_assertion: $f" >&2
+      exit 1
+    fi
   done
 
   # Pair invariant #1: before/ must be byte-identical -- otherwise a recall
@@ -743,18 +836,19 @@ run_pair_mode() {
   # `diff -rq` above only proves the SOURCE is identical, not that both
   # members would be scored the same way (round-9 plan finding).
   local fields_a fields_b
-  fields_a="$(jq -Sc '{must_mention_file, keywords_any, should_flag}' "$exp_a")"
-  fields_b="$(jq -Sc '{must_mention_file, keywords_any, should_flag}' "$exp_b")"
+  fields_a="$(jq -Sc '{must_mention_file, keywords_any, should_flag, defect_assertion}' "$exp_a")"
+  fields_b="$(jq -Sc '{must_mention_file, keywords_any, should_flag, defect_assertion}' "$exp_b")"
   if [ "$fields_a" != "$fields_b" ]; then
-    echo "error: --pair fixtures' must_mention_file/keywords_any/should_flag differ:" >&2
+    echo "error: --pair fixtures' must_mention_file/keywords_any/should_flag/defect_assertion differ:" >&2
     echo "  $slug_a: $fields_a" >&2
     echo "  $slug_b: $fields_b" >&2
     exit 1
   fi
 
-  local should_flag must_file focus_a focus_b
+  local should_flag must_file defect_assertion focus_a focus_b
   should_flag="$(jq -r '.should_flag' "$exp_a")"
   must_file="$(jq -r '.must_mention_file' "$exp_a")"
+  defect_assertion="$(jq -r '.defect_assertion' "$exp_a")"
   focus_a="$(jq -r '.focus // empty' "$exp_a")"
   focus_b="$(jq -r '.focus // empty' "$exp_b")"
   if [ "$should_flag" != "true" ]; then
@@ -865,13 +959,26 @@ run_pair_mode() {
   local hits_b=0 valid_b=0 errors_b=0
   local run_n
   for run_n in $(seq 1 "$RUNS_PER_FIXTURE"); do
-    score_pair_member "$slug_a" "$must_file" "$focus_a" "$CURRENT_TMP_REPO" "$snapshot_sha" "$run_n" "${pair_keywords[@]}"
+    # Built as an array (rather than expanding "${pair_keywords[@]}" inline
+    # at each call site) so a fixture with keywords_any==null -- valid per
+    # this function's own validation above, which leaves pair_keywords
+    # empty -- never reaches a bare "${pair_keywords[@]}" expansion under
+    # this script's `set -u`/bash-3.2 floor: a /cc round-1 finding live-
+    # confirmed that exact expansion crashes with "unbound variable" (exit
+    # 127) on an explicitly-empty array, the same class of gap fixed once
+    # already in scripts/run-codex-review.sh's TRACKED_BINARY_PATHS.
+    local score_args
+    score_args=("$slug_a" "$must_file" "$defect_assertion" "$focus_a" "$CURRENT_TMP_REPO" "$snapshot_sha" "$run_n")
+    [ "${#pair_keywords[@]}" -gt 0 ] && score_args+=("${pair_keywords[@]}")
+    score_pair_member "${score_args[@]}"
     case "$PAIR_RUN_OUTCOME" in
       hit) hits_a=$((hits_a + 1)); valid_a=$((valid_a + 1)) ;;
       miss) valid_a=$((valid_a + 1)) ;;
       error) errors_a=$((errors_a + 1)) ;;
     esac
-    score_pair_member "$slug_b" "$must_file" "$focus_b" "$CURRENT_TMP_REPO" "$snapshot_sha" "$run_n" "${pair_keywords[@]}"
+    score_args=("$slug_b" "$must_file" "$defect_assertion" "$focus_b" "$CURRENT_TMP_REPO" "$snapshot_sha" "$run_n")
+    [ "${#pair_keywords[@]}" -gt 0 ] && score_args+=("${pair_keywords[@]}")
+    score_pair_member "${score_args[@]}"
     case "$PAIR_RUN_OUTCOME" in
       hit) hits_b=$((hits_b + 1)); valid_b=$((valid_b + 1)) ;;
       miss) valid_b=$((valid_b + 1)) ;;
@@ -1034,6 +1141,30 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
     safeguard_assertion="$(jq -r '.safeguard_assertion' "$expected_file")"
   fi
 
+  defect_assertion=""
+  if [ "$should_flag" = "true" ]; then
+    # Required for every bug fixture (see judge_finding and the
+    # defect_assertion header comment above) -- validated with the exact
+    # same non-empty/whitespace-trimmed/NUL-free contract as
+    # safeguard_assertion above, and for the same reasons: `jq -r` silently
+    # returns "" or "null" for a missing/wrong-typed field rather than
+    # erroring, a whitespace-only string like "   " would otherwise pass a
+    # plain `length > 0` check, and a NUL byte would silently truncate to a
+    # shorter string than the fixture author wrote once captured into this
+    # bash variable. Only actually READ later when the lexical file+keyword
+    # check misses but a finding still names must_mention_file (see the
+    # should_flag=="true" scoring branch below) -- validated here regardless,
+    # before any runs execute, so a misconfigured fixture is caught up front
+    # rather than only failing partway through a sweep on whichever run
+    # happens to need the semantic fallback first.
+    if ! jq -e '.defect_assertion | (type == "string" and (explode | any(. == 0) | not) and ((gsub("\\s"; "")) | length > 0))' "$expected_file" >/dev/null 2>&1; then
+      echo "skip: $slug (bug fixture missing/invalid defect_assertion in expected.json)" >&2
+      CONFIG_ERROR_COUNT=$((CONFIG_ERROR_COUNT + 1))
+      continue
+    fi
+    defect_assertion="$(jq -r '.defect_assertion' "$expected_file")"
+  fi
+
   keywords=()
   # `jq -c` + a `jq -j` (not `jq -r`) decode per line -- see run_pair_mode's
   # identical fix (same file, its own comment has the full reasoning) for
@@ -1144,7 +1275,19 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
   snapshot_sha="$(git -C "$CURRENT_TMP_REPO" rev-parse HEAD)"
 
   hits=0
+  lexical_hits=0
   valid=0
+  # Separate denominator for the lexical metric -- a /cc round-2 finding
+  # caught that lexical_hits was being divided by the SAME `valid` the
+  # semantic judge-error branch below decrements, so a judge timeout on a
+  # run that was ALREADY a genuine, fully-computed lexical miss silently
+  # removed that miss from the lexical denominator too -- inflating lexical
+  # recall and contradicting this file's own stated claim that lexical_hits
+  # is "COMPLETELY unaffected by the semantic judge fallback". lexical_valid
+  # increments in lockstep with `valid` on every wrapper success (lexical
+  # scoring is pure jq -- it always completes, unlike the semantic
+  # fallback), but is NEVER decremented by a judge error.
+  lexical_valid=0
   errors=0
 
   echo "=== $slug ($category) ==="
@@ -1220,20 +1363,25 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
       continue
     fi
     valid=$((valid + 1))
+    lexical_valid=$((lexical_valid + 1))
     verdict="$(printf '%s' "$result" | jq -r '.verdict.verdict')"
 
     if [ "$should_flag" = "true" ]; then
       # Hit requires: some finding names must_file AND at least one keyword
       # appears (case-insensitively) in THAT SAME finding's summary/evidence
       # -- not just anywhere in the whole verdict -- so a lucky keyword match
-      # on an unrelated finding can't count.
+      # on an unrelated finding can't count. Computed exactly as before and
+      # NEVER skipped -- this is "lexical_hits" below (R5's new parallel
+      # metric), and the ONLY check run at all when it already hits, since a
+      # semantic judge_finding call costs a real API call this scoring
+      # should never spend when the cheap lexical check already succeeded.
       file_hit="$(printf '%s' "$result" | jq -r --arg f "$must_file" '
         [.verdict.findings[] | select(.file | contains($f))] | length > 0
       ')"
-      is_hit="false"
+      lexical_hit="false"
       if [ "$file_hit" = "true" ]; then
         if [ "${#keywords[@]}" -eq 0 ]; then
-          is_hit="true"
+          lexical_hit="true"
         else
           for kw in "${keywords[@]}"; do
             match="$(printf '%s' "$result" | jq -r --arg f "$must_file" --arg kw "$kw" '
@@ -1243,15 +1391,73 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
               ] | length > 0
             ')"
             if [ "$match" = "true" ]; then
-              is_hit="true"
+              lexical_hit="true"
               break
             fi
           done
         fi
       fi
-      if [ "$is_hit" = "true" ]; then
+
+      if [ "$lexical_hit" = "true" ]; then
+        lexical_hits=$((lexical_hits + 1))
         hits=$((hits + 1))
-        echo "  run $run_n: HIT (verdict=$verdict)"
+        echo "  run $run_n: HIT (verdict=$verdict, lexical keyword match)"
+      elif [ "$file_hit" = "true" ]; then
+        # Lexical check missed, but at least one finding still named the
+        # right file -- the model was looking in the right place but didn't
+        # happen to use a keyword from keywords_any. Manual review of a full
+        # 63-run sweep found this produces FALSE misses: the model correctly
+        # identified (and in one case live-verified) the exact seeded bug,
+        # just phrased with a synonym (see the defect_assertion header
+        # comment above for the two concrete examples). Every finding on
+        # must_file is judged individually here, exactly mirroring the
+        # control-group loop's own per-finding pattern below -- the judge
+        # sees ONLY defect_assertion and that ONE finding's own
+        # summary+evidence, never keywords_any, never the other findings,
+        # never any other fixture metadata, so it is deciding narrowly
+        # "does this one finding identify this one described defect" and
+        # nothing broader (e.g. not "is this a good review overall").
+        matching_findings="$(printf '%s' "$result" | jq -c --arg f "$must_file" '
+          [.verdict.findings[] | select(.file | contains($f))]
+        ')"
+        judge_idx=0
+        any_yes="false"
+        any_error="false"
+        while IFS= read -r finding_json; do
+          judge_idx=$((judge_idx + 1))
+          finding_text="$(printf '%s' "$finding_json" | jq -r '(.summary // "") + "\n" + (.evidence // "")')"
+          judge_finding "has the following known defect" \
+            "$defect_assertion" \
+            "Does this finding identify the defect described above, even if phrased differently or using different terminology?" \
+            "$finding_text" \
+            "$run_dir/semantic-judge-${judge_idx}.prompt.txt" "$run_dir/semantic-judge-${judge_idx}.response.txt"
+          case "$JUDGE_VERDICT" in
+            yes) any_yes="true" ;;
+            error) any_error="true" ;;
+          esac
+        done < <(printf '%s' "$matching_findings" | jq -c '.[]')
+
+        if [ "$any_error" = "true" ]; then
+          # A judge-call failure/ambiguous-response is excluded from scoring
+          # entirely -- same treatment as an ok:false wrapper failure above
+          # and as the control-group path's own judge-error handling below --
+          # never silently folded into either "hit" (which would inflate
+          # recall) or "miss" (which would understate it). `valid` was
+          # already incremented above on the assumption this run would be
+          # scoreable; undo that now that a judge error has made it not so.
+          echo "  run $run_n: ERROR (semantic judge call failed or gave a non-yes/no response) -- excluded from scoring"
+          errors=$((errors + 1))
+          valid=$((valid - 1))
+        elif [ "$any_yes" = "true" ]; then
+          # Semantic-only hit: counts toward the combined hits/FIXTURE_HITS
+          # metric (lexical-or-semantic) but deliberately NOT toward
+          # lexical_hits/FIXTURE_LEXICAL_HITS, which must stay unaffected by
+          # this adjudication path.
+          hits=$((hits + 1))
+          echo "  run $run_n: HIT (verdict=$verdict, semantic judge confirmed a differently-phrased match)"
+        else
+          echo "  run $run_n: miss (verdict=$verdict)"
+        fi
       else
         echo "  run $run_n: miss (verdict=$verdict)"
       fi
@@ -1281,7 +1487,10 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
         while IFS= read -r finding_json; do
           judge_idx=$((judge_idx + 1))
           finding_text="$(printf '%s' "$finding_json" | jq -r '(.summary // "") + "\n" + (.evidence // "")')"
-          judge_finding "$safeguard_assertion" "$finding_text" \
+          judge_finding "is protected by the following safeguard, already verified correct" \
+            "$safeguard_assertion" \
+            "Does this finding claim that the stated safeguard is missing, broken, or ineffective?" \
+            "$finding_text" \
             "$run_dir/judge-${judge_idx}.prompt.txt" "$run_dir/judge-${judge_idx}.response.txt"
           case "$JUDGE_VERDICT" in
             yes) any_yes="true" ;;
@@ -1321,7 +1530,9 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
   FIXTURE_DIFFICULTY+=("$difficulty")
   FIXTURE_SHOULD_FLAG+=("$should_flag")
   FIXTURE_HITS+=("$hits")
+  FIXTURE_LEXICAL_HITS+=("$lexical_hits")
   FIXTURE_VALID+=("$valid")
+  FIXTURE_LEXICAL_VALID+=("$lexical_valid")
   FIXTURE_ERRORS+=("$errors")
 done
 
@@ -1360,15 +1571,27 @@ for i in "${!FIXTURE_NAMES[@]}"; do
 done
 
 total_hits=0
+total_lexical_hits=0
 total_valid=0
+total_lexical_valid=0
 for i in "${!FIXTURE_NAMES[@]}"; do
   if [ "${FIXTURE_SHOULD_FLAG[$i]}" = "true" ]; then
     total_hits=$((total_hits + FIXTURE_HITS[i]))
+    total_lexical_hits=$((total_lexical_hits + FIXTURE_LEXICAL_HITS[i]))
     total_valid=$((total_valid + FIXTURE_VALID[i]))
+    total_lexical_valid=$((total_lexical_valid + FIXTURE_LEXICAL_VALID[i]))
   fi
 done
 echo ""
-echo "Overall recall (bug fixtures, excludes control group):"
+# "Semantic target recall": fed by hits/FIXTURE_HITS, which count a run as a
+# hit if EITHER the lexical file+keyword check matched OR (when it didn't,
+# but a finding still named must_mention_file) the semantic judge_finding
+# fallback confirmed a differently-phrased match against defect_assertion --
+# see the should_flag=="true" scoring branch above. This is the more
+# complete picture (a model that identified the seeded defect but phrased it
+# with an unanticipated synonym still counts), and was previously labeled
+# "Overall recall" before this line was fed by lexical-only scoring.
+echo "Semantic target recall (bug fixtures, lexical + judge-confirmed, excludes control group):"
 if [ "$total_valid" -gt 0 ]; then
   pct="$(awk -v h="$total_hits" -v v="$total_valid" 'BEGIN { printf "%.1f", (h / v) * 100 }')"
   echo "  $total_hits/$total_valid ($pct%)"
@@ -1377,7 +1600,29 @@ else
 fi
 
 echo ""
-echo "Recall by category:"
+# Lexical-only counterpart: fed by lexical_hits/FIXTURE_LEXICAL_HITS over
+# its OWN denominator lexical_valid/FIXTURE_LEXICAL_VALID -- NOT the shared
+# total_valid above. A /cc round-2 finding caught that reusing total_valid
+# here let a semantic judge-call failure (on a run that was ALREADY a
+# genuine, fully-computed lexical miss) silently vanish from the lexical
+# denominator too, inflating this metric and contradicting the very claim
+# this comment makes. lexical_valid is immune to that: it increments
+# whenever the review call itself succeeds and is never decremented by a
+# judge error (lexical scoring is pure jq and always completes). This is
+# exactly what the scorer would have reported before R5 (the file+keyword
+# check alone). Shown side by side with the semantic metric above so a
+# future reader can see both numbers, matching the diagnosis document's own
+# reported pair (74.1% lexical vs 83.3% semantic on a full 63-run sweep).
+echo "Lexical recall (bug fixtures, keyword-match only, excludes control group):"
+if [ "$total_lexical_valid" -gt 0 ]; then
+  pct="$(awk -v h="$total_lexical_hits" -v v="$total_lexical_valid" 'BEGIN { printf "%.1f", (h / v) * 100 }')"
+  echo "  $total_lexical_hits/$total_lexical_valid ($pct%)"
+else
+  echo "  N/A (no valid runs)"
+fi
+
+echo ""
+echo "Recall by category (semantic, lexical + judge-confirmed):"
 categories="$(printf '%s\n' "${FIXTURE_CATEGORIES[@]:-}" | sort -u)"
 while IFS= read -r cat; do
   [ "$cat" = "control_clean" ] && continue
@@ -1385,7 +1630,14 @@ while IFS= read -r cat; do
   cat_hits=0
   cat_valid=0
   for i in "${!FIXTURE_NAMES[@]}"; do
-    if [ "${FIXTURE_CATEGORIES[$i]}" = "$cat" ]; then
+    # Gated on should_flag=="true" (not just category != "control_clean"
+    # above) -- a /cc round-1 finding caught that category is an unenforced
+    # free-text field (nothing ties its value to should_flag), so a future
+    # --corpus-dir fixture using a non-"control_clean" category on a
+    # control-group fixture would otherwise silently pollute this bug-
+    # fixture recall breakdown. Matches the total_hits/total_valid gate
+    # above, which already filters this way.
+    if [ "${FIXTURE_CATEGORIES[$i]}" = "$cat" ] && [ "${FIXTURE_SHOULD_FLAG[$i]}" = "true" ]; then
       cat_hits=$((cat_hits + FIXTURE_HITS[i]))
       cat_valid=$((cat_valid + FIXTURE_VALID[i]))
     fi
@@ -1398,12 +1650,39 @@ while IFS= read -r cat; do
   fi
 done <<< "$categories"
 
+echo ""
+echo "Recall by category (lexical, keyword-match only):"
+while IFS= read -r cat; do
+  [ "$cat" = "control_clean" ] && continue
+  [ -z "$cat" ] && continue
+  cat_lexical_hits=0
+  cat_lexical_valid=0
+  for i in "${!FIXTURE_NAMES[@]}"; do
+    # Same should_flag gate as the semantic breakdown above -- see its
+    # comment for why category alone isn't a reliable filter. Uses its own
+    # FIXTURE_LEXICAL_VALID denominator, not FIXTURE_VALID -- see that
+    # array's own comment (a /cc round-2 finding) for why sharing it with
+    # the semantic denominator lets a judge-call failure inflate this
+    # lexical metric.
+    if [ "${FIXTURE_CATEGORIES[$i]}" = "$cat" ] && [ "${FIXTURE_SHOULD_FLAG[$i]}" = "true" ]; then
+      cat_lexical_hits=$((cat_lexical_hits + FIXTURE_LEXICAL_HITS[i]))
+      cat_lexical_valid=$((cat_lexical_valid + FIXTURE_LEXICAL_VALID[i]))
+    fi
+  done
+  if [ "$cat_lexical_valid" -gt 0 ]; then
+    pct="$(awk -v h="$cat_lexical_hits" -v v="$cat_lexical_valid" 'BEGIN { printf "%.1f", (h / v) * 100 }')"
+    echo "  $cat: $cat_lexical_hits/$cat_lexical_valid ($pct%)"
+  else
+    echo "  $cat: N/A (no valid runs)"
+  fi
+done <<< "$categories"
+
 # Recall by difficulty (easy vs subtle) -- the point of this split per
 # research on leaky/easy benchmarks (PrimeVul): a corpus dominated by
 # "easy" bugs inflates recall in a way that doesn't reflect real review
 # value. Watching easy vs subtle drift apart here is the actual signal.
 echo ""
-echo "Recall by difficulty:"
+echo "Recall by difficulty (semantic, lexical + judge-confirmed):"
 difficulties="$(printf '%s\n' "${FIXTURE_DIFFICULTY[@]:-}" | sort -u)"
 while IFS= read -r diff; do
   [ "$diff" = "n/a" ] && continue
@@ -1411,7 +1690,12 @@ while IFS= read -r diff; do
   diff_hits=0
   diff_valid=0
   for i in "${!FIXTURE_NAMES[@]}"; do
-    if [ "${FIXTURE_DIFFICULTY[$i]}" = "$diff" ]; then
+    # Gated on should_flag=="true" for the same reason as the category
+    # breakdown above -- difficulty is likewise an unenforced free-text/
+    # enum field with no validator link to should_flag. Currently every
+    # control-group fixture uses difficulty:null (-> "n/a", already
+    # skipped above), so this is defense-in-depth rather than a live fix.
+    if [ "${FIXTURE_DIFFICULTY[$i]}" = "$diff" ] && [ "${FIXTURE_SHOULD_FLAG[$i]}" = "true" ]; then
       diff_hits=$((diff_hits + FIXTURE_HITS[i]))
       diff_valid=$((diff_valid + FIXTURE_VALID[i]))
     fi
@@ -1419,6 +1703,30 @@ while IFS= read -r diff; do
   if [ "$diff_valid" -gt 0 ]; then
     pct="$(awk -v h="$diff_hits" -v v="$diff_valid" 'BEGIN { printf "%.1f", (h / v) * 100 }')"
     echo "  $diff: $diff_hits/$diff_valid ($pct%)"
+  else
+    echo "  $diff: N/A (no valid runs)"
+  fi
+done <<< "$difficulties"
+
+echo ""
+echo "Recall by difficulty (lexical, keyword-match only):"
+while IFS= read -r diff; do
+  [ "$diff" = "n/a" ] && continue
+  [ -z "$diff" ] && continue
+  diff_lexical_hits=0
+  diff_lexical_valid=0
+  for i in "${!FIXTURE_NAMES[@]}"; do
+    # Same should_flag gate as the semantic breakdown above. Uses its own
+    # FIXTURE_LEXICAL_VALID denominator -- see that array's own comment
+    # (a /cc round-2 finding) for why.
+    if [ "${FIXTURE_DIFFICULTY[$i]}" = "$diff" ] && [ "${FIXTURE_SHOULD_FLAG[$i]}" = "true" ]; then
+      diff_lexical_hits=$((diff_lexical_hits + FIXTURE_LEXICAL_HITS[i]))
+      diff_lexical_valid=$((diff_lexical_valid + FIXTURE_LEXICAL_VALID[i]))
+    fi
+  done
+  if [ "$diff_lexical_valid" -gt 0 ]; then
+    pct="$(awk -v h="$diff_lexical_hits" -v v="$diff_lexical_valid" 'BEGIN { printf "%.1f", (h / v) * 100 }')"
+    echo "  $diff: $diff_lexical_hits/$diff_lexical_valid ($pct%)"
   else
     echo "  $diff: N/A (no valid runs)"
   fi
@@ -1450,17 +1758,19 @@ echo "Wrapper-level errors (excluded from all scoring above): $total_errors"
 echo ""
 if [ "$CONFIG_ERROR_COUNT" -gt 0 ]; then
   # Deliberately does not name a single cause -- CONFIG_ERROR_COUNT is
-  # incremented for SIX distinct validation failures (a symlinked
+  # incremented for SEVEN distinct validation failures (a symlinked
   # expected.json/before/, a nested .git corpus-format violation, malformed
   # required fields, invalid keywords_any, invalid focus,
-  # invalid/missing safeguard_assertion); this message has fallen behind
-  # the actual increment-site count more than once already as new
-  # validation checks were added elsewhere in this file. Keep this list in
-  # sync whenever a new CONFIG_ERROR_COUNT increment site is added.
+  # invalid/missing safeguard_assertion, invalid/missing defect_assertion --
+  # the last one added by R5); this message has fallen behind the actual
+  # increment-site count more than once already as new validation checks
+  # were added elsewhere in this file. Keep this list in sync whenever a new
+  # CONFIG_ERROR_COUNT increment site is added.
   echo "WARNING: $CONFIG_ERROR_COUNT fixture(s) skipped entirely due to a configuration error"
   echo "(a symlinked expected.json/before/, a nested .git under before/, malformed expected.json,"
-  echo "invalid keywords_any, invalid focus, or missing/invalid safeguard_assertion -- see the"
-  echo "skip: messages earlier in this output for which one) -- NOT counted in any denominator above."
+  echo "invalid keywords_any, invalid focus, missing/invalid safeguard_assertion, or missing/invalid"
+  echo "defect_assertion -- see the skip: messages earlier in this output for which one) -- NOT"
+  echo "counted in any denominator above."
   echo ""
 fi
 if [ "$ARTIFACT_WRITE_FAILURES" -eq 0 ]; then
