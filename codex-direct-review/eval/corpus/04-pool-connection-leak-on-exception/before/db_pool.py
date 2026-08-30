@@ -1,3 +1,7 @@
+class TransientError(Exception):
+    """Raised for errors that are safe to retry (e.g. a dropped connection)."""
+
+
 class ConnectionPool:
     def __init__(self):
         self._available = ["conn-1", "conn-2", "conn-3"]
@@ -13,8 +17,15 @@ class ConnectionPool:
         self._available.append(conn)
 
 
-def run_query(pool, execute, sql):
-    conn = pool.acquire()
-    result = execute(conn, sql)
-    pool.release(conn)
-    return result
+def run_query(pool, execute, sql, max_retries=3):
+    last_error = None
+    for attempt in range(max_retries):
+        conn = pool.acquire()
+        try:
+            result = execute(conn, sql)
+            pool.release(conn)
+            return result
+        except TransientError as exc:
+            last_error = exc
+            continue
+    raise last_error

@@ -1,14 +1,15 @@
-function deepClone(obj) {
-  if (obj === null || typeof obj !== "object") {
-    return obj;
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+    return false;
   }
-  const copy = Array.isArray(obj) ? [] : {};
-  for (const key in obj) {
-    if (Object.prototype.hasOwnProperty.call(obj, key)) {
-      copy[key] = deepClone(obj[key]);
-    }
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  for (const key of keysA) {
+    if (!deepEqual(a[key], b[key])) return false;
   }
-  return copy;
+  return true;
 }
 
-module.exports = { deepClone };
+module.exports = { deepEqual };

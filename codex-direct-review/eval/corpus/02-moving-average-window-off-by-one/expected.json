@@ -1,1 +1,1 @@
-{"category": "logic_off_by_one", "difficulty": "subtle", "should_flag": true, "must_mention_file": "movingAverage.js", "keywords_any": ["off-by-one", "off by one", "windowsize + 1", "extra element", "window size", "slice"], "severity_floor": "medium"}
+{"category": "logic_off_by_one", "difficulty": "subtle", "should_flag": true, "must_mention_file": "movingAverage.js", "keywords_any": ["off-by-one", "off by one", "never removed", "never subtracted", "stale", "sliding window", "boundary", "windowsize"], "severity_floor": "medium"}

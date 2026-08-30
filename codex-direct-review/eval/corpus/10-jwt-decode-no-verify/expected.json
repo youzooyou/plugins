@@ -1,1 +1,1 @@
-{"category": "security_injection", "difficulty": "subtle", "should_flag": true, "must_mention_file": "auth.js", "keywords_any": ["jwt.decode", "signature", "verify", "forge", "auth bypass", "not verified"], "severity_floor": "high"}
+{"category": "security_injection", "difficulty": "subtle", "should_flag": true, "must_mention_file": "auth.js", "keywords_any": ["includes", "substring", "privilege escalation", "admin_view_only", "role name", "exact match", "startswith", "contains"], "severity_floor": "high"}

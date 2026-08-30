@@ -1,1 +1,1 @@
-{"category": "reuse_simplification", "difficulty": "subtle", "should_flag": true, "must_mention_file": "clone.js", "keywords_any": ["structuredclone", "reinvent", "built-in", "simplify", "standard library"], "severity_floor": "low"}
+{"category": "reuse_simplification", "difficulty": "subtle", "should_flag": true, "must_mention_file": "clone.js", "keywords_any": ["deep equal", "isdeepstrictequal", "reinvent", "date", "own enumerable", "object.keys", "built-in", "util.isdeepstrictequal"], "severity_floor": "low"}

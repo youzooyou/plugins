@@ -1,9 +1,14 @@
 function movingAverage(values, windowSize) {
   const result = [];
-  for (let i = 0; i + windowSize <= values.length; i++) {
-    const window = values.slice(i, i + windowSize + 1);
-    const sum = window.reduce((a, b) => a + b, 0);
-    result.push(sum / windowSize);
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    sum += values[i];
+    if (i > windowSize) {
+      sum -= values[i - windowSize];
+    }
+    if (i >= windowSize - 1) {
+      result.push(sum / windowSize);
+    }
   }
   return result;
 }
