@@ -95,7 +95,14 @@ judge_result() {
           (has("summary") and (.summary | type) == "string") and
           (has("evidence") and (.evidence | type) == "string") and
           ((keys_unsorted - ["file","line","severity","summary","evidence"]) == [])
-        ))
+        )) and
+        # verdict/findings cross-field consistency (CLEAN implies no findings,
+        # ISSUES implies at least one) is enforced HERE, not as an allOf/if-then
+        # in schemas/review-verdict.schema.json -- confirmed live that the
+        # backend strict-structured-output mode rejects allOf outright
+        # (invalid_json_schema: allOf is not permitted in this context).
+        # This jq check is the only enforcement point for this rule.
+        (if .verdict == "CLEAN" then (.findings | length == 0) else (.findings | length > 0) end)
       ' "$outfile" >/dev/null 2>&1; then
     printf '{"ok":false,"reason":"schema_mismatch","detail":"output JSON does not match review-verdict schema"}\n'
     return 1
@@ -145,6 +152,25 @@ run_selftest() {
   echo '{"verdict":"CLEAN","findings":[{"file":false,"summary":0,"evidence":[],"line":null,"severity":null}],"summary":null,"unexpected":true}' > "$tmp/wrong_types.json"
   out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/wrong_types.json")"
   echo "$out" | jq -e '.reason == "schema_mismatch"' >/dev/null 2>&1 || { echo "FAIL: wrong_types case: $out"; fail=1; }
+
+  # Case 8: verdict CLEAN but findings non-empty -- a self-contradictory
+  # result that structural/type checks alone would accept.
+  echo '{"verdict":"CLEAN","findings":[{"file":"a.py","line":1,"severity":"low","summary":"x","evidence":"y"}],"summary":null}' > "$tmp/clean_with_findings.json"
+  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/clean_with_findings.json")"
+  echo "$out" | jq -e '.reason == "schema_mismatch"' >/dev/null 2>&1 || { echo "FAIL: clean_with_findings case: $out"; fail=1; }
+
+  # Case 9: verdict ISSUES but findings empty -- the inverse contradiction.
+  echo '{"verdict":"ISSUES","findings":[],"summary":"looks fine"}' > "$tmp/issues_no_findings.json"
+  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/issues_no_findings.json")"
+  echo "$out" | jq -e '.reason == "schema_mismatch"' >/dev/null 2>&1 || { echo "FAIL: issues_no_findings case: $out"; fail=1; }
+
+  # Case 10: verdict ISSUES with a well-typed finding -- the valid
+  # acceptance path for the new consistency clause. Without this, a
+  # regression changing "length > 0" to e.g. "length > 1" would still pass
+  # Cases 1/8/9 while silently rejecting every real single-finding review.
+  echo '{"verdict":"ISSUES","findings":[{"file":"a.py","line":1,"severity":"low","summary":"x","evidence":"y"}],"summary":null}' > "$tmp/issues_with_finding.json"
+  out="$(judge_result 0 "$tmp/good.jsonl" "$tmp/issues_with_finding.json")"
+  echo "$out" | jq -e '.ok == true' >/dev/null 2>&1 || { echo "FAIL: issues_with_finding case: $out"; fail=1; }
 
   rm -rf "$tmp"
 
