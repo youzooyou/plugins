@@ -1,0 +1,1 @@
+{"category": "security_injection", "difficulty": "subtle", "should_flag": true, "must_mention_file": "password_reset.py", "keywords_any": ["expir", "never expire", "stale token", "reset token", "time-limited", "expires_at"], "severity_floor": "high"}

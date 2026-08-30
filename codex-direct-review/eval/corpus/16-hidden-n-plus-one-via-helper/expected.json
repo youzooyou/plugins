@@ -1,0 +1,1 @@
+{"category": "performance_regression", "difficulty": "subtle", "should_flag": true, "must_mention_file": "orders.js", "keywords_any": ["n+1", "batch", "single query", "in (", "query per", "loop", "getcustomername"], "severity_floor": "medium"}

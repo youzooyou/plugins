@@ -1,0 +1,1 @@
+{"category": "logic_off_by_one", "difficulty": "easy", "should_flag": true, "must_mention_file": "paginate.py", "keywords_any": ["off-by-one", "off by one", "offset", "page - 1", "(page-1)", "pagination"], "severity_floor": "medium"}

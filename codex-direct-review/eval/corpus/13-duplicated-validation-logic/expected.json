@@ -1,0 +1,1 @@
+{"category": "reuse_simplification", "difficulty": "easy", "should_flag": true, "must_mention_file": "validators.py", "keywords_any": ["duplicate", "duplicated", "extract", "shared helper", "repeated", "copy-paste", "reuse"], "severity_floor": "low"}

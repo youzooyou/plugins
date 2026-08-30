@@ -1,0 +1,1 @@
+{"category": "performance_regression", "difficulty": "easy", "should_flag": true, "must_mention_file": "filter_common.py", "keywords_any": ["o(n", "set(", "quadratic", "performance", "membership"], "severity_floor": "low"}

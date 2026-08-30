@@ -1,0 +1,1 @@
+{"category": "context_intent_blind", "difficulty": "subtle", "should_flag": true, "must_mention_file": "active_users.py", "keywords_any": ["last_login_at", "recent", "recency", "30 days", "stale", "signup", "never updated", "dormant"], "severity_floor": "medium"}

@@ -1,0 +1,1 @@
+{"category": "concurrency_race", "difficulty": "subtle", "should_flag": true, "must_mention_file": "job_worker.py", "keywords_any": ["race", "toctou", "check-then-act", "check then act", "lock", "double"], "severity_floor": "medium"}

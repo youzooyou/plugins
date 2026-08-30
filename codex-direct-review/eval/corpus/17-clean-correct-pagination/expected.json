@@ -1,0 +1,1 @@
+{"category": "control_clean", "difficulty": null, "should_flag": false, "must_mention_file": "paginate_ok.py", "keywords_any": null, "severity_floor": null, "safeguard_assertion": "page and page_size are validated to be greater than zero before computing the slice bounds, preventing a non-positive page or page_size from producing an incorrect or out-of-bounds slice"}

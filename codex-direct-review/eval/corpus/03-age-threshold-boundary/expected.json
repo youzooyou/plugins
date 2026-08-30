@@ -1,0 +1,1 @@
+{"category": "logic_off_by_one", "difficulty": "subtle", "should_flag": true, "must_mention_file": "eligibility.go", "keywords_any": ["boundary", "off-by-one", ">=", "inclusive", "exclusive", "18"], "severity_floor": "low"}

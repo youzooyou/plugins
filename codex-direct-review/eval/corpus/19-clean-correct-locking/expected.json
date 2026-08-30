@@ -1,0 +1,1 @@
+{"category": "control_clean", "difficulty": null, "should_flag": false, "must_mention_file": "cache_ok.go", "keywords_any": null, "severity_floor": null, "safeguard_assertion": "concurrent writes to the cache's underlying map are serialized by a mutex held around every read-modify-write, preventing a data race between goroutines"}

@@ -1,0 +1,1 @@
+{"category": "security_injection", "difficulty": "subtle", "should_flag": true, "must_mention_file": "auth.js", "keywords_any": ["jwt.decode", "signature", "verify", "forge", "auth bypass", "not verified"], "severity_floor": "high"}

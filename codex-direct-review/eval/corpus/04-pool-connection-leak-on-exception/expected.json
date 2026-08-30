@@ -1,0 +1,1 @@
+{"category": "resource_leak", "difficulty": "subtle", "should_flag": true, "must_mention_file": "db_pool.py", "keywords_any": ["leak", "release", "finally", "exception", "never released", "pool exhaust"], "severity_floor": "medium"}

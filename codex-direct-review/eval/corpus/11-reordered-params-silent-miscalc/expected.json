@@ -1,0 +1,1 @@
+{"category": "api_breaking_change", "difficulty": "subtle", "should_flag": true, "must_mention_file": "checkout.py", "keywords_any": ["reorder", "swapped", "argument order", "positional", "wrong order", "quantity and tax_rate", "silently"], "severity_floor": "high"}
