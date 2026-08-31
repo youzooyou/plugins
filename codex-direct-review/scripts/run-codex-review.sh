@@ -1016,6 +1016,7 @@ TIMEOUT_SECS="$DEFAULT_TIMEOUT_SECS"
 # it in the final-output section below is well-defined under `set -u`
 # regardless of which scope actually ran.
 SOURCE_COVERAGE_JSON=""
+EVAL_CAPTURE_EVENTLOG_PATH=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1066,6 +1067,15 @@ while [ $# -gt 0 ]; do
         exit 1
       fi
       TIMEOUT_SECS="$2"; shift 2 ;;
+    --eval-capture-eventlog)
+      # Internal, eval-harness-only flag -- not part of the public CLI
+      # surface and intentionally undocumented in SKILL.md. Lets
+      # run_recall_eval.sh capture the raw codex exec event log for a run
+      # so it can extract investigation evidence (command_execution items)
+      # after the fact. Omitting this flag changes nothing about default
+      # behavior.
+      [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--eval-capture-eventlog requires a value"}\n'; exit 1; }
+      EVAL_CAPTURE_EVENTLOG_PATH="$2"; shift 2 ;;
     *)
       DETAIL_JSON="$(printf '%s' "$1" | jq -Rs '"unknown argument: " + .')"
       printf '{"ok":false,"reason":"bad_args","detail":%s}\n' "$DETAIL_JSON"
@@ -1523,6 +1533,9 @@ rm -f "$PROMPT_FILE"
 
 if [ "$TIMED_OUT" -eq 1 ]; then
   printf '{"ok":false,"reason":"timeout","detail":"codex exec exceeded %ss"}\n' "$TIMEOUT_SECS"
+  if [ -n "$EVAL_CAPTURE_EVENTLOG_PATH" ]; then
+    cp "$EVENTLOG" "$EVAL_CAPTURE_EVENTLOG_PATH" 2>/dev/null || true
+  fi
   rm -f "$EVENTLOG" "$OUTFILE"
   exit 1
 fi
@@ -1535,6 +1548,9 @@ fi
 # not written to stdout before that decision is made.
 JUDGE_OUTPUT="$(judge_result "$EXIT_CODE" "$EVENTLOG" "$OUTFILE")"
 RESULT=$?
+if [ -n "$EVAL_CAPTURE_EVENTLOG_PATH" ]; then
+  cp "$EVENTLOG" "$EVAL_CAPTURE_EVENTLOG_PATH" 2>/dev/null || true
+fi
 rm -f "$EVENTLOG" "$OUTFILE"
 # Only ever enrich with coverage when the review itself succeeded (RESULT
 # 0) -- a failed/malformed review has nothing truthful to attach coverage
