@@ -150,12 +150,14 @@ STATE_ROOT="$HOME/.local/state/codex-review-eval"
 SUITE_ID="$(date +%Y%m%dT%H%M%S)-$$"
 SUITE_DIR="$STATE_ROOT/$SUITE_ID"
 mkdir -p "$STATE_ROOT" || { echo "error: cannot create $STATE_ROOT" >&2; exit 1; }
-# Plain `mkdir` (no -p) IS the atomic collision check: it fails outright if
-# $SUITE_DIR already exists, rather than a separate check-then-create pair
-# that could race. A collision here (same second + same PID) is not
-# something to silently retry past -- something's already wrong.
-mkdir "$SUITE_DIR" || { echo "error: suite-id collision at $SUITE_DIR" >&2; exit 1; }
-echo "Raw per-run results for this sweep: $SUITE_DIR" >&2
+# $SUITE_DIR itself is created further down, AFTER argument parsing --
+# run_judge_calibration never uses it at all (it creates and reports its own
+# separate judge-calibration-... directory), so creating and announcing it
+# unconditionally here, before --calibrate-judge is even known, meant a
+# normal-suite collision could abort an otherwise-runnable calibration, and
+# a successful calibration would still leave this one behind empty while
+# printing a misleading "Raw per-run results for this sweep" line that
+# doesn't describe where calibration actually wrote anything.
 
 ONLY=""
 CORPUS_DIR_OVERRIDE=""
@@ -163,6 +165,9 @@ PAIR_A=""
 PAIR_B=""
 RUNS_OVERRIDE=""
 CAPTURE_INVESTIGATION_EVIDENCE=0
+CALIBRATE_JUDGE=0
+CALIBRATION_RUNS_PER_CASE=10
+CALIBRATION_RUNS_EXPLICITLY_SET=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --only)
@@ -226,6 +231,23 @@ while [ $# -gt 0 ]; do
       # adds per-run disk artifacts and jq parsing that most sweeps don't
       # need.
       CAPTURE_INVESTIGATION_EVIDENCE=1; shift ;;
+    --calibrate-judge)
+      # Runs judge_finding against a fixed set of cases with known-correct
+      # answers instead of the normal fixture sweep -- see
+      # run_judge_calibration below. A plain boolean flag, matching
+      # --capture-investigation-evidence's exact style.
+      CALIBRATE_JUDGE=1; shift ;;
+    --calibration-runs)
+      # Overrides the default 10 runs/case for --calibrate-judge. Same
+      # validation as --runs above (see RUNS_OVERRIDE's own comment for why
+      # a `case`/glob pattern is the wrong tool here) -- `[[ =~ ]]` anchors
+      # the match so nothing after the digits can sneak through unchecked.
+      [ $# -ge 2 ] || { echo "error: --calibration-runs requires a positive integer" >&2; exit 1; }
+      if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+        echo "error: --calibration-runs must be a positive integer with no leading zero, got: $2" >&2
+        exit 1
+      fi
+      CALIBRATION_RUNS_PER_CASE="$2"; CALIBRATION_RUNS_EXPLICITLY_SET=1; shift 2 ;;
     *)
       echo "error: unknown argument: $1" >&2
       exit 1 ;;
@@ -235,50 +257,123 @@ if [ -n "$PAIR_A" ] && [ -n "$ONLY" ]; then
   echo "error: --pair and --only are mutually exclusive" >&2
   exit 1
 fi
+# A /cc round caught that this exact silent-precedence gap already existed
+# for a NEW combination: the dispatch below checks PAIR_A first and exits
+# via run_pair_mode before ever reaching the --calibrate-judge dispatch, so
+# `--pair A B --calibrate-judge` would silently run the pair sweep and
+# ignore the calibration request entirely, with no error at all.
+if [ -n "$PAIR_A" ] && [ "$CALIBRATE_JUDGE" -eq 1 ]; then
+  echo "error: --pair and --calibrate-judge are mutually exclusive" >&2
+  exit 1
+fi
+# --calibration-runs only has any effect inside run_judge_calibration, which
+# is only ever dispatched when CALIBRATE_JUDGE=1 -- without this check,
+# --calibration-runs N alone silently fell through to the normal fixture
+# sweep with N having done nothing at all, no warning or error.
+if [ "$CALIBRATION_RUNS_EXPLICITLY_SET" -eq 1 ] && [ "$CALIBRATE_JUDGE" -ne 1 ]; then
+  echo "error: --calibration-runs requires --calibrate-judge" >&2
+  exit 1
+fi
+# --calibrate-judge exits via run_judge_calibration before either fixture-
+# sweep loop (RUNS_PER_FIXTURE) is ever reached, before the --only slug
+# filter or the --capture-investigation-evidence eventlog capture are ever
+# consulted, and without ever reading CORPUS_DIR/CORPUS_VERSION at all --
+# a /cc round showed each of these four flags is silently accepted and has
+# zero effect when combined with --calibrate-judge (e.g. `--calibrate-judge
+# --runs 1` still runs the full default-10-runs-per-case calibration, not
+# the "1 run" a caller reading --runs's own help text would expect; a bad
+# or unrelated --corpus-dir would also needlessly fail corpus validation
+# below for a mode that never reads corpus contents at all). Reject all
+# four combinations explicitly (checked here, before the corpus-dir
+# existence check further down) rather than let any of them silently do
+# nothing or fail for the wrong reason.
+if [ "$CALIBRATE_JUDGE" -eq 1 ]; then
+  if [ -n "$RUNS_OVERRIDE" ]; then
+    echo "error: --runs has no effect with --calibrate-judge -- use --calibration-runs instead" >&2
+    exit 1
+  fi
+  if [ -n "$ONLY" ]; then
+    echo "error: --only has no effect with --calibrate-judge (calibration always runs its own fixed case set)" >&2
+    exit 1
+  fi
+  if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+    echo "error: --capture-investigation-evidence has no effect with --calibrate-judge" >&2
+    exit 1
+  fi
+  if [ -n "$CORPUS_DIR_OVERRIDE" ]; then
+    echo "error: --corpus-dir has no effect with --calibrate-judge (calibration never reads the fixture corpus)" >&2
+    exit 1
+  fi
+else
+  # $SUITE_DIR is a normal-fixture-sweep/--pair artifact directory that
+  # run_judge_calibration never touches (it creates its own separate
+  # judge-calibration-... directory instead) -- created here, only once
+  # --calibrate-judge is known NOT to be set, so calibration can never be
+  # aborted by an unrelated normal-suite collision, and never leaves this
+  # directory behind empty while announcing the wrong location.
+  #
+  # Plain `mkdir` (no -p) IS the atomic collision check: it fails outright if
+  # $SUITE_DIR already exists, rather than a separate check-then-create pair
+  # that could race. A collision here (same second + same PID) is not
+  # something to silently retry past -- something's already wrong.
+  mkdir "$SUITE_DIR" || { echo "error: suite-id collision at $SUITE_DIR" >&2; exit 1; }
+  echo "Raw per-run results for this sweep: $SUITE_DIR" >&2
+fi
 RUNS_PER_FIXTURE="$DEFAULT_RUNS_PER_FIXTURE"
 if [ -n "$RUNS_OVERRIDE" ]; then
   RUNS_PER_FIXTURE="$RUNS_OVERRIDE"
 fi
-if [ -n "$CORPUS_DIR_OVERRIDE" ]; then
-  CORPUS_DIR="$CORPUS_DIR_OVERRIDE"
-fi
-if [ ! -d "$CORPUS_DIR" ]; then
-  echo "error: corpus directory not found: $CORPUS_DIR" >&2
-  exit 1
-fi
+# All of this block -- corpus-dir resolution/existence, CORPUS_VERSION
+# derivation, and the review-wrapper executable check -- is a prerequisite
+# of the normal fixture sweep and --pair mode only. run_judge_calibration
+# uses neither CORPUS_DIR/CORPUS_VERSION (it never reads the corpus, see the
+# --corpus-dir rejection above) nor REVIEW_SCRIPT (it calls `codex exec`
+# directly via judge_finding, not the review wrapper) -- a /cc round showed
+# that leaving these unconditional made --calibrate-judge needlessly fail
+# whenever the default corpus dir or wrapper happened to be missing/
+# inaccessible, even though calibration depends on neither.
+if [ "$CALIBRATE_JUDGE" -ne 1 ]; then
+  if [ -n "$CORPUS_DIR_OVERRIDE" ]; then
+    CORPUS_DIR="$CORPUS_DIR_OVERRIDE"
+  fi
+  if [ ! -d "$CORPUS_DIR" ]; then
+    echo "error: corpus directory not found: $CORPUS_DIR" >&2
+    exit 1
+  fi
 
-# Best-effort corpus version label for manifest.json (see the per-run
-# manifest write below) -- lets a saved result be traced back to which
-# corpus content actually produced it. Deliberately conservative: reports
-# "uncommitted" unless the corpus directory has ZERO uncommitted changes
-# (git status --porcelain, which -- unlike `git describe --dirty` -- also
-# catches untracked files, not just modified tracked ones) AND at least one
-# file under it is actually tracked. Before eval/'s first commit (see the
-# corpus-format-conversion plan item), this always resolves to "uncommitted"
-# -- accurate, since there is genuinely no committed version yet to name.
-#
-# Every git call below runs with `-C "$CORPUS_DIR"` and a "." pathspec, NOT
-# `-C "$SCRIPT_DIR"` with $CORPUS_DIR as an external pathspec argument --
-# the whole point of --corpus-dir is to allow pointing at a DIFFERENT
-# checkout/worktree (e.g. one checked out at the eval-corpus-v1 tag) that
-# isn't necessarily inside this same repo at all. An earlier version used
-# `-C "$SCRIPT_DIR" -- "$CORPUS_DIR"`, which fails outright for exactly that
-# case -- live-confirmed: `git -C eval status --porcelain -- /etc/passwd`
-# errors with "outside repository" when the path isn't under that repo.
-# Rooting every git call directly at $CORPUS_DIR itself works for both the
-# default (corpus/ inside this repo) and override (a separate worktree)
-# cases uniformly.
-CORPUS_VERSION="uncommitted"
-if git -C "$CORPUS_DIR" rev-parse HEAD >/dev/null 2>&1 \
-  && [ -z "$(git -C "$CORPUS_DIR" status --porcelain -- . 2>/dev/null)" ] \
-  && [ -n "$(git -C "$CORPUS_DIR" ls-files -- . 2>/dev/null)" ]; then
-  CORPUS_VERSION="$(git -C "$CORPUS_DIR" describe --tags --always 2>/dev/null)"
-  [ -z "$CORPUS_VERSION" ] && CORPUS_VERSION="uncommitted"
-fi
+  # Best-effort corpus version label for manifest.json (see the per-run
+  # manifest write below) -- lets a saved result be traced back to which
+  # corpus content actually produced it. Deliberately conservative: reports
+  # "uncommitted" unless the corpus directory has ZERO uncommitted changes
+  # (git status --porcelain, which -- unlike `git describe --dirty` -- also
+  # catches untracked files, not just modified tracked ones) AND at least one
+  # file under it is actually tracked. Before eval/'s first commit (see the
+  # corpus-format-conversion plan item), this always resolves to "uncommitted"
+  # -- accurate, since there is genuinely no committed version yet to name.
+  #
+  # Every git call below runs with `-C "$CORPUS_DIR"` and a "." pathspec, NOT
+  # `-C "$SCRIPT_DIR"` with $CORPUS_DIR as an external pathspec argument --
+  # the whole point of --corpus-dir is to allow pointing at a DIFFERENT
+  # checkout/worktree (e.g. one checked out at the eval-corpus-v1 tag) that
+  # isn't necessarily inside this same repo at all. An earlier version used
+  # `-C "$SCRIPT_DIR" -- "$CORPUS_DIR"`, which fails outright for exactly that
+  # case -- live-confirmed: `git -C eval status --porcelain -- /etc/passwd`
+  # errors with "outside repository" when the path isn't under that repo.
+  # Rooting every git call directly at $CORPUS_DIR itself works for both the
+  # default (corpus/ inside this repo) and override (a separate worktree)
+  # cases uniformly.
+  CORPUS_VERSION="uncommitted"
+  if git -C "$CORPUS_DIR" rev-parse HEAD >/dev/null 2>&1 \
+    && [ -z "$(git -C "$CORPUS_DIR" status --porcelain -- . 2>/dev/null)" ] \
+    && [ -n "$(git -C "$CORPUS_DIR" ls-files -- . 2>/dev/null)" ]; then
+    CORPUS_VERSION="$(git -C "$CORPUS_DIR" describe --tags --always 2>/dev/null)"
+    [ -z "$CORPUS_VERSION" ] && CORPUS_VERSION="uncommitted"
+  fi
 
-if [ ! -x "$REVIEW_SCRIPT" ]; then
-  echo "error: review script not found or not executable at $REVIEW_SCRIPT" >&2
-  exit 1
+  if [ ! -x "$REVIEW_SCRIPT" ]; then
+    echo "error: review script not found or not executable at $REVIEW_SCRIPT" >&2
+    exit 1
+  fi
 fi
 
 CURRENT_TMP_REPO=""
@@ -365,10 +460,19 @@ set -m
 # earlier version creating it BEFORE the traps existed -- a signal in that
 # narrow window would leak this one empty directory, since the default
 # signal disposition applies until a trap is actually registered).
-FAKE_GIT_HOME="$(mktemp -d)"
-if [ -z "$FAKE_GIT_HOME" ] || [ ! -d "$FAKE_GIT_HOME" ]; then
-  echo "error: mktemp -d failed for isolated git HOME" >&2
-  exit 1
+#
+# Skipped entirely for --calibrate-judge: run_judge_calibration only calls
+# judge_finding (a direct `codex exec` call needing no isolation-snapshot
+# git env at all), so an otherwise-runnable calibration should not be able
+# to fail just because this mktemp -d happened to fail -- FAKE_GIT_HOME
+# stays at its already-declared "" default in that case, which
+# cleanup_tmp_repo's `rm -rf "${FAKE_GIT_HOME:-}"` already handles safely.
+if [ "$CALIBRATE_JUDGE" -ne 1 ]; then
+  FAKE_GIT_HOME="$(mktemp -d)"
+  if [ -z "$FAKE_GIT_HOME" ] || [ ! -d "$FAKE_GIT_HOME" ]; then
+    echo "error: mktemp -d failed for isolated git HOME" >&2
+    exit 1
+  fi
 fi
 
 JUDGE_VERDICT=""
@@ -432,6 +536,13 @@ judge_finding() {
     JUDGE_EVENT_FILE=""
     JUDGE_MSG_FILE=""
     JUDGE_VERDICT="error"
+    # Neither prompt_audit_path nor response_audit_path is ever written on
+    # this path -- count both as artifact write failures (matching the two
+    # separate increments below for a copy/write failure on each path
+    # individually), so a caller relying solely on ARTIFACT_WRITE_FAILURES
+    # to decide whether "Raw prompts/responses saved" is true can't be told
+    # the artifacts were saved when neither write was even attempted.
+    ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 2))
     return
   fi
 
@@ -514,6 +625,196 @@ judge_finding() {
     no) JUDGE_VERDICT="no" ;;
     *) JUDGE_VERDICT="error" ;;
   esac
+}
+
+# run_judge_calibration
+# judge_finding's own accuracy has never been measured -- it's used
+# throughout the main sweep above as a semantic fallback, but nothing checks
+# whether ITS yes/no verdicts are actually correct. This runs it against a
+# fixed set of cases with KNOWN correct answers (real fixture excerpts plus
+# a few constructed ones covering both the bug-fixture and control-group
+# question framings), many times each, and reports the pooled agreement
+# rate plus each case's own per-case rate (no single-population confidence
+# interval is computed across the pooled total -- see the reporting block
+# below for why that would misrepresent 8 cases of differing difficulty as
+# one shared success probability). Dispatched via --calibrate-judge, in
+# place of the normal fixture sweep (see the dispatch site below, mirroring
+# run_pair_mode's own `if [ -n "$PAIR_A" ]; then ... exit $?` dispatch).
+run_judge_calibration() {
+  # Same mkdir-based collision-is-an-error discipline as $SUITE_DIR above --
+  # a distinct suite-id prefix keeps calibration runs visually separate from
+  # normal sweep output under the same $STATE_ROOT. Includes $$ for the same
+  # reason $SUITE_ID does above: a timestamp alone is only unique to one-
+  # second resolution, so two --calibrate-judge processes started in the
+  # same second would otherwise pick the identical path and the second
+  # mkdir would exit as a false collision before running any cases at all.
+  local calibration_dir="$STATE_ROOT/judge-calibration-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  mkdir "$calibration_dir" || { echo "error: calibration suite-id collision at $calibration_dir" >&2; return 1; }
+
+  # Parallel indexed arrays, 1-7 (bash 3.2 compat -- no associative arrays,
+  # matching this file's own documented constraint). Every string below is
+  # byte-exact to the task spec: real corpus/model text is evidence, not
+  # prose to be tidied up.
+  local CAL_CONTEXT_LABEL=() CAL_ASSERTION=() CAL_QUESTION=() CAL_FINDING_TEXT=() CAL_EXPECTED=() CAL_LABEL=()
+
+  CAL_CONTEXT_LABEL[1]="has the following known defect"
+  CAL_ASSERTION[1]="process_job checks job_id not in processed and only adds job_id to processed after work_fn has already run, with no lock covering that check-then-act sequence, so two threads calling concurrently for the same job_id can both pass the membership check before either updates the set and both end up executing work_fn -- violating the documented exactly-once guarantee."
+  CAL_QUESTION[1]="Does this finding identify the defect described above, even if phrased differently or using different terminology?"
+  CAL_FINDING_TEXT[1]=$'The check-then-add sequence is not atomic, so concurrent callers can run the same job more than once despite the function\'s documented guarantee.\nBoth threads can pass `if job_id not in processed` before either reaches `processed.add(job_id)`. A two-thread execution with a barrier inside `work_fn` produced `{\'work_fn_calls\': [\'job-1\', \'job-1\'], \'processed\': [\'job-1\'], \'threads_alive\': [False, False]}`: the set records the ID once, but the work runs twice.'
+  CAL_EXPECTED[1]="yes"
+  CAL_LABEL[1]="real fixture-07 true-positive"
+
+  CAL_CONTEXT_LABEL[2]="has the following known defect"
+  CAL_ASSERTION[2]="verify_reset_token only compares the stored token string to the supplied one and never checks any expiration timestamp on the record, so a password reset token remains valid indefinitely once issued -- an old or leaked token can still be used to reset the password long after it should have expired."
+  CAL_QUESTION[2]="Does this finding identify the defect described above, even if phrased differently or using different terminology?"
+  CAL_FINDING_TEXT[2]=$'The password-reset secret is compared with ordinary equality, which can expose a timing side channel while an attacker guesses tokens.\nLine 6 evaluates `record["token"] == token`. Python\'s `hmac.compare_digest` documentation states that it is designed to prevent timing analysis, whereas this ordinary comparison provides no such guarantee. Reset-token verification is a security-sensitive comparison.'
+  CAL_EXPECTED[2]="no"
+  CAL_LABEL[2]="real fixture-09 true-negative"
+
+  CAL_CONTEXT_LABEL[3]="has the following known defect"
+  CAL_ASSERTION[3]="filter_common checks membership with item in list_b where list_b is a plain list, making each membership test O(len(list_b)) and the whole function O(len(list_a) times len(list_b)) -- quadratic time; converting list_b to a set once up front would make each membership check O(1) and the whole function linear."
+  CAL_QUESTION[3]="Does this finding identify the defect described above, even if phrased differently or using different terminology?"
+  CAL_FINDING_TEXT[3]="The nested lookup pattern here results in O(n*m) time complexity since checking presence in list_b requires a full scan for every element of list_a; using a hash-based set instead of a list for list_b would reduce this to linear time overall."
+  CAL_EXPECTED[3]="yes"
+  CAL_LABEL[3]="constructed paraphrase positive"
+
+  CAL_CONTEXT_LABEL[4]="has the following known defect"
+  CAL_ASSERTION[4]="get_user_by_name builds the SQL query by directly concatenating the raw username argument into the string instead of using a parameterized placeholder, so a username containing SQL syntax (for example a quote followed by injected clauses) can alter the query's logic or expose unintended rows -- a classic SQL injection."
+  CAL_QUESTION[4]="Does this finding identify the defect described above, even if phrased differently or using different terminology?"
+  CAL_FINDING_TEXT[4]="The function does not validate that the username parameter length stays within a reasonable bound, which could allow an unusually long input to cause excessive memory or CPU usage during query construction."
+  CAL_EXPECTED[4]="no"
+  CAL_LABEL[4]="constructed unrelated-finding negative"
+
+  CAL_CONTEXT_LABEL[5]="is protected by the following safeguard, already verified correct"
+  CAL_ASSERTION[5]="concurrent writes to the cache's underlying map are serialized by a mutex held around every read-modify-write, preventing a data race between goroutines"
+  CAL_QUESTION[5]="Does this finding claim that the stated safeguard is missing, broken, or ineffective?"
+  CAL_FINDING_TEXT[5]="This implementation correctly guards every read-modify-write access to the map with c.mu.Lock() and c.mu.Unlock(), so there is no data race between the concurrent goroutines here."
+  CAL_EXPECTED[5]="no"
+  CAL_LABEL[5]="constructed safeguard-confirmed negative"
+
+  CAL_CONTEXT_LABEL[6]="is protected by the following safeguard, already verified correct"
+  CAL_ASSERTION[6]="concurrent writes to the cache's underlying map are serialized by a mutex held around every read-modify-write, preventing a data race between goroutines"
+  CAL_QUESTION[6]="Does this finding claim that the stated safeguard is missing, broken, or ineffective?"
+  CAL_FINDING_TEXT[6]="IncrementAll spawns goroutines that write to c.data[key]++ with no synchronization at all -- this is a data race that can corrupt the map or crash the program with Go's concurrent map write detector."
+  CAL_EXPECTED[6]="yes"
+  CAL_LABEL[6]="constructed safeguard-disputed positive"
+
+  CAL_CONTEXT_LABEL[7]="is protected by the following safeguard, already verified correct"
+  CAL_ASSERTION[7]="VALID_TIERS is a small, fixed-size (4-entry) constant catalog that never grows with user input scale, so the linear membership scan here is effectively O(1) in practice and does not need to be converted to a set for performance."
+  CAL_QUESTION[7]="Does this finding claim that the stated safeguard is missing, broken, or ineffective?"
+  CAL_FINDING_TEXT[7]=$'The publicly exported mutable list lets any importer change the supposedly fixed set of valid tiers at runtime.\n`is_valid_tier` directly evaluates membership in VALID_TIERS; after tier_catalog.VALID_TIERS.append("attacker-tier"), is_valid_tier("attacker-tier") returns True. This contradicts the function\'s documented fixed known-tier set.'
+  CAL_EXPECTED[7]="ambiguous"
+  CAL_LABEL[7]="fixture-24 mutability, DELIBERATELY AMBIGUOUS"
+
+  # Cases 8-9 added after a /cc round found cases 3-6 too lexically close to
+  # their own assertion's vocabulary (a shallow topic/polarity heuristic
+  # could pass them without genuine semantic matching). These two are
+  # deliberately harder: case 8 is a REAL, topically-adjacent finding on
+  # the exact same file/function that is nonetheless the WRONG defect
+  # (from this session's own actual candidate sweep, where the model
+  # legitimately reported this instead of the seeded duplication issue --
+  # see the git history around fixture 13's recall drop); case 9 is a
+  # constructed paraphrase using almost no lexical overlap with its
+  # assertion at all (no shared identifier names, no shared nouns beyond
+  # the general concept).
+  CAL_CONTEXT_LABEL[8]="has the following known defect"
+  CAL_ASSERTION[8]="validate_signup and validate_profile_update each re-implement the identical email-format and password-length validation checks via copy-pasted code instead of sharing one helper function, so any future change to those validation rules must be made in two separate places and risks drifting out of sync between them."
+  CAL_QUESTION[8]="Does this finding identify the defect described above, even if phrased differently or using different terminology?"
+  CAL_FINDING_TEXT[8]="Non-string email and password values raise TypeError instead of being reported as validation errors."
+  CAL_EXPECTED[8]="no"
+  CAL_LABEL[8]="real fixture-13 hard near-miss negative (same file, different real defect)"
+
+  CAL_CONTEXT_LABEL[9]="has the following known defect"
+  CAL_ASSERTION[9]="formatUser returns a field named fullName, but renderUserCard reads formatted.name (not formatted.fullName) when building the card HTML, so the consumer was never updated after the field was renamed and always renders undefined for the user's name."
+  CAL_QUESTION[9]="Does this finding identify the defect described above, even if phrased differently or using different terminology?"
+  CAL_FINDING_TEXT[9]="There's a stale reference to the producer's earlier property name in the rendering code -- the consumer wasn't updated when the upstream shape changed, so the display always shows a blank value where the user's name should appear."
+  CAL_EXPECTED[9]="yes"
+  CAL_LABEL[9]="constructed hard low-lexical-overlap paraphrase positive"
+
+  local yes_count=() no_count=() error_count=()
+  local i n
+  for i in 1 2 3 4 5 6 7 8 9; do
+    yes_count[i]=0
+    no_count[i]=0
+    error_count[i]=0
+    for n in $(seq 1 "$CALIBRATION_RUNS_PER_CASE"); do
+      judge_finding "${CAL_CONTEXT_LABEL[i]}" "${CAL_ASSERTION[i]}" "${CAL_QUESTION[i]}" "${CAL_FINDING_TEXT[i]}" \
+        "$calibration_dir/case-${i}-run-${n}.prompt.txt" "$calibration_dir/case-${i}-run-${n}.response.txt"
+      echo "  case $i run $n: $JUDGE_VERDICT"
+      case "$JUDGE_VERDICT" in
+        yes) yes_count[i]=$((yes_count[i] + 1)) ;;
+        no) no_count[i]=$((no_count[i] + 1)) ;;
+        *) error_count[i]=$((error_count[i] + 1)) ;;
+      esac
+    done
+  done
+
+  echo ""
+  echo "=== Judge calibration (N=$CALIBRATION_RUNS_PER_CASE runs/case) ==="
+  local total_agree=0 total_scored=0 agree scored err_note
+  for i in 1 2 3 4 5 6 7 8 9; do
+    # Printed in natural numeric order (including the unscored case 7 in
+    # its own position) rather than looping the scored cases separately
+    # and appending case 7 afterward -- purely cosmetic, but avoids the
+    # calibration report listing cases out of numeric order.
+    if [ "${CAL_EXPECTED[i]}" = "ambiguous" ]; then
+      err_note=""
+      [ "${error_count[i]}" -gt 0 ] && err_note=", ${error_count[i]} error(s)"
+      echo "Case $i [${CAL_LABEL[i]}]: ${yes_count[i]} yes / ${no_count[i]} no${err_note}"
+      continue
+    fi
+    if [ "${CAL_EXPECTED[i]}" = "yes" ]; then
+      agree="${yes_count[i]}"
+    else
+      agree="${no_count[i]}"
+    fi
+    # Errors are never folded into either definite outcome -- same "unknown
+    # stays unknown" principle the main sweep applies to judge_finding
+    # errors above (excluded from both hits and the scoring denominator,
+    # never silently counted as a miss).
+    scored=$((yes_count[i] + no_count[i]))
+    err_note=""
+    [ "${error_count[i]}" -gt 0 ] && err_note=", ${error_count[i]} error(s) excluded"
+    echo "Case $i [${CAL_LABEL[i]}]: ${agree}/${scored} agree (expected: ${CAL_EXPECTED[i]})${err_note}"
+    total_agree=$((total_agree + agree))
+    total_scored=$((total_scored + scored))
+  done
+
+  echo ""
+  echo "Overall judge accuracy (8 scored cases, excludes case 7 and judge errors):"
+  if [ "$total_scored" -gt 0 ]; then
+    local pct
+    pct="$(awk -v h="$total_agree" -v v="$total_scored" 'BEGIN { printf "%.1f", (h / v) * 100 }')"
+    # A /cc round correctly rejected an earlier version of this report that
+    # pooled all calls into a single binomial Wilson interval: that requires
+    # every trial to be an independent draw from ONE shared success
+    # probability, but these calls are repeated trials on 8 DIFFERENT fixed
+    # cases, each with its own (likely different) true success rate --
+    # exactly the kind of stratified/heterogeneous data a single-population
+    # CI misrepresents (it understates uncertainty by ignoring between-case
+    # variation). No caveat text fixes a statistic that is the wrong shape
+    # for this data, so the interval is not computed at all -- only the
+    # plain pooled fraction is reported, with an explicit note steering
+    # readers to the per-case lines above (each of which IS a same-input
+    # repeat-call rate, the one thing this pooling could validly claim) for
+    # case-level detail instead of a false aggregate confidence claim.
+    echo "  $total_agree/$total_scored ($pct%) pooled across 8 fixed cases"
+    echo "  (NOT a valid single-population confidence interval -- these 8 cases"
+    echo "  have different underlying difficulty, so a binomial CI assuming one"
+    echo "  shared success probability would misstate precision. See each"
+    echo "  case's own N/N line above for case-level detail. More"
+    echo "  --calibration-runs adds more calls on these SAME 8 cases, it does"
+    echo "  not add scenario coverage.)"
+  else
+    echo "  N/A (no scored runs -- every scored case's calls all errored)"
+  fi
+
+  echo ""
+  if [ "$ARTIFACT_WRITE_FAILURES" -eq 0 ]; then
+    echo "Raw prompts/responses saved to: $calibration_dir"
+  else
+    echo "Raw prompts/responses saved to: $calibration_dir (INCOMPLETE -- $ARTIFACT_WRITE_FAILURES artifact write(s) failed, see warnings above)"
+  fi
 }
 
 FIXTURE_NAMES=()
@@ -1143,6 +1444,11 @@ run_pair_mode() {
 
 if [ -n "$PAIR_A" ]; then
   run_pair_mode "$PAIR_A" "$PAIR_B"
+  exit $?
+fi
+
+if [ "$CALIBRATE_JUDGE" -eq 1 ]; then
+  run_judge_calibration
   exit $?
 fi
 
