@@ -162,6 +162,7 @@ CORPUS_DIR_OVERRIDE=""
 PAIR_A=""
 PAIR_B=""
 RUNS_OVERRIDE=""
+CAPTURE_INVESTIGATION_EVIDENCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --only)
@@ -214,6 +215,17 @@ while [ $# -gt 0 ]; do
         exit 1
       fi
       RUNS_OVERRIDE="$2"; shift 2 ;;
+    --capture-investigation-evidence)
+      # Captures each run's raw codex exec event log (via run-codex-
+      # review.sh's internal --eval-capture-eventlog flag) and extracts its
+      # command_execution items into investigation-evidence.json alongside
+      # result.json/manifest.json -- lets a sweep be audited for whether
+      # reviews actually investigated the repo (ran greps/tests/reads)
+      # rather than just guessing from the diff text. Off by default: it
+      # doubles nothing performance-wise (same review calls either way) but
+      # adds per-run disk artifacts and jq parsing that most sweeps don't
+      # need.
+      CAPTURE_INVESTIGATION_EVIDENCE=1; shift ;;
     *)
       echo "error: unknown argument: $1" >&2
       exit 1 ;;
@@ -539,6 +551,12 @@ ARTIFACT_WRITE_FAILURES=0
 # (some fixtures scored, this one silently absent) can't be mistaken for a
 # complete one.
 CONFIG_ERROR_COUNT=0
+# Only meaningful when CAPTURE_INVESTIGATION_EVIDENCE=1; stay 0/0 otherwise
+# and the scorecard section below never prints. Counted only for the main
+# loop's should_flag=="true" (bug fixture) hit runs -- see the two
+# increment sites below (lexical hit, semantic-judge-confirmed hit).
+INVESTIGATION_HIT_RUNS=0
+INVESTIGATION_HIT_RUNS_WITH_EVIDENCE=0
 
 # score_pair_member SLUG MUST_FILE DEFECT_ASSERTION FOCUS SNAPSHOT_REPO SNAPSHOT_SHA RUN_N [KEYWORD ...]
 # Runs ONE review call for one blind/focused pair member against the
@@ -568,21 +586,105 @@ score_pair_member() {
     PAIR_RUN_OUTCOME="error"
     return
   fi
-  if [ -n "$focus" ]; then
-    "$REVIEW_SCRIPT" --cwd "$snapshot_repo" --commit "$snapshot_sha" --focus "$focus" > "$REVIEW_OUT" 2>&1 &
-  else
-    "$REVIEW_SCRIPT" --cwd "$snapshot_repo" --commit "$snapshot_sha" > "$REVIEW_OUT" 2>&1 &
+
+  # run_id/run_dir: mkdir only moves ahead of the review invocation when
+  # CAPTURE_INVESTIGATION_EVIDENCE actually needs an existing directory to
+  # point --eval-capture-eventlog at -- a /cc round caught that
+  # unconditionally moving mkdir earlier (regardless of the flag) created a
+  # persistent empty orphan run_dir on an INT/TERM interrupt mid-review even
+  # on ordinary (capture-off) sweeps, since this file's shared
+  # cleanup_tmp_repo/on_signal trap (see its own comments above) has no
+  # knowledge of run_dir and never removes it. Keeping mkdir at its original
+  # post-`wait` position for the default (capture-off) path makes this
+  # exactly as before: no run_dir exists at all if a signal arrives before
+  # the review call returns.
+  local run_id run_dir
+  run_id="${slug}-run${run_n}"
+  run_dir="$SUITE_DIR/$run_id"
+  if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+    mkdir "$run_dir" || { echo "error: run-id collision at $run_dir" >&2; exit 1; }
   fi
+
+  # Built as an array (matching this file's existing score_args/
+  # pair_keywords idiom) rather than duplicating the invocation across
+  # focus/no-focus x capture/no-capture branches.
+  local -a review_args=(--cwd "$snapshot_repo" --commit "$snapshot_sha")
+  [ -n "$focus" ] && review_args+=(--focus "$focus")
+  [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ] && review_args+=(--eval-capture-eventlog "$run_dir/eventlog.jsonl")
+  "$REVIEW_SCRIPT" "${review_args[@]}" > "$REVIEW_OUT" 2>&1 &
   wait "$!"
   local result
   result="$(cat "$REVIEW_OUT")"
   rm -f "$REVIEW_OUT"
   REVIEW_OUT=""
 
-  local run_id run_dir
-  run_id="${slug}-run${run_n}"
-  run_dir="$SUITE_DIR/$run_id"
-  mkdir "$run_dir" || { echo "error: run-id collision at $run_dir" >&2; exit 1; }
+  if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -ne 1 ]; then
+    mkdir "$run_dir" || { echo "error: run-id collision at $run_dir" >&2; exit 1; }
+  fi
+
+  if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+    local commands_json ok_for_evidence evidence_unknown eventlog_verified
+    commands_json=""
+    evidence_unknown="false"
+    ok_for_evidence="$(printf '%s' "$result" | jq -r '.ok' 2>/dev/null)"
+    # Verified means: the file exists AND actually contains turn.completed
+    # -- not just `-f`. A third /cc round caught that `-f` alone accepts a
+    # PRESENT-BUT-TRUNCATED copy (scripts/run-codex-review.sh's `cp ... ||
+    # true` can fail partway through, leaving a partial file) just as
+    # readily as a complete one; `jq -Rn -c '[inputs | fromjson? | ...]'`
+    # silently drops any malformed trailing line rather than erroring, so a
+    # truncated file can still produce a plausible-looking (but wrong) []
+    # result. Checking for the same completion marker judge_result itself
+    # requires (`grep -q '"type":"turn.completed"'`) catches both the
+    # missing-file and truncated-file cases with one predicate.
+    eventlog_verified="false"
+    if [ -f "$run_dir/eventlog.jsonl" ] && grep -q '"type":"turn.completed"' "$run_dir/eventlog.jsonl" 2>/dev/null; then
+      eventlog_verified="true"
+    fi
+    if [ "$eventlog_verified" = "true" ]; then
+      commands_json="$(jq -Rn -c '[inputs | fromjson? | select(.type == "item.completed" and .item.type == "command_execution") | .item.command]' "$run_dir/eventlog.jsonl" 2>/dev/null)"
+      if [ -z "$commands_json" ] || [ "$commands_json" = "null" ]; then
+        commands_json="[]"
+      fi
+    elif [ "$ok_for_evidence" = "true" ]; then
+      # ok:true guarantees judge_result found turn.completed in the
+      # ORIGINAL event log before scripts/run-codex-review.sh's own
+      # best-effort copy -- so an eventlog.jsonl that is either missing
+      # entirely OR present but lacking that same marker is always a copy
+      # failure (missing or truncated), never a legitimate "nothing to
+      # capture" case. Recorded as unknown (JSON null), never silently
+      # folded into "no evidence found" -- that would understate a genuine
+      # investigation gap by disguising a lost/corrupt artifact as a clean
+      # negative. Excluded from the hit-rate denominator at the call site
+      # that tallies this (only a true/false has_investigation_evidence
+      # counts there).
+      evidence_unknown="true"
+      echo "  warning: investigation eventlog for $run_id missing or incomplete despite ok:true (copy failure?)" >&2
+      ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 1))
+      commands_json="[]"
+    else
+      commands_json="[]"
+    fi
+    # A /cc round caught that the fallback write below was itself
+    # unchecked -- if the primary jq write failed (e.g. disk full,
+    # unwritable run_dir) AND the fallback printf failed for the same
+    # underlying reason, no investigation-evidence.json would exist at
+    # all, and the later hit-counting read (jq ... 2>/dev/null on a
+    # missing file) would silently treat that run as "no evidence" --
+    # misreporting an unknown as a negative, with no warning anywhere.
+    # Matches this file's existing result.json/manifest.json write-failure
+    # convention: warn + count in ARTIFACT_WRITE_FAILURES rather than fail
+    # the run.
+    if [ "$evidence_unknown" = "true" ]; then
+      printf '{"command_count":0,"commands":[],"has_investigation_evidence":null}\n' > "$run_dir/investigation-evidence.json" 2>/dev/null || true
+    elif ! jq -n --argjson cmds "$commands_json" '{command_count: ($cmds | length), commands: $cmds, has_investigation_evidence: (($cmds | length) > 0)}' > "$run_dir/investigation-evidence.json" 2>/dev/null; then
+      if ! printf '{"command_count":0,"commands":[],"has_investigation_evidence":false}\n' > "$run_dir/investigation-evidence.json" 2>/dev/null; then
+        echo "  warning: failed to write investigation-evidence artifact for $run_id (disk full/permission?)" >&2
+        ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 1))
+      fi
+    fi
+  fi
+
   if ! printf '%s' "$result" > "$run_dir/result.json"; then
     echo "  warning: failed to write raw result artifact for $run_id (disk full/permission?)" >&2
     ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 1))
@@ -957,6 +1059,14 @@ run_pair_mode() {
 
   local hits_a=0 valid_a=0 errors_a=0
   local hits_b=0 valid_b=0 errors_b=0
+  # A /cc round caught that --pair mode wrote per-run investigation-
+  # evidence.json files (score_pair_member handles that unconditionally)
+  # but never aggregated or reported them -- the main loop's scorecard
+  # section below is unreachable from this function, which exits before
+  # it. Local to this pair, combining both members into one figure (a
+  # per-member split isn't needed: the blind/focused CONTRAST itself is
+  # already the point of --pair, not a separate evidence breakdown).
+  local pair_investigation_hit_runs=0 pair_investigation_hit_runs_with_evidence=0
   local run_n
   for run_n in $(seq 1 "$RUNS_PER_FIXTURE"); do
     # Built as an array (rather than expanding "${pair_keywords[@]}" inline
@@ -972,7 +1082,17 @@ run_pair_mode() {
     [ "${#pair_keywords[@]}" -gt 0 ] && score_args+=("${pair_keywords[@]}")
     score_pair_member "${score_args[@]}"
     case "$PAIR_RUN_OUTCOME" in
-      hit) hits_a=$((hits_a + 1)); valid_a=$((valid_a + 1)) ;;
+      hit)
+        hits_a=$((hits_a + 1)); valid_a=$((valid_a + 1))
+        if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+          local has_evidence
+          has_evidence="$(jq -r '.has_investigation_evidence' "$SUITE_DIR/${slug_a}-run${run_n}/investigation-evidence.json" 2>/dev/null)"
+          if [ "$has_evidence" = "true" ] || [ "$has_evidence" = "false" ]; then
+            pair_investigation_hit_runs=$((pair_investigation_hit_runs + 1))
+            [ "$has_evidence" = "true" ] && pair_investigation_hit_runs_with_evidence=$((pair_investigation_hit_runs_with_evidence + 1))
+          fi
+        fi
+        ;;
       miss) valid_a=$((valid_a + 1)) ;;
       error) errors_a=$((errors_a + 1)) ;;
     esac
@@ -980,7 +1100,16 @@ run_pair_mode() {
     [ "${#pair_keywords[@]}" -gt 0 ] && score_args+=("${pair_keywords[@]}")
     score_pair_member "${score_args[@]}"
     case "$PAIR_RUN_OUTCOME" in
-      hit) hits_b=$((hits_b + 1)); valid_b=$((valid_b + 1)) ;;
+      hit)
+        hits_b=$((hits_b + 1)); valid_b=$((valid_b + 1))
+        if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+          has_evidence="$(jq -r '.has_investigation_evidence' "$SUITE_DIR/${slug_b}-run${run_n}/investigation-evidence.json" 2>/dev/null)"
+          if [ "$has_evidence" = "true" ] || [ "$has_evidence" = "false" ]; then
+            pair_investigation_hit_runs=$((pair_investigation_hit_runs + 1))
+            [ "$has_evidence" = "true" ] && pair_investigation_hit_runs_with_evidence=$((pair_investigation_hit_runs_with_evidence + 1))
+          fi
+        fi
+        ;;
       miss) valid_b=$((valid_b + 1)) ;;
       error) errors_b=$((errors_b + 1)) ;;
     esac
@@ -994,6 +1123,17 @@ run_pair_mode() {
   printf '  %-40s %d/%d hits (%d errors)\n' "$slug_a (blind)" "$hits_a" "$valid_a" "$errors_a"
   printf '  %-40s %d/%d hits (%d errors)\n' "$slug_b (focused)" "$hits_b" "$valid_b" "$errors_b"
   echo ""
+  if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+    echo "Investigation evidence (hit runs only, both pair members combined):"
+    if [ "$pair_investigation_hit_runs" -gt 0 ]; then
+      local pair_pct
+      pair_pct="$(awk -v h="$pair_investigation_hit_runs_with_evidence" -v v="$pair_investigation_hit_runs" 'BEGIN { printf "%.1f", (h / v) * 100 }')"
+      echo "  $pair_investigation_hit_runs_with_evidence/$pair_investigation_hit_runs runs had at least one command_execution event ($pair_pct%)"
+    else
+      echo "  N/A (no hit runs)"
+    fi
+    echo ""
+  fi
   if [ "$ARTIFACT_WRITE_FAILURES" -eq 0 ]; then
     echo "Raw per-run results and manifests saved to: $SUITE_DIR"
   else
@@ -1311,26 +1451,90 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
       errors=$((errors + 1))
       continue
     fi
-    if [ -n "$focus" ]; then
-      "$REVIEW_SCRIPT" --cwd "$CURRENT_TMP_REPO" --commit "$snapshot_sha" --focus "$focus" > "$REVIEW_OUT" 2>&1 &
-    else
-      "$REVIEW_SCRIPT" --cwd "$CURRENT_TMP_REPO" --commit "$snapshot_sha" > "$REVIEW_OUT" 2>&1 &
+    # run_id/run_dir: mkdir only moves ahead of the review invocation when
+    # CAPTURE_INVESTIGATION_EVIDENCE actually needs an existing directory to
+    # point --eval-capture-eventlog at -- a /cc round caught that
+    # unconditionally moving mkdir earlier (regardless of the flag) created
+    # a persistent empty orphan run_dir on an INT/TERM interrupt mid-review
+    # even on ordinary (capture-off) sweeps, since this file's shared
+    # cleanup_tmp_repo/on_signal trap (see its own comments above) has no
+    # knowledge of run_dir and never removes it. Keeping mkdir at its
+    # original post-`wait` position for the default (capture-off) path
+    # makes this exactly as before: no run_dir exists at all if a signal
+    # arrives before the review call returns. run_id is deterministic
+    # (slug+run number), which is already unique within a single suite by
+    # construction (the fixture loop never revisits the same slug/run_n
+    # pair), so plain `mkdir` doubles as the collision check regardless of
+    # which position it runs from.
+    run_id="${slug}-run${run_n}"
+    run_dir="$SUITE_DIR/$run_id"
+    if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+      mkdir "$run_dir" || { echo "error: run-id collision at $run_dir" >&2; exit 1; }
     fi
+    # Built as an array (matching this file's existing score_args/
+    # pair_keywords idiom) rather than duplicating the invocation across
+    # focus/no-focus x capture/no-capture branches.
+    review_args=(--cwd "$CURRENT_TMP_REPO" --commit "$snapshot_sha")
+    [ -n "$focus" ] && review_args+=(--focus "$focus")
+    [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ] && review_args+=(--eval-capture-eventlog "$run_dir/eventlog.jsonl")
+    "$REVIEW_SCRIPT" "${review_args[@]}" > "$REVIEW_OUT" 2>&1 &
     # `wait "$!"` rather than capturing the PID into a variable first --
     # see on_signal's comment above for why: a variable holding this PID
     # would go stale (and unsafely killable) the instant `wait` reaps it.
     wait "$!"
     result="$(cat "$REVIEW_OUT")"
     rm -f "$REVIEW_OUT"
+    if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -ne 1 ]; then
+      mkdir "$run_dir" || { echo "error: run-id collision at $run_dir" >&2; exit 1; }
+    fi
+    if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+      commands_json=""
+      evidence_unknown="false"
+      ok_for_evidence="$(printf '%s' "$result" | jq -r '.ok' 2>/dev/null)"
+      # See score_pair_member's identical comment (a third /cc round caught
+      # this same deeper gap in both copies): verified means the file
+      # exists AND actually contains turn.completed, not just `-f` -- a
+      # present-but-truncated copy (the wrapper's `cp ... || true` can fail
+      # partway) would otherwise pass `-f` and silently parse down to []
+      # via fromjson?'s malformed-line skipping.
+      eventlog_verified="false"
+      if [ -f "$run_dir/eventlog.jsonl" ] && grep -q '"type":"turn.completed"' "$run_dir/eventlog.jsonl" 2>/dev/null; then
+        eventlog_verified="true"
+      fi
+      if [ "$eventlog_verified" = "true" ]; then
+        commands_json="$(jq -Rn -c '[inputs | fromjson? | select(.type == "item.completed" and .item.type == "command_execution") | .item.command]' "$run_dir/eventlog.jsonl" 2>/dev/null)"
+        if [ -z "$commands_json" ] || [ "$commands_json" = "null" ]; then
+          commands_json="[]"
+        fi
+      elif [ "$ok_for_evidence" = "true" ]; then
+        # ok:true guarantees the ORIGINAL event log had turn.completed
+        # before the wrapper's own best-effort copy, so an eventlog.jsonl
+        # that is missing OR present-but-incomplete is always a copy
+        # failure, never "nothing to capture" -- recorded as unknown
+        # (null), excluded from the hit-rate denominator, never folded
+        # into a false "no evidence" negative.
+        evidence_unknown="true"
+        echo "  run $run_n: warning: investigation eventlog for $run_id missing or incomplete despite ok:true (copy failure?)" >&2
+        ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 1))
+        commands_json="[]"
+      else
+        commands_json="[]"
+      fi
+      # See score_pair_member's identical comment (a /cc round caught this
+      # same gap in both copies): the fallback write must itself be
+      # checked, matching this file's result.json/manifest.json convention.
+      if [ "$evidence_unknown" = "true" ]; then
+        printf '{"command_count":0,"commands":[],"has_investigation_evidence":null}\n' > "$run_dir/investigation-evidence.json" 2>/dev/null || true
+      elif ! jq -n --argjson cmds "$commands_json" '{command_count: ($cmds | length), commands: $cmds, has_investigation_evidence: (($cmds | length) > 0)}' > "$run_dir/investigation-evidence.json" 2>/dev/null; then
+        if ! printf '{"command_count":0,"commands":[],"has_investigation_evidence":false}\n' > "$run_dir/investigation-evidence.json" 2>/dev/null; then
+          echo "  warning: failed to write investigation-evidence artifact for $run_id (disk full/permission?)" >&2
+          ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 1))
+        fi
+      fi
+    fi
     # Save the raw result + a small manifest before scoring it, regardless of
     # ok true/false -- this is what lets an ambiguous miss be diagnosed later
-    # without re-running. run_id is deterministic (slug+run number), which is
-    # already unique within a single suite by construction (the fixture loop
-    # never revisits the same slug/run_n pair), so plain `mkdir` doubles as
-    # the collision check.
-    run_id="${slug}-run${run_n}"
-    run_dir="$SUITE_DIR/$run_id"
-    mkdir "$run_dir" || { echo "error: run-id collision at $run_dir" >&2; exit 1; }
+    # without re-running.
     if ! printf '%s' "$result" > "$run_dir/result.json"; then
       echo "  warning: failed to write raw result artifact for $run_id (disk full/permission?)" >&2
       ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 1))
@@ -1401,6 +1605,21 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
       if [ "$lexical_hit" = "true" ]; then
         lexical_hits=$((lexical_hits + 1))
         hits=$((hits + 1))
+        if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+          # `.has_investigation_evidence` raw (no `// false`): a JSON null
+          # here means "unknown, capture failed" (see the write site's own
+          # comment) and must NOT collapse to false via `//`, which would
+          # silently count a lost artifact as a confirmed negative. Only an
+          # actual true/false increments the denominator; null (or a
+          # missing/unreadable file, read as empty string) is excluded
+          # entirely -- the same "never fold unknown into hit or miss"
+          # principle this file already applies to judge-call errors.
+          has_evidence="$(jq -r '.has_investigation_evidence' "$run_dir/investigation-evidence.json" 2>/dev/null)"
+          if [ "$has_evidence" = "true" ] || [ "$has_evidence" = "false" ]; then
+            INVESTIGATION_HIT_RUNS=$((INVESTIGATION_HIT_RUNS + 1))
+            [ "$has_evidence" = "true" ] && INVESTIGATION_HIT_RUNS_WITH_EVIDENCE=$((INVESTIGATION_HIT_RUNS_WITH_EVIDENCE + 1))
+          fi
+        fi
         echo "  run $run_n: HIT (verdict=$verdict, lexical keyword match)"
       elif [ "$file_hit" = "true" ]; then
         # Lexical check missed, but at least one finding still named the
@@ -1454,6 +1673,16 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
           # lexical_hits/FIXTURE_LEXICAL_HITS, which must stay unaffected by
           # this adjudication path.
           hits=$((hits + 1))
+          if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+            # See the lexical-hit site's identical comment: raw (no
+            # `// false`) so a null (capture failure) is excluded from the
+            # denominator rather than silently counted as a negative.
+            has_evidence="$(jq -r '.has_investigation_evidence' "$run_dir/investigation-evidence.json" 2>/dev/null)"
+            if [ "$has_evidence" = "true" ] || [ "$has_evidence" = "false" ]; then
+              INVESTIGATION_HIT_RUNS=$((INVESTIGATION_HIT_RUNS + 1))
+              [ "$has_evidence" = "true" ] && INVESTIGATION_HIT_RUNS_WITH_EVIDENCE=$((INVESTIGATION_HIT_RUNS_WITH_EVIDENCE + 1))
+            fi
+          fi
           echo "  run $run_n: HIT (verdict=$verdict, semantic judge confirmed a differently-phrased match)"
         else
           echo "  run $run_n: miss (verdict=$verdict)"
@@ -1747,6 +1976,17 @@ if [ "$fp_valid" -gt 0 ]; then
   echo "  $fp_bad/$fp_valid runs incorrectly flagged ($pct%)"
 else
   echo "  N/A (no valid runs)"
+fi
+
+if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+  echo ""
+  echo "Investigation evidence (bug fixtures, hit runs only):"
+  if [ "$INVESTIGATION_HIT_RUNS" -gt 0 ]; then
+    pct="$(awk -v h="$INVESTIGATION_HIT_RUNS_WITH_EVIDENCE" -v v="$INVESTIGATION_HIT_RUNS" 'BEGIN { printf "%.1f", (h / v) * 100 }')"
+    echo "  $INVESTIGATION_HIT_RUNS_WITH_EVIDENCE/$INVESTIGATION_HIT_RUNS runs had at least one command_execution event ($pct%)"
+  else
+    echo "  N/A (no hit runs)"
+  fi
 fi
 
 total_errors=0
