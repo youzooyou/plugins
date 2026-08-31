@@ -19,9 +19,14 @@ cross-verification — this is the lightweight, single-shot version.
    - Review against a base branch (ask which branch if not stated)
    - Review a specific commit (ask for the SHA if not stated)
 
-2. **Determine focus text.** If the user gave specific instructions ("check for security issues",
-   "just look at the auth logic"), use that as the focus text. Otherwise use a generic instruction:
-   "Review this diff for correctness bugs, security issues, and reuse/simplification opportunities."
+2. **Determine focus text.** If the user gave specific instructions or requirement/intent context
+   ("check for security issues", "just look at the auth logic", "this changes how discounts are
+   calculated for VIP accounts"), use that as the focus text. **If the user gave none, do not invent
+   a generic one** — omit `--focus` entirely. The wrapper's own no-`--focus` prompt already covers
+   the same generic ground (correctness, security, performance, reuse) AND explicitly instructs the
+   model to disclose that no intent/requirement context was available, so a code-only `CLEAN` can't
+   be mistaken for a full requirements review. Synthesizing filler focus text here would defeat that
+   disclosure by making the wrapper think real context was supplied when none was.
 
 3. **Run the wrapper.** Construct and run via Bash:
    ```bash
@@ -30,6 +35,7 @@ cross-verification — this is the lightweight, single-shot version.
      --uncommitted \
      --focus "<focus text>"
    ```
+   Omit the `--focus` flag entirely (not `--focus ""`) when step 2 found no real context to pass.
    (swap `--uncommitted` for `--base <branch>` or `--commit <sha>` per the resolved scope).
 
 4. **Parse the JSON result from stdout:**
