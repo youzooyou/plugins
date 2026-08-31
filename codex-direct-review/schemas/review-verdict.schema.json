@@ -8,12 +8,13 @@
         "type": "object",
         "properties": {
           "file": { "type": "string" },
-          "line": { "type": ["integer", "null"] },
-          "severity": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"], "minimum": 1 },
+          "severity": { "type": ["string", "null"], "enum": ["low", "medium", "high", null] },
           "summary": { "type": "string" },
-          "evidence": { "type": "string" }
+          "evidence": { "type": "string" },
+          "verification": { "type": "string" }
         },
-        "required": ["file", "line", "severity", "summary", "evidence"],
+        "required": ["file", "line", "severity", "summary", "evidence", "verification"],
         "additionalProperties": false
       }
     },
