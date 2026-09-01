@@ -374,6 +374,473 @@ if [ "$CALIBRATE_JUDGE" -ne 1 ]; then
     echo "error: review script not found or not executable at $REVIEW_SCRIPT" >&2
     exit 1
   fi
+
+  # Complete manifest provenance -- a /cc-adjacent reassessment flagged that
+  # manifest.json recorded fixture/run/corpus/focus/timestamp/reasoning-effort
+  # but nothing about WHICH model/CLI/plugin-code/prompt/schema actually
+  # produced a given result, making two manifests from different points in
+  # time impossible to tell apart as comparable or not. All five values below
+  # are fixed for this entire sweep invocation (same reasoning as
+  # $CORPUS_VERSION above), so computed once here, not per-run.
+  #
+  # A /cc round pointed out that this is a real theoretical gap for a long
+  # sweep: if run-codex-review.sh, the schema file, or ~/.codex/config.toml
+  # were edited WHILE this sweep is still running, later runs would
+  # actually be reviewed with the new code/config, but their manifest would
+  # still report these sweep-START values. Deliberately not addressed here
+  # -- this is the SAME "computed once per sweep invocation, not re-checked
+  # per run" property $CORPUS_VERSION (this file's pre-existing corpus-
+  # content fingerprint, unchanged by this diff) has always had, and
+  # extending EITHER of these from sweep-level to run-level provenance
+  # capture would be a broader, consistently-applied architectural change
+  # across this whole harness, not a fix scoped to the five fields this
+  # diff adds. A developer actively editing the plugin/schema/config while
+  # a sweep runs against that same code should already expect some
+  # inconsistency risk from doing so, independent of what any provenance
+  # stamp records.
+  PLUGIN_ROOT="$SCRIPT_DIR/.."
+
+  CLI_VERSION="$(codex --version 2>/dev/null)"
+  [ -z "$CLI_VERSION" ] && CLI_VERSION="unknown"
+
+  # $REVIEW_SCRIPT deliberately never passes --model or --profile (see its
+  # own comment at the codex exec call site) -- the user's own top-level
+  # config is what's actually in effect. codex exec loads config from
+  # $CODEX_HOME/config.toml (confirmed via `codex exec --help`), NOT
+  # unconditionally from ~/.codex/config.toml -- a /cc round caught that a
+  # supported CODEX_HOME override would otherwise make this silently read
+  # the wrong file (or none). Stops at the first [section] header so a
+  # [profiles.x] block's own `model` key (which is NOT active here, since no
+  # --profile is ever passed) is never mistaken for that top-level default.
+  CODEX_CONFIG_HOME="${CODEX_HOME:-$HOME/.codex}"
+  # Not a general TOML parser -- specifically handles the value/key shapes a
+  # /cc round confirmed (cross-checked against Python's tomllib) are all
+  # valid TOML for this one key: a bare or quoted key in either quote style
+  # (`model` / `"model"` / `'model'`), and a basic "...", literal '...',
+  # triple-basic """...""", or triple-literal '''...''' string value.
+  # Written to a real temp file and run via `awk -f` (rather than an inline
+  # single-quoted awk program, this file's usual style) purely because the
+  # program body itself needs literal single-quote characters -- embedding
+  # those inside a single-quoted string requires the classic '"'"' escape
+  # dance repeated many times over, which a /cc round's own history with a
+  # different escaping bug elsewhere in this project has already shown is
+  # exactly the kind of thing worth avoiding rather than getting right by
+  # hand. `awk -f <(cat << 'EOF' ...)` (process substitution instead of a
+  # real file) was tried first specifically to avoid a /cc-found signal-leak
+  # window (this whole block runs before either cleanup trap is installed
+  # further down, so a bare mktemp file here would have no cleanup path if
+  # interrupted mid-computation) -- but live-testing that exact form hit a
+  # genuine bash parser limitation: process substitution's own closing-paren
+  # matching does not correctly account for a `)` character appearing
+  # inside a heredoc body nested within it (this awk program's own
+  # `if (q == "\"" || q == "'") {` line contains exactly such a `)`),
+  # corrupting the surrounding shell parse in a way that has nothing to do
+  # with quoting at all. A real temp file avoids that bash limitation
+  # entirely, with its own narrow local trap (see below) closing the
+  # original signal-leak concern directly instead. Takes everything after
+  # the first `=`, then strips a MATCHING pair
+  # of leading/trailing quote characters (via index(), not a regex
+  # backreference -- there is no portable same-character/same-run
+  # backreference across quote styles) if the value starts with one,
+  # checking the 3-quote forms first so a triple-quoted value's OWN closing
+  # run isn't mistaken for a single closing character one position in; an
+  # unquoted value passes through unchanged. Also stops scanning at the
+  # first [section] header REGARDLESS OF LEADING INDENTATION (not just one
+  # in column 1) -- a /cc round live-confirmed an indented `[profiles.x]`
+  # header was otherwise missed entirely, letting an indented `model` key
+  # inside that profile be mistaken for the top-level default.
+  # Not a general TOML parser: does not handle a backslash-escaped quote
+  # inside a string (e.g. model = "gpt\"suffix") or a value spanning
+  # multiple physical lines -- both correctly parse under a real TOML
+  # parser, but neither is a realistic shape for a short model identifier
+  # (this key's value is always a simple unescaped string like
+  # "gpt-5.6-terra" in every real config.toml this project has seen), and
+  # this remains a best-effort provenance field, not a strict guarantee --
+  # matching how $CORPUS_VERSION/$PLUGIN_VERSION above already accept
+  # similar best-effort limits rather than reimplementing git internals.
+  # Narrow, local trap covering this temp file's brief lifetime -- installed
+  # BEFORE mktemp even runs (referencing the not-yet-set variable by name;
+  # a trap command is evaluated at FIRE time, not registration time, so it
+  # correctly sees whatever value the variable holds by then) so there is no
+  # gap between mktemp succeeding and a trap existing to clean up after it.
+  # A /cc round live-confirmed a plain `trap 'rm -f ...' EXIT INT TERM` (no
+  # `exit` in the handler) does NOT terminate the script on a real INT/TERM
+  # -- it cleans up and then RESUMES, silently ignoring the user's interrupt
+  # entirely (confirmed live: `trap 'printf trapped' EXIT INT TERM; kill
+  # -TERM $$; printf survived` prints "trappedsurvivedtrapped", not
+  # "trapped"). That would make this narrow fix worse than the leak it
+  # closes -- a user's Ctrl-C during a long sweep would be swallowed instead
+  # of cancelling it. EXIT and INT/TERM are therefore registered separately:
+  # EXIT only cleans up (preserving whatever exit code the script already
+  # has for a normal completion), while INT/TERM cleans up AND exits 130,
+  # matching on_signal's own exit code further below exactly.
+  CONFIGURED_MODEL_AWK=""
+  trap 'rm -f "$CONFIGURED_MODEL_AWK"' EXIT
+  trap 'rm -f "$CONFIGURED_MODEL_AWK"; exit 130' INT TERM
+  CONFIGURED_MODEL_AWK="$(mktemp)"
+  # A /cc round pointed out that an unchecked mktemp failure here would
+  # silently flow into "unset (CLI default)" below -- conflating "we could
+  # not even attempt to read the config" with "we read it and there
+  # genuinely is no top-level model key," which are very different
+  # provenance claims (the wrapper DOES rely on this config since it never
+  # passes --model itself). Distinct sentinel, matching the same
+  # mktemp-failure-checking precedent judge_finding already establishes
+  # elsewhere in this file, and the same one just applied to
+  # PLUGIN_UNHASHABLE_FLAG above.
+  if [ -z "$CONFIGURED_MODEL_AWK" ]; then
+    CONFIGURED_MODEL="unknown (could not create temp file for parsing)"
+  else
+    cat > "$CONFIGURED_MODEL_AWK" << 'AWKSCRIPT'
+/^[[:space:]]*\[/ { exit }
+/^[[:space:]]*["']?model["']?[[:space:]]*=/ {
+  line=$0
+  sub(/^[^=]*=[[:space:]]*/, "", line)
+  three=substr(line,1,3)
+  if (three == "\"\"\"" || three == "'''") {
+    rest=substr(line,4)
+    idx=index(rest, three)
+    if (idx>0) print substr(rest,1,idx-1)
+    else print rest
+  } else {
+    q=substr(line,1,1)
+    if (q == "\"" || q == "'") {
+      rest=substr(line,2)
+      idx=index(rest, q)
+      if (idx>0) print substr(rest,1,idx-1)
+      else print rest
+    } else {
+      print line
+    }
+  }
+  exit
+}
+AWKSCRIPT
+    CONFIGURED_MODEL_HEREDOC_EXIT=$?
+    # A /cc round pointed out that mktemp succeeding is not the only way
+    # this can fail -- the heredoc WRITE just above, or the awk READ right
+    # here, could each independently fail (a filesystem going full or
+    # read-only mid-computation) and produce the same empty CONFIGURED_MODEL
+    # as a genuinely absent model key. awk's own exit status distinguishes
+    # "ran fine, key absent" (status 0, empty output -- a real "unset") from
+    # "the read/parse itself failed" (nonzero status); an empty awk PROGRAM
+    # file from a failed heredoc write would still let awk exit 0 having
+    # matched nothing, which is why the heredoc write's own exit status
+    # (captured immediately above, before any other statement could
+    # overwrite $?) is ALSO checked, not just awk's.
+    CONFIGURED_MODEL="$(awk -f "$CONFIGURED_MODEL_AWK" "$CODEX_CONFIG_HOME/config.toml" 2>/dev/null)"
+    CONFIGURED_MODEL_AWK_EXIT=$?
+    rm -f "$CONFIGURED_MODEL_AWK"
+    if [ "$CONFIGURED_MODEL_HEREDOC_EXIT" -ne 0 ] || [ "$CONFIGURED_MODEL_AWK_EXIT" -ne 0 ]; then
+      CONFIGURED_MODEL="unknown (config parsing failed)"
+    else
+      [ -z "$CONFIGURED_MODEL" ] && CONFIGURED_MODEL="unset (CLI default)"
+    fi
+  fi
+  trap - EXIT INT TERM
+
+  # Same best-effort git-describe/uncommitted pattern as $CORPUS_VERSION
+  # above, rooted at the plugin directory instead of the corpus directory --
+  # the :!eval/corpus exclusion keeps a corpus-only change (already captured
+  # by $CORPUS_VERSION) from also marking the PLUGIN CODE itself dirty.
+  #
+  # A /cc round caught that a bare "uncommitted" collapses EVERY dirty state
+  # to the identical manifest value regardless of what actually changed --
+  # defeating the whole comparability goal for the single most common case
+  # (evaluating an in-progress, not-yet-committed candidate change). When
+  # dirty, appends the base commit plus a sha256 fingerprint of the actual
+  # dirty content instead: the tracked diff AND untracked file contents
+  # (named, so two files with identical content but different names still
+  # fingerprint differently) concatenated and hashed -- git status/diff
+  # alone would silently miss brand-new untracked files entirely.
+  PLUGIN_VERSION="uncommitted"
+  if git -C "$PLUGIN_ROOT" rev-parse HEAD >/dev/null 2>&1; then
+    # A /cc round pointed out that this status check's OWN failure (not just
+    # a genuinely clean tree) was indistinguishable from clean: a failing
+    # git status command still typically produces empty stdout (errors go to
+    # stderr, suppressed here), so the exit status must be checked
+    # separately -- otherwise a status-check failure would be silently
+    # classified as "confirmed clean" and go on to produce a precise,
+    # commit-based value for a tree whose actual state was never verified.
+    PLUGIN_STATUS_OUTPUT="$(git -C "$PLUGIN_ROOT" status --porcelain -- . ':!eval/corpus' 2>/dev/null)"
+    PLUGIN_STATUS_EXIT=$?
+    # Same reasoning, and a /cc round pointed out the identical gap existed
+    # here too: this ls-files call decides whether the plugin directory has
+    # any TRACKED files at all (part of the clean-vs-dirty classification,
+    # not just cosmetic) -- if IT fails while git status happens to
+    # succeed, the previous version fell through to the dirty branch
+    # unconditionally, which could then compute and report a fully
+    # "valid-looking" diff-based fingerprint despite never having actually
+    # confirmed whether the tree was clean or dirty in the first place.
+    PLUGIN_LS_FILES_OUTPUT="$(git -C "$PLUGIN_ROOT" ls-files -- . 2>/dev/null)"
+    PLUGIN_LS_FILES_EXIT=$?
+    if [ "$PLUGIN_STATUS_EXIT" -ne 0 ] || [ "$PLUGIN_LS_FILES_EXIT" -ne 0 ]; then
+      PLUGIN_VERSION="uncommitted-unknown-status-check-failed"
+    elif [ -z "$PLUGIN_STATUS_OUTPUT" ] && [ -n "$PLUGIN_LS_FILES_OUTPUT" ]; then
+      # A /cc round first suggested --abbrev=40 to force git describe's own
+      # hash suffix to full length regardless of core.abbrev -- but a LATER
+      # round caught that --abbrev only affects that suffix when describe
+      # actually emits one: at an EXACT tag (HEAD IS the tagged commit,
+      # zero commits since), describe returns ONLY the tag name with no
+      # hash suffix at all (e.g. "eval-corpus-v1"), and a tag is mutable --
+      # it can be force-moved to point at a different commit later, making
+      # that bare name insufficient to identify which commit was actually
+      # evaluated. Fixed properly: the full commit hash is now appended
+      # UNCONDITIONALLY (not left to describe's own conditional suffix
+      # logic), so both the exact-tag case ("eval-corpus-v1+fa5eefd...",
+      # live-verified) and the normal case ("eval-corpus-v2-17-g2465a43
+      # +2465a437...", slightly redundant with describe's own abbreviated
+      # suffix but harmless) always carry an explicit, immutable commit
+      # identifier no matter what state HEAD is in.
+      PLUGIN_VERSION_DESCRIBE="$(git -C "$PLUGIN_ROOT" describe --tags --always 2>/dev/null)"
+      PLUGIN_VERSION_FULL_SHA="$(git -C "$PLUGIN_ROOT" rev-parse HEAD 2>/dev/null)"
+      if [ -n "$PLUGIN_VERSION_DESCRIBE" ] && [ -n "$PLUGIN_VERSION_FULL_SHA" ]; then
+        PLUGIN_VERSION="${PLUGIN_VERSION_DESCRIBE}+${PLUGIN_VERSION_FULL_SHA}"
+      else
+        # Proactive self-audit after the status/diff/ls-files/mktemp
+        # failure-checking pattern above repeated four times: a bare
+        # "uncommitted" here would be actively MISLEADING, not just vague --
+        # the tree was just confirmed CLEAN by the branch above, so "there
+        # are uncommitted changes" is a wrong claim, not merely an
+        # unspecific one, if describe/rev-parse themselves failed for some
+        # unrelated reason. Explicit unknown sentinel instead, matching the
+        # same principle applied everywhere else in this block.
+        PLUGIN_VERSION="uncommitted-unknown-describe-or-rev-parse-failed"
+      fi
+    else
+      # Full 40-hex-char SHA, not --short -- a /cc round pointed out that an
+      # abbreviated hash (as short as 4 hex chars under a repo with a low
+      # core.abbrev setting) is a much easier, and entirely avoidable,
+      # collision target than the sha256 fingerprint the rest of this value
+      # already relies on for its actual uniqueness guarantee.
+      PLUGIN_BASE_SHA="$(git -C "$PLUGIN_ROOT" rev-parse HEAD 2>/dev/null)"
+      # File-based side-channel, not a plain shell variable -- the untracked-
+      # file loop below runs in a SUBSHELL (it's the right side of a pipe),
+      # so a variable it sets is invisible once that pipe completes. Writing
+      # to a real file is not subshell-scoped the same way: the write itself
+      # is a normal filesystem side effect, visible here regardless of which
+      # subshell performed it. Narrow local trap, same reasoning and same
+      # split EXIT-vs-INT/TERM behavior as CONFIGURED_MODEL_AWK's above.
+      PLUGIN_UNHASHABLE_FLAG=""
+      trap 'rm -f "$PLUGIN_UNHASHABLE_FLAG"' EXIT
+      trap 'rm -f "$PLUGIN_UNHASHABLE_FLAG"; exit 130' INT TERM
+      # Placed under $STATE_ROOT (the same directory tree every OTHER sweep
+      # artifact -- result.json, manifest.json itself -- is written to),
+      # not the system default tmp directory: a /cc round correctly showed
+      # that a system tmp dir is very often a SEPARATE mount/filesystem
+      # (e.g. a small tmpfs) from $STATE_ROOT, so a disk-full/permission
+      # failure affecting THIS flag would not necessarily also affect (and
+      # therefore be independently caught by) result.json/manifest.json's
+      # own writes and this file's existing ARTIFACT_WRITE_FAILURES
+      # tracking -- invalidating an earlier version of this exact
+      # rationale. Co-locating them makes that shared-fate assumption
+      # actually true by construction, rather than merely hoped for.
+      PLUGIN_UNHASHABLE_FLAG="$(mktemp "$STATE_ROOT/plugin-unhashable-flag.XXXXXX" 2>/dev/null)"
+      # A /cc round pointed out that this exact mechanism -- the one thing
+      # this whole block relies on to ever REPORT "unknown" instead of a
+      # false positive -- could itself silently fail: if mktemp fails,
+      # PLUGIN_UNHASHABLE_FLAG stays empty, and `[ -s "" ]` below is simply
+      # false, so a later marker write (which would target a literal empty
+      # path) can never be observed. Checked here the same way
+      # judge_finding's own three-mktemp check already does elsewhere in
+      # this file, rather than silently proceeding as if the safety net
+      # existed.
+      if [ -z "$PLUGIN_UNHASHABLE_FLAG" ]; then
+        PLUGIN_VERSION="uncommitted-unknown-unhashable-untracked-entry"
+      else
+      PLUGIN_DIRTY_SHA256="$(
+        {
+          # Against HEAD, not a bare `git diff` (which is index-relative and
+          # goes EMPTY the moment a change is `git add`-ed) -- a /cc round
+          # live-confirmed a staged-only change produced the identical
+          # empty-stream hash as any other staged-only change, since the
+          # dirty predicate above (git status --porcelain, which DOES see
+          # staged changes) and this hash input had silently drifted apart.
+          # --full-index: a /cc round live-confirmed that without it, a
+          # binary-file diff shows only "Binary files ... differ" plus an
+          # abbreviated object id in the index line -- the binary content
+          # itself contributes nothing else identifiable to this hash, so
+          # two different binary blobs whose abbreviated ids happened to
+          # collide (easier than a real sha256 collision, especially under
+          # a short core.abbrev) would fingerprint identically. --full-index
+          # emits the complete 40-character object id for both sides
+          # instead.
+          # A /cc round pointed out that a git failure here (corrupted
+          # index, permission error, etc. -- distinct from a merely EMPTY
+          # diff, which is the normal, valid "no tracked changes" case) was
+          # silently absorbed by 2>/dev/null with no exit-status check, so
+          # an incomplete/partial stream could still be hashed as if
+          # collection had fully succeeded. Checked directly here (this
+          # command is not itself piped, so $? reflects it exactly) rather
+          # than only trusting its suppressed-stderr output.
+          if ! git -C "$PLUGIN_ROOT" diff --no-ext-diff --full-index HEAD -- . ':!eval/corpus' 2>/dev/null; then
+            printf 'x' >> "$PLUGIN_UNHASHABLE_FLAG"
+          fi
+          # A NUL byte between the tracked-diff section above and the
+          # untracked-file records below -- NUL cannot appear in ordinary
+          # git diff text, so this closes even the section BOUNDARY against
+          # the same class of ambiguity fixed below within the untracked
+          # section itself.
+          printf '\0'
+          # -z/-d '' (NUL-delimited), not newline-delimited `read` -- a
+          # filename containing a literal newline would otherwise corrupt
+          # this loop. -L is checked BEFORE -f and never dereferenced --
+          # an earlier version used a bare -f guard (which follows symlinks)
+          # to fix a /cc-found FIFO-hang risk (an untracked FIFO, or a
+          # symlink resolving to one, would otherwise block `cat` forever
+          # with no writer), but a later /cc round caught that this still
+          # let an untracked symlink pointing at an ordinary file dereference
+          # and hash that file's TARGET content: retargeting the symlink
+          # between two files with identical bytes would leave the
+          # fingerprint unchanged despite the plugin tree genuinely
+          # changing, changing the target's content elsewhere on disk would
+          # change the fingerprint despite no plugin-tree change at all, and
+          # more importantly it let this best-effort provenance computation
+          # read the content of an arbitrary file reachable via a symlink
+          # planted anywhere under the plugin directory. Matches git's own
+          # model instead: a symlink's hashed identity is the link's OWN
+          # target text (via `readlink`, never opened/dereferenced), exactly
+          # what git itself stores as that blob's content -- a FIFO/device/
+          # directory that is NOT a symlink still falls through both
+          # branches untouched, preserving the original FIFO-hang fix.
+          #
+          # Each record is emitted as TYPE-TAG \0 NAME \0 PAYLOAD \0 -- a /cc
+          # round proved the earlier human-readable "--- untracked: NAME ---"
+          # text delimiter was genuinely ambiguous (constructed and
+          # shasum-confirmed a real collision: one file whose OWN raw bytes
+          # happened to spell out that exact delimiter text hashed
+          # IDENTICALLY to two separate files that legitimately produced
+          # that same concatenated byte stream). NUL can appear in neither a
+          # POSIX filename nor a symlink target (both are NUL-terminated C
+          # strings at the OS level) nor a hex sha256 digest, so framing on
+          # NUL alone is provably unambiguous regardless of what bytes the
+          # file content or symlink target actually contain. A regular
+          # file's PAYLOAD is its own content sha256 (a fixed-width digest,
+          # not raw file bytes) rather than `cat`ing its content directly --
+          # deliberately avoids re-embedding arbitrary, unbounded byte
+          # content into the very stream whose framing must stay
+          # unambiguous. `readlink -n` (suppresses readlink's OWN trailing
+          # newline, which every readlink implementation normally appends to
+          # its output line) combined with the sentinel-x idiom (`cmd;
+          # printf x` then strip the trailing x) preserves a symlink
+          # target's own trailing newline byte-exactly, if it has one --
+          # otherwise indistinguishable from a target with no trailing
+          # newline at all, since a bare `$(readlink ...)` strips ALL
+          # trailing newlines unconditionally, in either case.
+          git -C "$PLUGIN_ROOT" ls-files --others --exclude-standard -z -- . ':!eval/corpus' 2>/dev/null \
+            | while IFS= read -r -d '' untracked_file; do
+                if [ -L "$PLUGIN_ROOT/$untracked_file" ]; then
+                  symlink_target="$(readlink -n "$PLUGIN_ROOT/$untracked_file" 2>/dev/null; printf x)"
+                  symlink_target="${symlink_target%x}"
+                  if [ -z "$symlink_target" ]; then
+                    # A /cc round caught the identical class of bug as the
+                    # unhashable-file case just above, in the symlink branch
+                    # too: if the symlink is removed/replaced (a TOCTOU
+                    # race) in the narrow window between the -L check and
+                    # this readlink call, readlink fails and produces empty
+                    # output -- indistinguishable, before this fix, from
+                    # (the practically nonexistent) case of a symlink whose
+                    # actual target is a genuinely empty string. Treated as
+                    # unknown, not as a confident empty payload, for the
+                    # same reason: it was silently accepted before, letting
+                    # the whole computation fall through to a falsely
+                    # precise hash-based value.
+                    printf 'x' >> "$PLUGIN_UNHASHABLE_FLAG"
+                  else
+                    printf 'symlink\0%s\0%s\0' "$untracked_file" "$symlink_target"
+                  fi
+                elif [ -f "$PLUGIN_ROOT/$untracked_file" ]; then
+                  untracked_content_sha256="$(shasum -a 256 "$PLUGIN_ROOT/$untracked_file" 2>/dev/null | awk '{print $1}')"
+                  if [ -z "$untracked_content_sha256" ]; then
+                    # A /cc round caught that an unreadable/vanished regular
+                    # file (shasum fails, but the pipeline's own exit status
+                    # stays 0 since awk itself succeeds on empty input)
+                    # would otherwise silently serialize as `file\0NAME\0\0`
+                    # -- an empty PAYLOAD looks like a definite, reproducible
+                    # value, but the actual content is UNKNOWN, not empty; if
+                    # that content changed while remaining unreadable, this
+                    # fingerprint would never notice. Flags the file (a real
+                    # filesystem write, not a subshell-scoped variable) so
+                    # the whole computation is marked unknown afterward,
+                    # rather than silently emitting a falsely-precise value.
+                    printf 'x' >> "$PLUGIN_UNHASHABLE_FLAG"
+                  else
+                    # A /cc round pointed out that the executable bit was
+                    # missing from this record -- git itself tracks it as
+                    # part of a TRACKED file's meaningful state (mode 100644
+                    # vs 100755 shows up in a real git diff, already
+                    # captured above for tracked changes), so an untracked
+                    # scripts executable bit toggling should count as a
+                    # real state change here too; content alone stayed
+                    # identical while script BEHAVIOR would not have.
+                    if [ -x "$PLUGIN_ROOT/$untracked_file" ]; then
+                      untracked_mode="exec"
+                    else
+                      untracked_mode="noexec"
+                    fi
+                    printf 'file\0%s\0%s\0%s\0' "$untracked_file" "$untracked_mode" "$untracked_content_sha256"
+                  fi
+                else
+                  # Neither a symlink nor a regular file (a FIFO, socket, or
+                  # device -- the FIFO-hang fix's OWN target case -- or a
+                  # path that vanished between listing and stat). Cannot be
+                  # meaningfully content-fingerprinted at all; a /cc round
+                  # pointed out that silently contributing nothing makes
+                  # such an entry's presence and absence indistinguishable.
+                  # Same unknown-flag treatment as an unhashable file above.
+                  printf 'x' >> "$PLUGIN_UNHASHABLE_FLAG"
+                fi
+              done
+          # ${PIPESTATUS[0]} (not $?, which after a pipeline reflects only
+          # its LAST command -- the while loop, not git ls-files itself) --
+          # captured immediately, before any other statement can overwrite
+          # it. Same reasoning as the git diff check above: a git failure
+          # here (as opposed to a legitimately empty/no-untracked-files
+          # list) was previously silently absorbed by 2>/dev/null with
+          # nothing checking whether collection itself actually succeeded.
+          if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+            printf 'x' >> "$PLUGIN_UNHASHABLE_FLAG"
+          fi
+        } | shasum -a 256 | awk '{print $1}'
+      )"
+      if [ -s "$PLUGIN_UNHASHABLE_FLAG" ]; then
+        PLUGIN_VERSION="uncommitted-unknown-unhashable-untracked-entry"
+      elif [ -n "$PLUGIN_BASE_SHA" ] && [ -n "$PLUGIN_DIRTY_SHA256" ]; then
+        PLUGIN_VERSION="uncommitted-from-${PLUGIN_BASE_SHA}+diff-${PLUGIN_DIRTY_SHA256}"
+      else
+        # Same proactive fix as the clean-tree branch above: without this,
+        # PLUGIN_VERSION would silently fall through to the outer default
+        # "uncommitted" (correct in spirit, but indistinguishable from a
+        # normal successful dirty-tree computation that just happens to
+        # produce a plain string) if PLUGIN_BASE_SHA's rev-parse itself
+        # failed. Explicit unknown sentinel instead.
+        PLUGIN_VERSION="uncommitted-unknown-base-sha-or-diff-hash-failed"
+      fi
+      rm -f "$PLUGIN_UNHASHABLE_FLAG"
+      trap - EXIT INT TERM
+      fi
+    fi
+  fi
+
+  SCHEMA_SHA256=""
+  if [ -f "$PLUGIN_ROOT/schemas/review-verdict.schema.json" ]; then
+    SCHEMA_SHA256="$(shasum -a 256 "$PLUGIN_ROOT/schemas/review-verdict.schema.json" | awk '{print $1}')"
+  fi
+
+  # Hashes build_review_prompt()'s own SOURCE LINES, not any single call's
+  # fully-interpolated prompt (which necessarily differs every call, since it
+  # embeds that call's diff text) -- this answers "did the prompt-BUILDING
+  # logic change," the thing actually useful for longitudinal comparison.
+  # Located dynamically via the same brace-matching technique already used
+  # (and proven this session) to isolate judge_finding() in test harnesses --
+  # never a hardcoded line range, which would silently go stale the moment
+  # the wrapper file is edited.
+  PROMPT_TEMPLATE_SHA256=""
+  if [ -f "$REVIEW_SCRIPT" ]; then
+    PROMPT_LINE_RANGE="$(awk '/^build_review_prompt\(\) \{/{start=NR} start && /^}/{print start","NR; exit}' "$REVIEW_SCRIPT")"
+    if [ -n "$PROMPT_LINE_RANGE" ]; then
+      PROMPT_TEMPLATE_SHA256="$(sed -n "${PROMPT_LINE_RANGE%%,*},${PROMPT_LINE_RANGE##*,}p" "$REVIEW_SCRIPT" | shasum -a 256 | awk '{print $1}')"
+    fi
+  fi
 fi
 
 CURRENT_TMP_REPO=""
@@ -1002,9 +1469,17 @@ score_pair_member() {
     --arg focus_sha256 "$focus_sha256" \
     --arg timestamp_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg reasoning_effort "xhigh (fixed by run-codex-review.sh, not configurable from here)" \
+    --arg cli_version "$CLI_VERSION" \
+    --arg configured_model "$CONFIGURED_MODEL" \
+    --arg plugin_version "$PLUGIN_VERSION" \
+    --arg prompt_template_sha256 "$PROMPT_TEMPLATE_SHA256" \
+    --arg schema_sha256 "$SCHEMA_SHA256" \
     '{fixture: $fixture, run: $run, snapshot_sha: $snapshot_sha, corpus_version: $corpus_version,
       focus_sha256: (if $focus_sha256 == "" then null else $focus_sha256 end),
-      timestamp_utc: $timestamp_utc, reasoning_effort: $reasoning_effort}' \
+      timestamp_utc: $timestamp_utc, reasoning_effort: $reasoning_effort,
+      cli_version: $cli_version, configured_model: $configured_model,
+      plugin_version: $plugin_version, prompt_template_sha256: $prompt_template_sha256,
+      schema_sha256: $schema_sha256}' \
     > "$run_dir/manifest.json"; then
     echo "  warning: failed to write manifest for $run_id (disk full/permission?)" >&2
     ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 1))
@@ -1857,9 +2332,17 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
       --arg focus_sha256 "$focus_sha256" \
       --arg timestamp_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       --arg reasoning_effort "xhigh (fixed by run-codex-review.sh, not configurable from here)" \
+      --arg cli_version "$CLI_VERSION" \
+      --arg configured_model "$CONFIGURED_MODEL" \
+      --arg plugin_version "$PLUGIN_VERSION" \
+      --arg prompt_template_sha256 "$PROMPT_TEMPLATE_SHA256" \
+      --arg schema_sha256 "$SCHEMA_SHA256" \
       '{fixture: $fixture, run: $run, snapshot_sha: $snapshot_sha, corpus_version: $corpus_version,
         focus_sha256: (if $focus_sha256 == "" then null else $focus_sha256 end),
-        timestamp_utc: $timestamp_utc, reasoning_effort: $reasoning_effort}' \
+        timestamp_utc: $timestamp_utc, reasoning_effort: $reasoning_effort,
+        cli_version: $cli_version, configured_model: $configured_model,
+        plugin_version: $plugin_version, prompt_template_sha256: $prompt_template_sha256,
+        schema_sha256: $schema_sha256}' \
       > "$run_dir/manifest.json"; then
       echo "  warning: failed to write manifest for $run_id (disk full/permission?)" >&2
       ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 1))
