@@ -1094,6 +1094,135 @@ judge_finding() {
   esac
 }
 
+# score_bug_fixture_result RESULT_TEXT RUN_DIR MUST_FILE DEFECT_ASSERTION [KEYWORD ...]
+# A 2026-08-31 reassessment named this exact gap: score_pair_member and the
+# main fixture loop's should_flag=="true" branch separately implemented
+# identical scoring logic (target-file match, lexical keyword match,
+# semantic judge_finding fallback) -- confirmed byte-for-byte identical by
+# reading both sites before extracting this. This is that shared core, and
+# ONLY that core: it does not touch result.json/manifest.json/
+# investigation-evidence.json persistence (each caller's own responsibility,
+# unchanged), and it does not handle the should_flag=="false" control-group
+# branch (which has no lexical/semantic hit-kind concept at all --
+# score_pair_member never reached it either, since run_pair_mode only ever
+# calls it for should_flag=="true" fixtures).
+#
+# RESULT_TEXT is the wrapper's raw stdout string, NOT a path to read from --
+# a /cc round caught that an earlier revision of this function read from
+# "$run_dir/result.json" instead. Both callers already treat that artifact
+# write as best-effort/non-fatal (a disk-full/permission failure there only
+# warns and increments ARTIFACT_WRITE_FAILURES; the review itself still gets
+# scored from the in-memory string, which is exactly why that write is
+# non-fatal in the first place). Reading the file back here would have
+# silently coupled scoring correctness to that unrelated write's success --
+# a genuinely successful review with a stale or missing result.json would
+# have been mis-scored as "error" and excluded from the scorecard,
+# something the ORIGINAL pre-extraction code never did (it always parsed
+# the in-memory $result, never re-read from disk).
+#
+# Sets globals rather than returning a single scalar, matching this file's
+# existing PAIR_RUN_OUTCOME/JUDGE_VERDICT convention (bash 3.2, this file's
+# stated floor, has no `local -n`/nameref) -- extended past a single value
+# because callers need the lexical/semantic distinction one scalar can't
+# carry (the main loop tracks lexical_hits as its own separate recall
+# metric):
+#   SCORE_OUTCOME:  "hit" | "miss" | "error"
+#   SCORE_HIT_KIND: "lexical" | "semantic" | "none" (meaningful only when
+#                   SCORE_OUTCOME="hit")
+#   SCORE_VERDICT:  the review's own verdict.verdict string, for logging
+#   SCORE_DETAIL:   populated only on error -- the exact text each caller
+#                   already logged before this extraction ("wrapper
+#                   failure: $reason" or the semantic-judge-failure message),
+#                   so printed output stays byte-identical to before.
+score_bug_fixture_result() {
+  local result="$1" run_dir="$2" must_file="$3" defect_assertion="$4"
+  shift 4
+  # remaining "$@" = keywords (possibly zero)
+
+  SCORE_OUTCOME=""
+  SCORE_HIT_KIND="none"
+  SCORE_VERDICT=""
+  SCORE_DETAIL=""
+
+  local ok
+  ok="$(printf '%s' "$result" | jq -r '.ok')"
+  if [ "$ok" != "true" ]; then
+    local reason
+    reason="$(printf '%s' "$result" | jq -r '.reason // "unknown"')"
+    SCORE_DETAIL="wrapper failure: $reason"
+    SCORE_OUTCOME="error"
+    return
+  fi
+
+  SCORE_VERDICT="$(printf '%s' "$result" | jq -r '.verdict.verdict')"
+  local file_hit
+  file_hit="$(printf '%s' "$result" | jq -r --arg f "$must_file" '
+    [.verdict.findings[] | select(.file | contains($f))] | length > 0
+  ')"
+
+  local is_hit="false" hit_kind="none"
+  if [ "$file_hit" = "true" ]; then
+    if [ "$#" -eq 0 ]; then
+      is_hit="true"
+      hit_kind="lexical"
+    else
+      local kw match
+      for kw in "$@"; do
+        match="$(printf '%s' "$result" | jq -r --arg f "$must_file" --arg kw "$kw" '
+          [.verdict.findings[]
+           | select(.file | contains($f))
+           | select(((.summary // "") + " " + (.evidence // "")) | ascii_downcase | contains($kw | ascii_downcase))
+          ] | length > 0
+        ')"
+        if [ "$match" = "true" ]; then
+          is_hit="true"
+          hit_kind="lexical"
+          break
+        fi
+      done
+    fi
+  fi
+
+  if [ "$file_hit" = "true" ] && [ "$is_hit" != "true" ]; then
+    # Semantic fallback: the lexical keyword check above missed, but a
+    # finding still names must_file, so judge each such finding individually
+    # against defect_assertion rather than scoring this run a flat miss.
+    local matching_findings judge_idx=0 any_yes="false" any_error="false" finding_json finding_text
+    matching_findings="$(printf '%s' "$result" | jq -c --arg f "$must_file" '
+      [.verdict.findings[] | select(.file | contains($f))]
+    ')"
+    while IFS= read -r finding_json; do
+      judge_idx=$((judge_idx + 1))
+      finding_text="$(printf '%s' "$finding_json" | jq -r '(.summary // "") + "\n" + (.evidence // "")')"
+      judge_finding "has the following known defect" \
+        "$defect_assertion" \
+        "Does this finding identify the defect described above, even if phrased differently or using different terminology?" \
+        "$finding_text" \
+        "$run_dir/semantic-judge-${judge_idx}.prompt.txt" "$run_dir/semantic-judge-${judge_idx}.response.txt"
+      case "$JUDGE_VERDICT" in
+        yes) any_yes="true" ;;
+        error) any_error="true" ;;
+      esac
+    done < <(printf '%s' "$matching_findings" | jq -c '.[]')
+
+    if [ "$any_error" = "true" ]; then
+      SCORE_DETAIL="semantic judge call failed or gave a non-yes/no response"
+      SCORE_OUTCOME="error"
+      return
+    elif [ "$any_yes" = "true" ]; then
+      is_hit="true"
+      hit_kind="semantic"
+    fi
+  fi
+
+  if [ "$is_hit" = "true" ]; then
+    SCORE_OUTCOME="hit"
+    SCORE_HIT_KIND="$hit_kind"
+  else
+    SCORE_OUTCOME="miss"
+  fi
+}
+
 # run_judge_calibration
 # judge_finding's own accuracy has never been measured -- it's used
 # throughout the main sweep above as a semantic fallback, but nothing checks
@@ -1485,86 +1614,26 @@ score_pair_member() {
     ARTIFACT_WRITE_FAILURES=$((ARTIFACT_WRITE_FAILURES + 1))
   fi
 
-  local ok
-  ok="$(printf '%s' "$result" | jq -r '.ok')"
-  if [ "$ok" != "true" ]; then
-    local reason
-    reason="$(printf '%s' "$result" | jq -r '.reason // "unknown"')"
-    echo "  [$slug] run $run_n: ERROR (wrapper failure: $reason) -- excluded from scoring"
-    PAIR_RUN_OUTCOME="error"
-    return
-  fi
-
-  local verdict
-  verdict="$(printf '%s' "$result" | jq -r '.verdict.verdict')"
-  local file_hit
-  file_hit="$(printf '%s' "$result" | jq -r --arg f "$must_file" '
-    [.verdict.findings[] | select(.file | contains($f))] | length > 0
-  ')"
-  local is_hit="false"
-  if [ "$file_hit" = "true" ]; then
-    if [ "$#" -eq 0 ]; then
-      is_hit="true"
-    else
-      local kw match
-      for kw in "$@"; do
-        match="$(printf '%s' "$result" | jq -r --arg f "$must_file" --arg kw "$kw" '
-          [.verdict.findings[]
-           | select(.file | contains($f))
-           | select(((.summary // "") + " " + (.evidence // "")) | ascii_downcase | contains($kw | ascii_downcase))
-          ] | length > 0
-        ')"
-        if [ "$match" = "true" ]; then
-          is_hit="true"
-          break
-        fi
-      done
-    fi
-  fi
-
-  if [ "$file_hit" = "true" ] && [ "$is_hit" != "true" ]; then
-    # Semantic fallback, mirroring the main loop's should_flag=="true"
-    # branch exactly (see its own comment for the full reasoning): the
-    # lexical keyword check above already ran and missed, but a finding
-    # still names must_file, so judge each such finding individually
-    # against defect_assertion rather than scoring this run a flat miss.
-    local matching_findings judge_idx any_yes any_error finding_json finding_text
-    matching_findings="$(printf '%s' "$result" | jq -c --arg f "$must_file" '
-      [.verdict.findings[] | select(.file | contains($f))]
-    ')"
-    judge_idx=0
-    any_yes="false"
-    any_error="false"
-    while IFS= read -r finding_json; do
-      judge_idx=$((judge_idx + 1))
-      finding_text="$(printf '%s' "$finding_json" | jq -r '(.summary // "") + "\n" + (.evidence // "")')"
-      judge_finding "has the following known defect" \
-        "$defect_assertion" \
-        "Does this finding identify the defect described above, even if phrased differently or using different terminology?" \
-        "$finding_text" \
-        "$run_dir/semantic-judge-${judge_idx}.prompt.txt" "$run_dir/semantic-judge-${judge_idx}.response.txt"
-      case "$JUDGE_VERDICT" in
-        yes) any_yes="true" ;;
-        error) any_error="true" ;;
-      esac
-    done < <(printf '%s' "$matching_findings" | jq -c '.[]')
-
-    if [ "$any_error" = "true" ]; then
-      echo "  [$slug] run $run_n: ERROR (semantic judge call failed or gave a non-yes/no response) -- excluded from scoring"
+  # Shared scoring core (target-file match, lexical keyword match, semantic
+  # judge_finding fallback) extracted into score_bug_fixture_result -- see
+  # its own doc comment for why. This wrapper's external contract
+  # (PAIR_RUN_OUTCOME, read by run_pair_mode's two call sites) is completely
+  # unchanged; only the internals moved.
+  score_bug_fixture_result "$result" "$run_dir" "$must_file" "$defect_assertion" "$@"
+  case "$SCORE_OUTCOME" in
+    error)
+      echo "  [$slug] run $run_n: ERROR (${SCORE_DETAIL}) -- excluded from scoring"
       PAIR_RUN_OUTCOME="error"
-      return
-    elif [ "$any_yes" = "true" ]; then
-      is_hit="true"
-    fi
-  fi
-
-  if [ "$is_hit" = "true" ]; then
-    echo "  [$slug] run $run_n: HIT (verdict=$verdict)"
-    PAIR_RUN_OUTCOME="hit"
-  else
-    echo "  [$slug] run $run_n: miss (verdict=$verdict)"
-    PAIR_RUN_OUTCOME="miss"
-  fi
+      ;;
+    hit)
+      echo "  [$slug] run $run_n: HIT (verdict=$SCORE_VERDICT)"
+      PAIR_RUN_OUTCOME="hit"
+      ;;
+    miss)
+      echo "  [$slug] run $run_n: miss (verdict=$SCORE_VERDICT)"
+      PAIR_RUN_OUTCOME="miss"
+      ;;
+  esac
 }
 
 # run_pair_mode SLUG_A SLUG_B
@@ -2360,125 +2429,90 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
     verdict="$(printf '%s' "$result" | jq -r '.verdict.verdict')"
 
     if [ "$should_flag" = "true" ]; then
-      # Hit requires: some finding names must_file AND at least one keyword
-      # appears (case-insensitively) in THAT SAME finding's summary/evidence
-      # -- not just anywhere in the whole verdict -- so a lucky keyword match
-      # on an unrelated finding can't count. Computed exactly as before and
-      # NEVER skipped -- this is "lexical_hits" below (R5's new parallel
-      # metric), and the ONLY check run at all when it already hits, since a
-      # semantic judge_finding call costs a real API call this scoring
-      # should never spend when the cheap lexical check already succeeded.
-      file_hit="$(printf '%s' "$result" | jq -r --arg f "$must_file" '
-        [.verdict.findings[] | select(.file | contains($f))] | length > 0
-      ')"
-      lexical_hit="false"
-      if [ "$file_hit" = "true" ]; then
-        if [ "${#keywords[@]}" -eq 0 ]; then
-          lexical_hit="true"
-        else
-          for kw in "${keywords[@]}"; do
-            match="$(printf '%s' "$result" | jq -r --arg f "$must_file" --arg kw "$kw" '
-              [.verdict.findings[]
-               | select(.file | contains($f))
-               | select(((.summary // "") + " " + (.evidence // "")) | ascii_downcase | contains($kw | ascii_downcase))
-              ] | length > 0
-            ')"
-            if [ "$match" = "true" ]; then
-              lexical_hit="true"
-              break
-            fi
-          done
-        fi
+      # Shared scoring core (target-file match, lexical keyword match,
+      # semantic judge_finding fallback) extracted into
+      # score_bug_fixture_result -- see its own doc comment for why (a
+      # 2026-08-31 reassessment named this exact duplication against
+      # score_pair_member). $ok was already verified "true" above (shared
+      # with the should_flag=="false" branch), so SCORE_OUTCOME="error" here
+      # in practice only ever comes from the semantic-judge-failure path,
+      # never re-triggers the wrapper-failure path -- handled below anyway
+      # rather than assumed unreachable. result.json was already written to
+      # $run_dir/result.json above (unchanged, still each caller's own
+      # responsibility per the extraction's scope).
+      #
+      # A /cc round caught that `"${keywords[@]}"` on a genuinely-empty
+      # array (keywords_any is explicitly valid as null, leaving
+      # keywords=()) throws "keywords[@]: unbound variable" under this
+      # file's `set -u` on Bash 3.2 -- live-confirmed this is a real Bash
+      # 3.2 quirk: a NAMED array's `${arr[@]}` is never exempted from
+      # set -u even when empty, unlike the special-cased bare (unbraced)
+      # "$@", which IS always safe regardless of count (also live-
+      # confirmed, and why score_pair_member's own equivalent call two
+      # cases below never needed this guard). Splitting the call rather
+      # than expanding unconditionally avoids ever attempting the
+      # unsafe expansion at all when there are no keywords.
+      if [ "${#keywords[@]}" -eq 0 ]; then
+        score_bug_fixture_result "$result" "$run_dir" "$must_file" "$defect_assertion"
+      else
+        score_bug_fixture_result "$result" "$run_dir" "$must_file" "$defect_assertion" "${keywords[@]}"
       fi
-
-      if [ "$lexical_hit" = "true" ]; then
-        lexical_hits=$((lexical_hits + 1))
-        hits=$((hits + 1))
-        if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
-          # `.has_investigation_evidence` raw (no `// false`): a JSON null
-          # here means "unknown, capture failed" (see the write site's own
-          # comment) and must NOT collapse to false via `//`, which would
-          # silently count a lost artifact as a confirmed negative. Only an
-          # actual true/false increments the denominator; null (or a
-          # missing/unreadable file, read as empty string) is excluded
-          # entirely -- the same "never fold unknown into hit or miss"
-          # principle this file already applies to judge-call errors.
-          has_evidence="$(jq -r '.has_investigation_evidence' "$run_dir/investigation-evidence.json" 2>/dev/null)"
-          if [ "$has_evidence" = "true" ] || [ "$has_evidence" = "false" ]; then
-            INVESTIGATION_HIT_RUNS=$((INVESTIGATION_HIT_RUNS + 1))
-            [ "$has_evidence" = "true" ] && INVESTIGATION_HIT_RUNS_WITH_EVIDENCE=$((INVESTIGATION_HIT_RUNS_WITH_EVIDENCE + 1))
+      case "$SCORE_OUTCOME" in
+        hit)
+          if [ "$SCORE_HIT_KIND" = "lexical" ]; then
+            lexical_hits=$((lexical_hits + 1))
+            hits=$((hits + 1))
+            if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+              # `.has_investigation_evidence` raw (no `// false`): a JSON null
+              # here means "unknown, capture failed" (see the write site's own
+              # comment) and must NOT collapse to false via `//`, which would
+              # silently count a lost artifact as a confirmed negative. Only an
+              # actual true/false increments the denominator; null (or a
+              # missing/unreadable file, read as empty string) is excluded
+              # entirely -- the same "never fold unknown into hit or miss"
+              # principle this file already applies to judge-call errors.
+              has_evidence="$(jq -r '.has_investigation_evidence' "$run_dir/investigation-evidence.json" 2>/dev/null)"
+              if [ "$has_evidence" = "true" ] || [ "$has_evidence" = "false" ]; then
+                INVESTIGATION_HIT_RUNS=$((INVESTIGATION_HIT_RUNS + 1))
+                [ "$has_evidence" = "true" ] && INVESTIGATION_HIT_RUNS_WITH_EVIDENCE=$((INVESTIGATION_HIT_RUNS_WITH_EVIDENCE + 1))
+              fi
+            fi
+            echo "  run $run_n: HIT (verdict=$verdict, lexical keyword match)"
+          else
+            # Semantic-only hit: counts toward the combined hits/FIXTURE_HITS
+            # metric (lexical-or-semantic) but deliberately NOT toward
+            # lexical_hits/FIXTURE_LEXICAL_HITS, which must stay unaffected by
+            # this adjudication path.
+            hits=$((hits + 1))
+            if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
+              # See the lexical-hit site's identical comment: raw (no
+              # `// false`) so a null (capture failure) is excluded from the
+              # denominator rather than silently counted as a negative.
+              has_evidence="$(jq -r '.has_investigation_evidence' "$run_dir/investigation-evidence.json" 2>/dev/null)"
+              if [ "$has_evidence" = "true" ] || [ "$has_evidence" = "false" ]; then
+                INVESTIGATION_HIT_RUNS=$((INVESTIGATION_HIT_RUNS + 1))
+                [ "$has_evidence" = "true" ] && INVESTIGATION_HIT_RUNS_WITH_EVIDENCE=$((INVESTIGATION_HIT_RUNS_WITH_EVIDENCE + 1))
+              fi
+            fi
+            echo "  run $run_n: HIT (verdict=$verdict, semantic judge confirmed a differently-phrased match)"
           fi
-        fi
-        echo "  run $run_n: HIT (verdict=$verdict, lexical keyword match)"
-      elif [ "$file_hit" = "true" ]; then
-        # Lexical check missed, but at least one finding still named the
-        # right file -- the model was looking in the right place but didn't
-        # happen to use a keyword from keywords_any. Manual review of a full
-        # 63-run sweep found this produces FALSE misses: the model correctly
-        # identified (and in one case live-verified) the exact seeded bug,
-        # just phrased with a synonym (see the defect_assertion header
-        # comment above for the two concrete examples). Every finding on
-        # must_file is judged individually here, exactly mirroring the
-        # control-group loop's own per-finding pattern below -- the judge
-        # sees ONLY defect_assertion and that ONE finding's own
-        # summary+evidence, never keywords_any, never the other findings,
-        # never any other fixture metadata, so it is deciding narrowly
-        # "does this one finding identify this one described defect" and
-        # nothing broader (e.g. not "is this a good review overall").
-        matching_findings="$(printf '%s' "$result" | jq -c --arg f "$must_file" '
-          [.verdict.findings[] | select(.file | contains($f))]
-        ')"
-        judge_idx=0
-        any_yes="false"
-        any_error="false"
-        while IFS= read -r finding_json; do
-          judge_idx=$((judge_idx + 1))
-          finding_text="$(printf '%s' "$finding_json" | jq -r '(.summary // "") + "\n" + (.evidence // "")')"
-          judge_finding "has the following known defect" \
-            "$defect_assertion" \
-            "Does this finding identify the defect described above, even if phrased differently or using different terminology?" \
-            "$finding_text" \
-            "$run_dir/semantic-judge-${judge_idx}.prompt.txt" "$run_dir/semantic-judge-${judge_idx}.response.txt"
-          case "$JUDGE_VERDICT" in
-            yes) any_yes="true" ;;
-            error) any_error="true" ;;
-          esac
-        done < <(printf '%s' "$matching_findings" | jq -c '.[]')
-
-        if [ "$any_error" = "true" ]; then
+          ;;
+        miss)
+          echo "  run $run_n: miss (verdict=$verdict)"
+          ;;
+        error)
           # A judge-call failure/ambiguous-response is excluded from scoring
-          # entirely -- same treatment as an ok:false wrapper failure above
-          # and as the control-group path's own judge-error handling below --
-          # never silently folded into either "hit" (which would inflate
-          # recall) or "miss" (which would understate it). `valid` was
-          # already incremented above on the assumption this run would be
+          # entirely -- same treatment as an ok:false wrapper failure and as
+          # the control-group path's own judge-error handling below -- never
+          # silently folded into either "hit" (which would inflate recall)
+          # or "miss" (which would understate it). `valid` was already
+          # incremented above on the assumption this run would be
           # scoreable; undo that now that a judge error has made it not so.
-          echo "  run $run_n: ERROR (semantic judge call failed or gave a non-yes/no response) -- excluded from scoring"
+          echo "  run $run_n: ERROR (${SCORE_DETAIL}) -- excluded from scoring"
           errors=$((errors + 1))
           valid=$((valid - 1))
-        elif [ "$any_yes" = "true" ]; then
-          # Semantic-only hit: counts toward the combined hits/FIXTURE_HITS
-          # metric (lexical-or-semantic) but deliberately NOT toward
-          # lexical_hits/FIXTURE_LEXICAL_HITS, which must stay unaffected by
-          # this adjudication path.
-          hits=$((hits + 1))
-          if [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ]; then
-            # See the lexical-hit site's identical comment: raw (no
-            # `// false`) so a null (capture failure) is excluded from the
-            # denominator rather than silently counted as a negative.
-            has_evidence="$(jq -r '.has_investigation_evidence' "$run_dir/investigation-evidence.json" 2>/dev/null)"
-            if [ "$has_evidence" = "true" ] || [ "$has_evidence" = "false" ]; then
-              INVESTIGATION_HIT_RUNS=$((INVESTIGATION_HIT_RUNS + 1))
-              [ "$has_evidence" = "true" ] && INVESTIGATION_HIT_RUNS_WITH_EVIDENCE=$((INVESTIGATION_HIT_RUNS_WITH_EVIDENCE + 1))
-            fi
-          fi
-          echo "  run $run_n: HIT (verdict=$verdict, semantic judge confirmed a differently-phrased match)"
-        else
-          echo "  run $run_n: miss (verdict=$verdict)"
-        fi
-      else
-        echo "  run $run_n: miss (verdict=$verdict)"
-      fi
+          ;;
+      esac
     else
       # Control group ("seeded-bug false-report rate", not a generic
       # "no findings at all" bar): a finding on must_file is only a false
