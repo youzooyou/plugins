@@ -45,6 +45,12 @@ cross-verification — this is the lightweight, single-shot version.
    - `"ok":true` → present `verdict.verdict` and `verdict.findings` (file, line if present,
      severity if present, summary, evidence, verification), most severe first. If `findings` is
      empty, say so explicitly.
+   - `verdict.dimensions` is a per-dimension review-completion ledger (correctness, security,
+     performance, reuse, contracts, resources_concurrency, intent — each with a `status` of
+     `checked`/`not_applicable`/`blocked` and an `evidence` string). Normally no need to surface
+     this to the user unless something is `blocked` (the model tried to check that dimension but
+     genuinely could not) — mention that explicitly, the same way a partial `coverage.source` gets
+     flagged below, since it means the review has a known gap.
    - **Check for a top-level `coverage.source` object** (present only for `--uncommitted`; absent
      for `--base`/`--commit`). If `coverage.source.status` is `"partial"`, say so **prominently,
      before or alongside the verdict** — e.g. "⚠️ Source coverage partial: N file(s) were not fully

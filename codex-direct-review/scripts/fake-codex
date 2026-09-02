@@ -54,7 +54,22 @@ fi
 case "${FAKE_CODEX_MODE:-good}" in
   good)
     echo '{"type":"turn.completed","usage":{}}'
-    printf '%s' "${FAKE_CODEX_RESPONSE:-{\"verdict\":\"CLEAN\",\"findings\":[],\"summary\":null}}" > "$OUTFILE"
+    # Default response is fed through the real wrapper's real judge_result
+    # inside run_integration_selftest, so it needs a schema-valid
+    # dimensions ledger too, or every happy-path integration case would
+    # start failing on schema_mismatch once judge_result requires it.
+    #
+    # DEFAULT_RESPONSE is its own variable, not an inline literal default
+    # (`${FAKE_CODEX_RESPONSE:-{...}}`) -- live-confirmed bash's `${VAR:-word}`
+    # brace-counts literal `{`/`}` characters WITHIN the default word itself
+    # to find where the expansion ends, and with multiple sibling `{...}`
+    # groups (one per dimension, not nested inside each other) that counting
+    # terminates the expansion partway through, silently truncating the
+    # JSON (confirmed: it stopped right after the first dimension's closing
+    # brace). A default that is a plain variable REFERENCE has no such
+    # literal braces for bash to miscount.
+    DEFAULT_RESPONSE='{"verdict":"CLEAN","findings":[],"summary":null,"dimensions":{"correctness":{"status":"checked","evidence":"reviewed the change"},"security":{"status":"checked","evidence":"reviewed the change"},"performance":{"status":"checked","evidence":"reviewed the change"},"reuse":{"status":"checked","evidence":"reviewed the change"},"contracts":{"status":"checked","evidence":"reviewed the change"},"resources_concurrency":{"status":"checked","evidence":"reviewed the change"},"intent":{"status":"checked","evidence":"reviewed the change"}}}'
+    printf '%s' "${FAKE_CODEX_RESPONSE:-$DEFAULT_RESPONSE}" > "$OUTFILE"
     exit 0
     ;;
   malformed)

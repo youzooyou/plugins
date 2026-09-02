@@ -18,8 +18,78 @@
         "additionalProperties": false
       }
     },
-    "summary": { "type": ["string", "null"] }
+    "summary": { "type": ["string", "null"] },
+    "dimensions": {
+      "type": "object",
+      "properties": {
+        "correctness": {
+          "type": "object",
+          "properties": {
+            "status": { "type": "string", "enum": ["checked", "not_applicable", "blocked"] },
+            "evidence": { "type": "string" }
+          },
+          "required": ["status", "evidence"],
+          "additionalProperties": false
+        },
+        "security": {
+          "type": "object",
+          "properties": {
+            "status": { "type": "string", "enum": ["checked", "not_applicable", "blocked"] },
+            "evidence": { "type": "string" }
+          },
+          "required": ["status", "evidence"],
+          "additionalProperties": false
+        },
+        "performance": {
+          "type": "object",
+          "properties": {
+            "status": { "type": "string", "enum": ["checked", "not_applicable", "blocked"] },
+            "evidence": { "type": "string" }
+          },
+          "required": ["status", "evidence"],
+          "additionalProperties": false
+        },
+        "reuse": {
+          "type": "object",
+          "properties": {
+            "status": { "type": "string", "enum": ["checked", "not_applicable", "blocked"] },
+            "evidence": { "type": "string" }
+          },
+          "required": ["status", "evidence"],
+          "additionalProperties": false
+        },
+        "contracts": {
+          "type": "object",
+          "properties": {
+            "status": { "type": "string", "enum": ["checked", "not_applicable", "blocked"] },
+            "evidence": { "type": "string" }
+          },
+          "required": ["status", "evidence"],
+          "additionalProperties": false
+        },
+        "resources_concurrency": {
+          "type": "object",
+          "properties": {
+            "status": { "type": "string", "enum": ["checked", "not_applicable", "blocked"] },
+            "evidence": { "type": "string" }
+          },
+          "required": ["status", "evidence"],
+          "additionalProperties": false
+        },
+        "intent": {
+          "type": "object",
+          "properties": {
+            "status": { "type": "string", "enum": ["checked", "not_applicable", "blocked"] },
+            "evidence": { "type": "string" }
+          },
+          "required": ["status", "evidence"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["correctness", "security", "performance", "reuse", "contracts", "resources_concurrency", "intent"],
+      "additionalProperties": false
+    }
   },
-  "required": ["verdict", "findings", "summary"],
+  "required": ["verdict", "findings", "summary", "dimensions"],
   "additionalProperties": false
 }
