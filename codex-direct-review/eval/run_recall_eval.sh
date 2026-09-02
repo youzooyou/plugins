@@ -1353,23 +1353,41 @@ run_judge_calibration() {
   CAL_EXPECTED[4]="no"
   CAL_LABEL[4]="constructed unrelated-finding negative"
 
-  CAL_CONTEXT_LABEL[5]="is protected by the following safeguard, already verified correct"
+  # This wording (context_label + question, cases 5-7, kept byte-identical
+  # to the one real production call site that uses this framing --
+  # eval/run_recall_eval.sh's control-group scoring branch) replaced an
+  # earlier version after a real N=10 --calibrate-judge run measured case
+  # 6 at only 2/10 (20%) agreement -- a real judge-behavior gap flagged in
+  # commit 41a2e55 and left unaddressed until now. Root cause (found via
+  # minimal-pair analysis against case 5, which shares an IDENTICAL
+  # context_label/assertion/question and differs only in finding_text/
+  # expected): the old context_label's "already verified correct" phrase
+  # anchored the judge to defend the assertion as settled fact, so a
+  # finding disputing it via a DIFFERENT, unnamed function and IMPLICIT
+  # evidence (never echoing the assertion's own words like "mutex"/
+  # "lock") was misread as off-topic rather than as disputing evidence.
+  # Fixed by (a) dropping the anchoring "already verified correct" phrase
+  # from context_label, and (b) making explicit in the question that an
+  # implicit dispute counts, and that a different named function/path
+  # still counts as disputing evidence. Re-calibrated after this change --
+  # see this commit's message for the resulting numbers.
+  CAL_CONTEXT_LABEL[5]="is claimed to be protected by the following safeguard"
   CAL_ASSERTION[5]="concurrent writes to the cache's underlying map are serialized by a mutex held around every read-modify-write, preventing a data race between goroutines"
-  CAL_QUESTION[5]="Does this finding claim that the stated safeguard is missing, broken, or ineffective?"
+  CAL_QUESTION[5]="Does this finding describe or imply any way the stated safeguard could fail to actually apply or protect against the described risk -- even if the finding does not use words like missing, broken, or ineffective, and even if it discusses a different specific function, code path, or scenario than the one named in the safeguard claim?"
   CAL_FINDING_TEXT[5]="This implementation correctly guards every read-modify-write access to the map with c.mu.Lock() and c.mu.Unlock(), so there is no data race between the concurrent goroutines here."
   CAL_EXPECTED[5]="no"
   CAL_LABEL[5]="constructed safeguard-confirmed negative"
 
-  CAL_CONTEXT_LABEL[6]="is protected by the following safeguard, already verified correct"
+  CAL_CONTEXT_LABEL[6]="is claimed to be protected by the following safeguard"
   CAL_ASSERTION[6]="concurrent writes to the cache's underlying map are serialized by a mutex held around every read-modify-write, preventing a data race between goroutines"
-  CAL_QUESTION[6]="Does this finding claim that the stated safeguard is missing, broken, or ineffective?"
+  CAL_QUESTION[6]="Does this finding describe or imply any way the stated safeguard could fail to actually apply or protect against the described risk -- even if the finding does not use words like missing, broken, or ineffective, and even if it discusses a different specific function, code path, or scenario than the one named in the safeguard claim?"
   CAL_FINDING_TEXT[6]="IncrementAll spawns goroutines that write to c.data[key]++ with no synchronization at all -- this is a data race that can corrupt the map or crash the program with Go's concurrent map write detector."
   CAL_EXPECTED[6]="yes"
   CAL_LABEL[6]="constructed safeguard-disputed positive"
 
-  CAL_CONTEXT_LABEL[7]="is protected by the following safeguard, already verified correct"
+  CAL_CONTEXT_LABEL[7]="is claimed to be protected by the following safeguard"
   CAL_ASSERTION[7]="VALID_TIERS is a small, fixed-size (4-entry) constant catalog that never grows with user input scale, so the linear membership scan here is effectively O(1) in practice and does not need to be converted to a set for performance."
-  CAL_QUESTION[7]="Does this finding claim that the stated safeguard is missing, broken, or ineffective?"
+  CAL_QUESTION[7]="Does this finding describe or imply any way the stated safeguard could fail to actually apply or protect against the described risk -- even if the finding does not use words like missing, broken, or ineffective, and even if it discusses a different specific function, code path, or scenario than the one named in the safeguard claim?"
   CAL_FINDING_TEXT[7]=$'The publicly exported mutable list lets any importer change the supposedly fixed set of valid tiers at runtime.\n`is_valid_tier` directly evaluates membership in VALID_TIERS; after tier_catalog.VALID_TIERS.append("attacker-tier"), is_valid_tier("attacker-tier") returns True. This contradicts the function\'s documented fixed known-tier set.'
   CAL_EXPECTED[7]="ambiguous"
   CAL_LABEL[7]="fixture-24 mutability, DELIBERATELY AMBIGUOUS"
@@ -2645,9 +2663,16 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
         while IFS= read -r finding_json; do
           judge_idx=$((judge_idx + 1))
           finding_text="$(printf '%s' "$finding_json" | jq -r '(.summary // "") + "\n" + (.evidence // "")')"
-          judge_finding "is protected by the following safeguard, already verified correct" \
+          # This exact context_label/question wording is calibrated by
+          # run_judge_calibration's cases 5-7 -- see that function's own
+          # doc comment for why this specific phrasing was chosen (fixes a
+          # measured 2/10 judge weakness on disputing findings). Keep
+          # byte-identical to those cases; a wording change here without
+          # also updating the calibration cases would make the calibration
+          # numbers describe a prompt this call site no longer sends.
+          judge_finding "is claimed to be protected by the following safeguard" \
             "$safeguard_assertion" \
-            "Does this finding claim that the stated safeguard is missing, broken, or ineffective?" \
+            "Does this finding describe or imply any way the stated safeguard could fail to actually apply or protect against the described risk -- even if the finding does not use words like missing, broken, or ineffective, and even if it discusses a different specific function, code path, or scenario than the one named in the safeguard claim?" \
             "$finding_text" \
             "$run_dir/judge-${judge_idx}.prompt.txt" "$run_dir/judge-${judge_idx}.response.txt"
           case "$JUDGE_VERDICT" in
