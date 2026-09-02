@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Test double for the real `codex` CLI, used only by
+# run-codex-review.sh's --selftest-integration suite (never installed
+# anywhere a real invocation would find it -- a test harness prepends its
+# directory to PATH for the duration of one subprocess call only).
+#
+# Mimics just enough of `codex exec`'s interface for that purpose: reads
+# --output-last-message to learn where to write its "final message" file,
+# ignores every other argument (the wrapper's own argv to codex is fixed
+# and not something a test needs to intercept), and behaves according to
+# $FAKE_CODEX_MODE so the SAME script drives every integration test case.
+set -u
+
+# A /cc round pointed out this test double parsed only --output-last-message
+# and silently discarded every other argument, so nothing in the integration
+# suite ever verified the wrapper actually passes its security- and
+# contract-critical flags to codex (--sandbox read-only, --output-schema,
+# --json, --ephemeral, the reasoning-effort override) -- a regression
+# dropping --sandbox read-only (weakening the write boundary) or
+# --output-schema (weakening structured-output enforcement) would stay
+# invisible to every case here, since only output/prompt content was ever
+# checked. Captures the full original argv (one arg per line, so a test
+# case can grep for exact flag tokens) to $FAKE_CODEX_CAPTURE_ARGV_TO when
+# set, BEFORE the loop below consumes "$@" via shift. A no-op otherwise.
+if [ -n "${FAKE_CODEX_CAPTURE_ARGV_TO:-}" ]; then
+  printf '%s\n' "$@" > "$FAKE_CODEX_CAPTURE_ARGV_TO"
+fi
+
+OUTFILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output-last-message)
+      OUTFILE="$2"; shift 2 ;;
+    *)
+      shift ;;
+  esac
+done
+
+# A /cc round pointed out that always returning the same fixed response
+# regardless of what the wrapper actually sent meant every scope/coverage
+# integration case could pass even if the wrapper delivered an empty,
+# wrong, or truncated diff -- a real diff-collection regression (wrong
+# ref, dropped scope, etc.) would silently produce identical, still-CLEAN
+# results. Captures the real codex CLI's own stdin contract (the whole
+# prompt, piped in via the wrapper's `< "$PROMPT_FILE"`) to
+# $FAKE_CODEX_CAPTURE_PROMPT_TO when a test case sets it, so that case can
+# assert on the ACTUAL diff content that reached this point, not just on
+# whether the overall call succeeded. A no-op for cases that don't set it.
+PROMPT_TEXT="$(cat)"
+if [ -n "${FAKE_CODEX_CAPTURE_PROMPT_TO:-}" ]; then
+  printf '%s' "$PROMPT_TEXT" > "$FAKE_CODEX_CAPTURE_PROMPT_TO"
+fi
+
+case "${FAKE_CODEX_MODE:-good}" in
+  good)
+    echo '{"type":"turn.completed","usage":{}}'
+    printf '%s' "${FAKE_CODEX_RESPONSE:-{\"verdict\":\"CLEAN\",\"findings\":[],\"summary\":null}}" > "$OUTFILE"
+    exit 0
+    ;;
+  malformed)
+    echo '{"type":"turn.completed","usage":{}}'
+    printf 'not json' > "$OUTFILE"
+    exit 0
+    ;;
+  nonzero)
+    echo '{"type":"turn.started"}'
+    exit 1
+    ;;
+  hang)
+    # Spawns a background child before sleeping itself, mimicking the real
+    # codex CLI's own Node-wrapper-plus-MCP-host child process -- the
+    # timeout integration test needs a live descendant process to verify
+    # the wrapper's process-GROUP kill actually reaches children, not just
+    # this top-level PID (which a single-process fake could never
+    # distinguish from a plain same-PID kill).
+    sleep 999999 &
+    echo "$!" > "${FAKE_CODEX_CHILD_PID_FILE:-/dev/null}"
+    wait
+    ;;
+  *)
+    echo "fake-codex: unknown FAKE_CODEX_MODE: ${FAKE_CODEX_MODE:-}" >&2
+    exit 127
+    ;;
+esac

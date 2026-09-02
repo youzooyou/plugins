@@ -999,8 +999,548 @@ printf 'x')"
   fi
 }
 
+# _integration_require_nonempty VALUE LABEL -> prints a clear error naming
+# LABEL and returns 1 if VALUE is empty, else returns 0 silently.
+#
+# A /cc round LIVE-REPRODUCED a genuinely dangerous failure mode in a
+# sandboxed environment: `mktemp -d`'s result was never checked, so when it
+# failed (permission denied) the resulting empty string flowed straight
+# into `git -C "$dir" init/config`. Git treats `-C ""` as "the current
+# directory" -- NOT an error -- so those calls (and the caller's later
+# add/commit) silently targeted the REAL invoking checkout instead of an
+# isolated temp dir; Codex's own run showed git attempting to lock this
+# actual plugins repo's `.git/config` and `.git/index.lock`. Since this
+# script has no `set -e`, nothing else would have stopped that. Every
+# mktemp/mktemp -d result in this whole suite is routed through this check
+# before anything uses it as a path, and every call site aborts the ENTIRE
+# integration selftest (`return 1`) on failure rather than trying to
+# continue -- a systemic mktemp failure is not something later cases could
+# safely work around either.
+_integration_require_nonempty() {
+  if [ -z "$1" ]; then
+    echo "run_integration_selftest: $2 -- aborting rather than risk operating on an unintended path" >&2
+    return 1
+  fi
+  return 0
+}
+
+# _integration_test_repo -> creates and prints the path to a fresh temp
+# git repo (init + user.email/user.name only, no commit) for
+# run_integration_selftest's cases to build on. Caller is responsible for
+# rm -rf'ing the printed path when done, and MUST check the printed value
+# is non-empty (via _integration_require_nonempty) before using it -- this
+# function itself has no way to abort the caller's flow if mktemp fails.
+#
+# Relies on bash's dynamic scoping to see the CALLER's local
+# $git_isolated_env array (run_integration_selftest declares it before
+# calling this) -- deliberate, not an oversight: this helper only exists
+# to serve that one function, and threading an array through explicit
+# function arguments in bash 3.2 is far more awkward than the one
+# documented implicit dependency this creates. See run_integration_selftest
+# for why every git call needs this isolation.
+_integration_test_repo() {
+  local dir
+  dir="$(mktemp -d)"
+  if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+    return 0
+  fi
+  # A /cc round pointed out these three calls were unchecked -- if `git
+  # init`/`config` ever failed, the function still printed $dir as if it
+  # were a valid, ready-to-use repo. Returning early (without printing
+  # anything) on any failure means the caller's EXISTING
+  # _integration_require_nonempty check on the captured value already
+  # catches this correctly, with no new caller-side code needed.
+  #
+  # A LATER /cc round then proved that early return alone still leaks
+  # $dir itself: mktemp above already succeeded (a real directory exists
+  # on disk) by the time any of these three calls could fail, but since
+  # this function returns WITHOUT ever printing $dir on that path, the
+  # caller's own repo variable stays empty and its RETURN trap -- which
+  # can only remove paths it actually learned about -- has nothing to
+  # clean up. The path is not lost to the trap by design; it never had a
+  # chance to see it. Fixed at the source instead: this function cleans
+  # up its OWN allocated directory before returning on any of these three
+  # failures, rather than relying on a caller that structurally cannot
+  # ever learn the path in this failure mode.
+  "${git_isolated_env[@]}" git -C "$dir" init -q || { rm -rf "$dir"; return 1; }
+  "${git_isolated_env[@]}" git -C "$dir" config user.email "test@example.com" || { rm -rf "$dir"; return 1; }
+  "${git_isolated_env[@]}" git -C "$dir" config user.name "test" || { rm -rf "$dir"; return 1; }
+  printf '%s' "$dir"
+}
+
+# _integration_git REPO ARGS... -> runs an isolated git command against
+# REPO; on failure, prints a clear error and returns 1. A /cc round
+# pointed out every fixture-setup git call in run_integration_selftest was
+# unchecked: if `git add`/`git commit` ever silently failed, a file meant
+# to become tracked-then-edited would stay untracked instead, and the
+# untracked-file collector would independently pick up its content and
+# count it -- letting a case's assertions still pass without ever
+# exercising the TRACKED-diff (or unborn-HEAD staged-plus-worktree) code
+# path it claims to test. Every fixture git call now aborts the whole
+# suite loudly instead of continuing into that silently-wrong state. Same
+# dynamic-scoping dependency on the caller's $git_isolated_env as
+# _integration_test_repo above.
+_integration_git() {
+  local repo="$1"
+  shift
+  "${git_isolated_env[@]}" git -C "$repo" "$@" \
+    || { echo "run_integration_selftest: git $* (in $repo) failed unexpectedly during fixture setup -- aborting" >&2; return 1; }
+}
+
+# run_integration_selftest -- black-box, end-to-end tests driving the
+# script's ACTUAL top-level flow (argument parsing, scope-specific git
+# diff/untracked-file collection -- including the unborn-HEAD special
+# case, prompt building, spawning `codex` as a REAL subprocess, the
+# deadline-poll timeout loop, process-group kill, reading codex's actual
+# output files, judge_result, final JSON print) through a fake `codex` CLI
+# substituted via PATH -- never through direct function calls the way
+# run_selftest's unit-level cases do. A 2026-08-31 reassessment named this
+# exact gap: "no deterministic end-to-end fake-Codex test for scope
+# collection, unborn HEAD, timeout handling, malformed model output, or
+# coverage propagation through the complete wrapper."
+#
+# Kept as a SEPARATE suite/flag from --selftest, not merged into it:
+# run_selftest is fast and dependency-free (pure function calls against
+# hand-crafted fixture files), while this one spawns real git repos and
+# real subprocesses with real sleeps -- splitting them means routine
+# --selftest runs stay fast, and this heavier suite is opt-in.
+run_integration_selftest() {
+  local fail=0
+  local fake_codex_dir wrapper out wrapper_exit repo sha_base sha_commit sha_diverged_base child_pid_file child_pid captured_prompt captured_argv expected_argv_prefix
+  local fake_git_home git_isolated_env wrapper_isolated_env
+  # A /cc round pointed out every early `return 1` added by prior rounds'
+  # fixes (mktemp validation, fixture git-failure checks) leaks whatever
+  # temp resources had already been created by that point: this function's
+  # own cleanup previously only ran on its normal end (and each case's own
+  # cleanup only after that case fully completed), and --selftest-integration
+  # exits long before the production script's own EXIT trap/
+  # TEMP_FILE_REGISTRY mechanism is ever installed (that happens much later,
+  # after argument parsing this dispatch never reaches). A local RETURN
+  # trap -- confirmed live to fire exactly once, only for THIS function's
+  # own return, on every path including an early `return 1`, and never for
+  # a called-and-returned helper like _integration_git -- cleans up every
+  # resource that MIGHT exist by then. Each rm is guarded by a nonempty
+  # check so it is a safe no-op both before that variable is ever assigned
+  # (avoiding an "unbound variable" reference under `set -u`) and on the
+  # normal path, where each case has typically already removed its own
+  # $repo/$captured_prompt/etc. by the time this fires.
+  trap '
+    [ -n "${captured_prompt:-}" ] && rm -f "$captured_prompt"
+    [ -n "${captured_argv:-}" ] && rm -f "$captured_argv"
+    [ -n "${child_pid_file:-}" ] && rm -f "$child_pid_file"
+    [ -n "${repo:-}" ] && rm -rf "$repo"
+    [ -n "${fake_codex_dir:-}" ] && rm -rf "$fake_codex_dir"
+    [ -n "${fake_git_home:-}" ] && rm -rf "$fake_git_home"
+  ' RETURN
+  fake_codex_dir="$(mktemp -d)"
+  _integration_require_nonempty "$fake_codex_dir" "could not create temp dir for fake-codex (mktemp -d failed)" || return 1
+  [ -d "$fake_codex_dir" ] || { echo "run_integration_selftest: mktemp -d for fake-codex reported a path that does not exist -- aborting" >&2; return 1; }
+  # A /cc round pointed out this whole suite's "deterministic, never touches
+  # the real API" premise depends entirely on this staging step actually
+  # succeeding: if `cp`/`chmod` ever silently failed (both were previously
+  # unchecked), `$fake_codex_dir/codex` would not exist, and every wrapper
+  # invocation below (which only PREPENDS $fake_codex_dir to PATH, never
+  # replaces it) would fall through to resolve `codex` from whatever comes
+  # NEXT on PATH -- Codex proved a REAL codex CLI is actually installed and
+  # resolvable on this exact machine (via nvm), so this was not a
+  # theoretical gap. The final `[ -x ... ]` check is a positive
+  # confirmation on top of cp/chmod's own exit codes -- the strongest
+  # available guarantee, checked once here, that nothing below can ever
+  # silently escalate into a real API call.
+  cp "$SCRIPT_DIR/fake-codex" "$fake_codex_dir/codex" \
+    || { echo "run_integration_selftest: could not stage fake-codex into $fake_codex_dir/codex -- aborting rather than risk falling through to a real codex CLI on PATH" >&2; return 1; }
+  chmod +x "$fake_codex_dir/codex" \
+    || { echo "run_integration_selftest: could not chmod +x the staged fake-codex -- aborting rather than risk falling through to a real codex CLI on PATH" >&2; return 1; }
+  [ -x "$fake_codex_dir/codex" ] \
+    || { echo "run_integration_selftest: staged fake-codex at $fake_codex_dir/codex is not executable after chmod -- aborting rather than risk falling through to a real codex CLI on PATH" >&2; return 1; }
+  wrapper="$SCRIPT_DIR/run-codex-review.sh"
+
+  # Matches eval/run_recall_eval.sh's own established `env -i` allowlist
+  # for every git call against a throwaway temp repo (see that file's own
+  # extensive comment history: three separate rounds each found ANOTHER
+  # inherited git-related environment variable -- GIT_DIR/GIT_WORK_TREE/
+  # GIT_INDEX_FILE, then GIT_CONFIG_COUNT/KEY_N/VALUE_N/PARAMETERS, then
+  # GIT_CONFIG_GLOBAL/SYSTEM/TEMPLATE_DIR -- before switching to this
+  # allowlist so nothing not explicitly let through survives at all). A
+  # /cc round pointed out this suite's own temp repos had NO such
+  # isolation, unlike every other place in this project that creates one.
+  # One shared fake HOME/env for this whole function's lifetime (not one
+  # per repo) -- these are single-use, single-test-run repos with no
+  # meaningful isolation need BETWEEN them, only from the ambient
+  # environment. --no-verify on every commit below is the same belt-and-
+  # suspenders documented in run_recall_eval.sh: a second, git-documented
+  # layer on top of this env-var isolation, not a substitute for it.
+  fake_git_home="$(mktemp -d)"
+  _integration_require_nonempty "$fake_git_home" "could not create temp HOME dir (mktemp -d failed)" || return 1
+  [ -d "$fake_git_home" ] || { echo "run_integration_selftest: mktemp -d for fake HOME reported a path that does not exist -- aborting" >&2; return 1; }
+  git_isolated_env=(env -i "PATH=$PATH" "HOME=$fake_git_home" "GIT_CONFIG_NOSYSTEM=1")
+
+  # A /cc round pointed out that the isolation above only ever wrapped this
+  # SUITE's own fixture-setup git calls (init/add/commit) -- every
+  # invocation of the WRAPPER ITSELF only set PATH and FAKE_CODEX_* vars,
+  # leaving the wrapper's OWN internal git calls (its `git diff`/`git show`,
+  # e.g. run-codex-review.sh:1549,1679,1691-1695) exposed to whatever
+  # GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/config-injection vars happen to be
+  # in the ambient environment this suite runs under. `env -i` reset plus
+  # this exact allowlist (verified sufficient: grepped this whole script for
+  # every externally-inherited env var it reads -- only $PATH; everything
+  # else is a local the script itself sets) closes that gap the identical
+  # way the fixture-setup calls above already are closed. FAKE_CODEX_* vars
+  # are added per invocation below since they vary per case.
+  wrapper_isolated_env=(env -i "PATH=$fake_codex_dir:$PATH" "HOME=$fake_git_home" "GIT_CONFIG_NOSYSTEM=1")
+
+  # Case 1: --uncommitted scope, happy path. Also exercises coverage
+  # propagation end-to-end (the reassessment's own named gap) -- unlike
+  # run_selftest's own coverage cases, which only ever set
+  # $SOURCE_COVERAGE_JSON by hand, this lets the REAL collector populate
+  # it via a real uncommitted tracked edit plus one real untracked file.
+  repo="$(_integration_test_repo)"
+  _integration_require_nonempty "$repo" "could not create isolated test repo for the uncommitted happy-path case" || return 1
+  echo "line one" > "$repo/tracked.txt"
+  _integration_git "$repo" add tracked.txt || return 1
+  _integration_git "$repo" commit -q --no-verify -m "initial" || return 1
+  echo "line two" >> "$repo/tracked.txt"
+  echo "new file" > "$repo/untracked.txt"
+  captured_prompt="$(mktemp)"
+  _integration_require_nonempty "$captured_prompt" "could not create temp file to capture the prompt (uncommitted happy-path case)" || return 1
+  captured_argv="$(mktemp)"
+  _integration_require_nonempty "$captured_argv" "could not create temp file to capture codex's argv (uncommitted happy-path case)" || return 1
+  out="$("${wrapper_isolated_env[@]}" FAKE_CODEX_MODE=good FAKE_CODEX_CAPTURE_PROMPT_TO="$captured_prompt" FAKE_CODEX_CAPTURE_ARGV_TO="$captured_argv" "$wrapper" --cwd "$repo" --uncommitted --focus "test")"
+  wrapper_exit=$?
+  # A /cc round pointed out none of this suite's assertions ever checked the
+  # wrapper's own PROCESS exit status, only its stdout JSON -- so a
+  # regression making a successful review exit non-zero, or a failure path
+  # exit 0, would pass unnoticed. The wrapper's exit convention is
+  # exhaustive and uniform throughout the whole script (confirmed by
+  # reading every exit call site): 0 iff ok:true, 1 iff ok:false -- so every
+  # case below asserts $wrapper_exit against exactly that.
+  [ "$wrapper_exit" -eq 0 ] \
+    || { echo "FAIL: uncommitted happy-path case exit status: expected 0 (ok:true), got $wrapper_exit"; fail=1; }
+  echo "$out" | jq -e '.ok == true and .verdict.verdict == "CLEAN"' >/dev/null 2>&1 \
+    || { echo "FAIL: uncommitted happy-path case: $out"; fail=1; }
+  # A /cc round pointed out checking only coverage field TYPES (not values)
+  # lets a regression that drops the tracked-file count (e.g. line
+  # 1793-1794's merge) or reports "partial" instead of "complete" pass
+  # silently. This fixture creates exactly one changed tracked file and one
+  # untracked file, so the true expected coverage is exact and known: 2
+  # reviewed files, nothing omitted, status complete -- matching the same
+  # exact-value style run_selftest's own coverage cases already use.
+  echo "$out" | jq -e '.coverage.source.reviewed_file_count == 2 and .coverage.source.status == "complete" and .coverage.source.omitted == []' >/dev/null 2>&1 \
+    || { echo "FAIL: uncommitted happy-path case coverage mismatch (expected reviewed_file_count=2, status=complete, omitted=[]): $out"; fail=1; }
+  # A /cc round pointed out fake-codex previously discarded every argument
+  # except --output-last-message, so nothing here ever verified the wrapper
+  # actually passes its security- and contract-critical flags to codex
+  # (production's real invocation: --ephemeral --sandbox read-only
+  # --skip-git-repo-check --json -c model_reasoning_effort="xhigh"
+  # --output-schema "$SCHEMA" --output-last-message "$OUTFILE") -- a
+  # regression dropping --sandbox read-only (weakening the write boundary)
+  # or --output-schema (weakening structured-output enforcement) would have
+  # stayed invisible to every case in this suite.
+  #
+  # A LATER /cc round then proved that checking each token's presence
+  # INDEPENDENTLY (the original version here) cannot detect a broken
+  # option/value PAIRING: "--sandbox" appearing somewhere and "read-only"
+  # appearing somewhere else in argv both pass even if they are not
+  # adjacent, and nothing confirmed --output-schema's VALUE is the real
+  # schema path rather than some other file -- production could swap in a
+  # wrong schema and every check here would stay green. Reading the line
+  # immediately AFTER each flag (argv is captured one arg per line, so
+  # adjacency in the file mirrors adjacency in the real argv) and comparing
+  # it to the exact expected value closes that gap. $SCHEMA is the same
+  # global this script computes for itself at the top from its own
+  # $SCRIPT_DIR -- since $wrapper is this exact file re-invoked, it
+  # resolves to an identical path when the wrapper runs, so comparing
+  # against it here (rather than hardcoding a path) stays correct even if
+  # the schema file is ever relocated.
+  #
+  # A STILL LATER /cc round proved even the pairing check above has a gap:
+  # `grep -A 1 ... | tail -n 1` takes the LAST matched pair when a flag
+  # appears more than once, so a regression that PREPENDS a conflicting
+  # earlier occurrence (e.g. "--sandbox workspace-write" ahead of the real
+  # "--sandbox read-only") stays invisible -- the correct pair is still the
+  # final one grep finds. Also, nothing asserted `exec` itself is the first
+  # argv element, so dropping the subcommand entirely left every flag-based
+  # assertion unaffected.
+  #
+  # A YET FURTHER /cc round then proved that even THAT (argv[0] + per-flag
+  # presence/pairing/exactly-once checks) still cannot catch an EXTRA
+  # appended argument that doesn't collide with any single check: the real
+  # `codex exec` CLI accepts `--dangerously-bypass-approvals-and-sandbox`
+  # (Codex live-verified this overrides the sandbox and still exits 0), and
+  # appending it alongside every correct expected flag would pass every
+  # individual presence/pairing/count check above while actually disabling
+  # the read-only sandbox in production. Each new fix in this comment
+  # history closed one specific bypass but left room for the next one --
+  # the only check that closes the whole CLASS of "unexpected argument
+  # anywhere" bugs is asserting the COMPLETE, EXACT, ORDERED argv, not
+  # accumulating more partial per-flag assertions. Replaces every check
+  # above with: an exact line-count (rejects anything extra OR missing),
+  # plus an exact line-for-line match of every argument except the very
+  # last (--output-last-message's own file-path value, which is a runtime-
+  # generated mktemp path this test cannot predict -- its mere presence as
+  # a plausible-looking temp path, positioned at the one place the wrapper
+  # actually reads its result from afterward, is already exercised by the
+  # surrounding assertions succeeding at all).
+  expected_argv_prefix=$'exec\n--ephemeral\n--sandbox\nread-only\n--skip-git-repo-check\n--json\n-c\nmodel_reasoning_effort=xhigh\n--output-schema\n'"$SCHEMA"$'\n--output-last-message'
+  [ "$(wc -l < "$captured_argv" | tr -d ' ')" -eq 12 ] \
+    || { echo "FAIL: uncommitted happy-path case: codex argv has $(wc -l < "$captured_argv" | tr -d ' ') arguments, expected exactly 12 -- an unexpected extra or missing argument (e.g. a sandbox-bypass flag) changes this count"; fail=1; }
+  [ "$(head -n 11 "$captured_argv")" = "$expected_argv_prefix" ] \
+    || { echo "FAIL: uncommitted happy-path case: codex argv[0..10] does not exactly match the expected sequence (extra, missing, reordered, or substituted arguments)"; fail=1; }
+  grep -qxF -- "--output-last-message" "$captured_argv" \
+    || { echo "FAIL: uncommitted happy-path case: codex argv is missing --output-last-message"; fail=1; }
+  rm -f "$captured_argv"
+  # A /cc round pointed out that checking only ok:true/coverage TYPES lets
+  # a real diff-collection regression (wrong ref, dropped scope, empty
+  # diff) pass silently, since the fake always returns the same fixed
+  # CLEAN response regardless of what it actually received. Asserts on the
+  # ACTUAL prompt content fake-codex captured, proving both the tracked
+  # edit and the untracked file's content genuinely reached the point of
+  # being sent for review.
+  grep -q "line two" "$captured_prompt" \
+    || { echo "FAIL: uncommitted happy-path case: captured prompt is missing the tracked edit"; fail=1; }
+  grep -q "new file" "$captured_prompt" \
+    || { echo "FAIL: uncommitted happy-path case: captured prompt is missing the untracked file's content"; fail=1; }
+  rm -f "$captured_prompt"
+  rm -rf "$repo"
+
+  # Case 2: unborn HEAD -- zero commits, BOTH a staged file that is further
+  # edited afterward (exercising the COMBINED staged+worktree state the
+  # empty-tree diff must represent) and a separate untracked file. A /cc
+  # round pointed out the original version here staged nothing, so this
+  # assertion could still pass even if the unborn-HEAD empty-tree diff
+  # regressed to `git diff --cached` only (staged-content only) -- the
+  # untracked-file collector picks up untracked content independently of
+  # whether the TRACKED diff logic is correct. staged-and-edited.txt is
+  # staged at "version-A" then further edited to append "version-B" BEFORE
+  # the repo's first-ever commit, so the assertions below can only all pass
+  # if the empty-tree diff reflects the FINAL combined index+worktree
+  # state, not just what was staged.
+  repo="$(_integration_test_repo)"
+  _integration_require_nonempty "$repo" "could not create isolated test repo for the unborn-HEAD case" || return 1
+  echo "version-A" > "$repo/staged-and-edited.txt"
+  _integration_git "$repo" add staged-and-edited.txt || return 1
+  echo "version-B" >> "$repo/staged-and-edited.txt"
+  echo "brand new" > "$repo/new.txt"
+  captured_prompt="$(mktemp)"
+  _integration_require_nonempty "$captured_prompt" "could not create temp file to capture the prompt (unborn-HEAD case)" || return 1
+  out="$("${wrapper_isolated_env[@]}" FAKE_CODEX_MODE=good FAKE_CODEX_CAPTURE_PROMPT_TO="$captured_prompt" "$wrapper" --cwd "$repo" --uncommitted --focus "test")"
+  wrapper_exit=$?
+  [ "$wrapper_exit" -eq 0 ] \
+    || { echo "FAIL: unborn-HEAD case exit status: expected 0 (ok:true), got $wrapper_exit"; fail=1; }
+  echo "$out" | jq -e '.ok == true' >/dev/null 2>&1 \
+    || { echo "FAIL: unborn-HEAD case: $out"; fail=1; }
+  grep -q "version-A" "$captured_prompt" \
+    || { echo "FAIL: unborn-HEAD case: captured prompt is missing the staged content"; fail=1; }
+  grep -q "version-B" "$captured_prompt" \
+    || { echo "FAIL: unborn-HEAD case: captured prompt is missing the further-edited unstaged content -- the diff may have regressed to staged-only (--cached)"; fail=1; }
+  grep -q "brand new" "$captured_prompt" \
+    || { echo "FAIL: unborn-HEAD case: captured prompt is missing the untracked file's content"; fail=1; }
+  rm -f "$captured_prompt"
+  rm -rf "$repo"
+
+  # Case 3: --base and --commit scope collection through a real THREE-commit
+  # repo -- the existing suite never drives either scope through a real
+  # repo at all. Deliberately uses three commits, each adding its OWN
+  # distinctly-named file, rather than two commits editing the same file: a
+  # /cc round proved that with only two commits (sha1=HEAD~1, sha2=HEAD),
+  # `--base sha1` (a RANGE diff, sha1...HEAD) and `--commit sha2` (a SINGLE
+  # commit's own patch) would show overlapping/identical content, so a
+  # regression that ignored --base and always diffed HEAD~1...HEAD, or
+  # ignored --commit and showed the wrong commit, could still pass. With
+  # three distinct files: `--base` on the FIRST commit ranges across BOTH
+  # later commits (must show the second AND third files' content, and must
+  # NOT show the first file's content, since it is unchanged across that
+  # range); `--commit` on the SECOND commit shows only that one file's own
+  # addition (must show ONLY the second file's content, not the first or
+  # third). No single wrong implementation satisfies both sets of
+  # assertions at once.
+  repo="$(_integration_test_repo)"
+  _integration_require_nonempty "$repo" "could not create isolated test repo for the --base/--commit scope case" || return 1
+  echo "content-one-unique" > "$repo/fileOne.txt"
+  _integration_git "$repo" add fileOne.txt || return 1
+  _integration_git "$repo" commit -q --no-verify -m "first" || return 1
+  sha_base="$("${git_isolated_env[@]}" git -C "$repo" rev-parse HEAD)"
+  _integration_require_nonempty "$sha_base" "git rev-parse HEAD returned nothing after the first fixture commit (--base/--commit scope case)" || return 1
+  echo "content-two-unique" > "$repo/fileTwo.txt"
+  _integration_git "$repo" add fileTwo.txt || return 1
+  _integration_git "$repo" commit -q --no-verify -m "second" || return 1
+  sha_commit="$("${git_isolated_env[@]}" git -C "$repo" rev-parse HEAD)"
+  _integration_require_nonempty "$sha_commit" "git rev-parse HEAD returned nothing after the second fixture commit (--base/--commit scope case)" || return 1
+  echo "content-three-unique" > "$repo/fileThree.txt"
+  _integration_git "$repo" add fileThree.txt || return 1
+  _integration_git "$repo" commit -q --no-verify -m "third" || return 1
+  captured_prompt="$(mktemp)"
+  _integration_require_nonempty "$captured_prompt" "could not create temp file to capture the prompt (--base/--commit scope case)" || return 1
+  out="$("${wrapper_isolated_env[@]}" FAKE_CODEX_MODE=good FAKE_CODEX_CAPTURE_PROMPT_TO="$captured_prompt" "$wrapper" --cwd "$repo" --base "$sha_base" --focus "test")"
+  wrapper_exit=$?
+  [ "$wrapper_exit" -eq 0 ] \
+    || { echo "FAIL: --base scope case exit status: expected 0 (ok:true), got $wrapper_exit"; fail=1; }
+  echo "$out" | jq -e '.ok == true' >/dev/null 2>&1 \
+    || { echo "FAIL: --base scope case: $out"; fail=1; }
+  grep -q "content-two-unique" "$captured_prompt" && grep -q "content-three-unique" "$captured_prompt" \
+    || { echo "FAIL: --base scope case: captured prompt is missing content introduced after the base ref"; fail=1; }
+  grep -q "content-one-unique" "$captured_prompt" \
+    && { echo "FAIL: --base scope case: captured prompt unexpectedly includes content from BEFORE the base ref"; fail=1; }
+  out="$("${wrapper_isolated_env[@]}" FAKE_CODEX_MODE=good FAKE_CODEX_CAPTURE_PROMPT_TO="$captured_prompt" "$wrapper" --cwd "$repo" --commit "$sha_commit" --focus "test")"
+  wrapper_exit=$?
+  [ "$wrapper_exit" -eq 0 ] \
+    || { echo "FAIL: --commit scope case exit status: expected 0 (ok:true), got $wrapper_exit"; fail=1; }
+  echo "$out" | jq -e '.ok == true' >/dev/null 2>&1 \
+    || { echo "FAIL: --commit scope case: $out"; fail=1; }
+  grep -q "content-two-unique" "$captured_prompt" \
+    || { echo "FAIL: --commit scope case: captured prompt is missing the targeted commit's own content"; fail=1; }
+  grep -q "content-one-unique" "$captured_prompt" \
+    && { echo "FAIL: --commit scope case: captured prompt unexpectedly includes an earlier commit's content"; fail=1; }
+  grep -q "content-three-unique" "$captured_prompt" \
+    && { echo "FAIL: --commit scope case: captured prompt unexpectedly includes a later commit's content"; fail=1; }
+  rm -f "$captured_prompt"
+  rm -rf "$repo"
+
+  # Case 3b: --base against a DIVERGED branch -- distinguishes production's
+  # merge-base ("...") semantics (run-codex-review.sh:1679) from a
+  # regression to a direct two-dot range (".."). A /cc round pointed out
+  # Case 3's fixture above is a straight LINEAR history, where sha_base is
+  # an ancestor of HEAD -- "sha_base...HEAD" and "sha_base..HEAD" produce
+  # IDENTICAL diffs there, so that regression would be invisible to it.
+  # This fixture branches BOTH sides from a shared root instead, so the
+  # base ref moves independently of HEAD:
+  #   root -> branch-a (root + fileA1; its tip becomes --base)
+  #   root -> branch-b (root + fileB1; checked out as HEAD)
+  # Correct merge-base semantics (branch-a...branch-b) diff from the shared
+  # root to HEAD, showing ONLY fileB1 (HEAD's own addition) and never
+  # fileA1 (branch-a's independent addition). A regression to a direct
+  # range (branch-a..branch-b) diffs branch-a's tree straight into
+  # branch-b's tree, which ALSO surfaces fileA1's content (as a removal),
+  # since branch-b's tree doesn't have that file.
+  repo="$(_integration_test_repo)"
+  _integration_require_nonempty "$repo" "could not create isolated test repo for the diverged-branch --base case" || return 1
+  echo "root-content" > "$repo/fileRoot.txt"
+  _integration_git "$repo" add fileRoot.txt || return 1
+  _integration_git "$repo" commit -q --no-verify -m "root" || return 1
+  _integration_git "$repo" branch branch-a || return 1
+  _integration_git "$repo" branch branch-b || return 1
+  _integration_git "$repo" checkout -q branch-a || return 1
+  echo "a1-unique-content" > "$repo/fileA1.txt"
+  _integration_git "$repo" add fileA1.txt || return 1
+  _integration_git "$repo" commit -q --no-verify -m "branch-a addition" || return 1
+  sha_diverged_base="$("${git_isolated_env[@]}" git -C "$repo" rev-parse branch-a)"
+  _integration_require_nonempty "$sha_diverged_base" "git rev-parse branch-a returned nothing (diverged-branch --base case)" || return 1
+  _integration_git "$repo" checkout -q branch-b || return 1
+  echo "b1-unique-content" > "$repo/fileB1.txt"
+  _integration_git "$repo" add fileB1.txt || return 1
+  _integration_git "$repo" commit -q --no-verify -m "branch-b addition" || return 1
+  captured_prompt="$(mktemp)"
+  _integration_require_nonempty "$captured_prompt" "could not create temp file to capture the prompt (diverged-branch --base case)" || return 1
+  out="$("${wrapper_isolated_env[@]}" FAKE_CODEX_MODE=good FAKE_CODEX_CAPTURE_PROMPT_TO="$captured_prompt" "$wrapper" --cwd "$repo" --base "$sha_diverged_base" --focus "test")"
+  wrapper_exit=$?
+  [ "$wrapper_exit" -eq 0 ] \
+    || { echo "FAIL: --base diverged-branch case exit status: expected 0 (ok:true), got $wrapper_exit"; fail=1; }
+  echo "$out" | jq -e '.ok == true' >/dev/null 2>&1 \
+    || { echo "FAIL: --base diverged-branch case: $out"; fail=1; }
+  grep -q "b1-unique-content" "$captured_prompt" \
+    || { echo "FAIL: --base diverged-branch case: captured prompt is missing HEAD's own addition since the shared root"; fail=1; }
+  grep -q "a1-unique-content" "$captured_prompt" \
+    && { echo "FAIL: --base diverged-branch case: captured prompt includes the base branch's own independent addition -- this indicates a regression from merge-base (...) to a direct range (..) semantics"; fail=1; }
+  rm -f "$captured_prompt"
+  rm -rf "$repo"
+
+  # Case 4: timeout -- confirms both the reported failure AND that the
+  # process-GROUP kill actually reaches a LIVE DESCENDANT process, which a
+  # unit-level test calling judge_result directly could never exercise
+  # (that function never spawns anything).
+  repo="$(_integration_test_repo)"
+  _integration_require_nonempty "$repo" "could not create isolated test repo for the timeout case" || return 1
+  echo "x" > "$repo/f.txt"
+  _integration_git "$repo" add f.txt || return 1
+  _integration_git "$repo" commit -q --no-verify -m "first" || return 1
+  echo "y" > "$repo/f.txt"
+  child_pid_file="$(mktemp)"
+  _integration_require_nonempty "$child_pid_file" "could not create temp file for the child PID (timeout case)" || return 1
+  # 2>/dev/null (not 2>&1) -- killing the backgrounded codex job makes
+  # bash's own job-control print an unrelated "Terminated: N ( ... )"
+  # notification to STDERR (confirmed live: it never appears on stdout),
+  # which would otherwise corrupt this capture's JSON parsing if merged
+  # in. Every other case below also captures stdout alone, matching how
+  # every real caller of this wrapper already treats its stdout as the
+  # sole meaningful output.
+  #
+  # --timeout 5, not 2 -- a /cc round pointed out a real startup race: the
+  # wrapper's deadline starts counting the instant it backgrounds codex,
+  # while fake-codex must still be scheduled, fork its `sleep 999999 &`,
+  # and write that child's PID out before the deadline fires; on a heavily
+  # loaded machine a 2-second budget could plausibly be too tight, making
+  # the assertion below fail for a test-timing reason having nothing to do
+  # with a real process-group-kill bug. 5s keeps this case fast (nowhere
+  # near the 1800s default) while giving that fork-and-write sequence, which
+  # normally completes in microseconds, generous headroom.
+  out="$("${wrapper_isolated_env[@]}" FAKE_CODEX_MODE=hang FAKE_CODEX_CHILD_PID_FILE="$child_pid_file" "$wrapper" --cwd "$repo" --uncommitted --focus "test" --timeout 5 2>/dev/null)"
+  wrapper_exit=$?
+  [ "$wrapper_exit" -eq 1 ] \
+    || { echo "FAIL: timeout case exit status: expected 1 (ok:false), got $wrapper_exit"; fail=1; }
+  echo "$out" | jq -e '.ok == false and .reason == "timeout"' >/dev/null 2>&1 \
+    || { echo "FAIL: timeout case result: $out"; fail=1; }
+  child_pid="$(cat "$child_pid_file" 2>/dev/null)"
+  if [ -n "$child_pid" ]; then
+    if kill -0 "$child_pid" 2>/dev/null; then
+      echo "FAIL: timeout case: fake-codex's child process (PID $child_pid) is still alive after the wrapper returned -- process-group kill did not reach it"
+      fail=1
+      kill -KILL "$child_pid" 2>/dev/null
+    fi
+  else
+    echo "FAIL: timeout case: fake-codex never wrote its child PID to $child_pid_file"
+    fail=1
+  fi
+  rm -f "$child_pid_file"
+  rm -rf "$repo"
+
+  # Case 5: malformed model output (non-JSON) through a real subprocess,
+  # not just via a direct judge_result call on a pre-made file.
+  repo="$(_integration_test_repo)"
+  _integration_require_nonempty "$repo" "could not create isolated test repo for the malformed-output case" || return 1
+  echo "x" > "$repo/f.txt"
+  _integration_git "$repo" add f.txt || return 1
+  _integration_git "$repo" commit -q --no-verify -m "first" || return 1
+  echo "y" > "$repo/f.txt"
+  out="$("${wrapper_isolated_env[@]}" FAKE_CODEX_MODE=malformed "$wrapper" --cwd "$repo" --uncommitted --focus "test")"
+  wrapper_exit=$?
+  [ "$wrapper_exit" -eq 1 ] \
+    || { echo "FAIL: malformed-output case exit status: expected 1 (ok:false), got $wrapper_exit"; fail=1; }
+  echo "$out" | jq -e '.ok == false and .reason == "invalid_json"' >/dev/null 2>&1 \
+    || { echo "FAIL: malformed-output case: $out"; fail=1; }
+  rm -rf "$repo"
+
+  # Case 6: nonzero exit.
+  repo="$(_integration_test_repo)"
+  _integration_require_nonempty "$repo" "could not create isolated test repo for the nonzero-exit case" || return 1
+  echo "x" > "$repo/f.txt"
+  _integration_git "$repo" add f.txt || return 1
+  _integration_git "$repo" commit -q --no-verify -m "first" || return 1
+  echo "y" > "$repo/f.txt"
+  out="$("${wrapper_isolated_env[@]}" FAKE_CODEX_MODE=nonzero "$wrapper" --cwd "$repo" --uncommitted --focus "test")"
+  wrapper_exit=$?
+  [ "$wrapper_exit" -eq 1 ] \
+    || { echo "FAIL: nonzero-exit case exit status: expected 1 (ok:false), got $wrapper_exit"; fail=1; }
+  echo "$out" | jq -e '.ok == false and .reason == "nonzero_exit"' >/dev/null 2>&1 \
+    || { echo "FAIL: nonzero-exit case: $out"; fail=1; }
+  rm -rf "$repo"
+
+  rm -rf "$fake_codex_dir" "$fake_git_home"
+
+  if [ "$fail" -eq 0 ]; then
+    echo "run-codex-review.sh: integration selftest OK"
+    return 0
+  else
+    echo "run-codex-review.sh: integration selftest FAILED"
+    return 1
+  fi
+}
+
 if [ "${1:-}" = "--selftest" ]; then
   run_selftest
+  exit $?
+fi
+if [ "${1:-}" = "--selftest-integration" ]; then
+  run_integration_selftest
   exit $?
 fi
 
