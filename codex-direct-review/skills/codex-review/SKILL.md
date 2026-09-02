@@ -67,3 +67,22 @@ cross-verification — this is the lightweight, single-shot version.
    if any, they want fixed before touching a single file — the same rule the existing
    `codex-result-handling` skill applies to `codex:codex-rescue` output applies here too, even
    though this path doesn't go through that subagent.
+
+6. **Evidence capture (optional, off by default).** Every finding's `verification` field is
+   self-reported by the model — it can legitimately say "not verified beyond reading the diff", or
+   it can claim to have run commands that never actually happened. If the user explicitly wants to
+   audit what the review actually did (not just trust what it claims), add
+   `--capture-eventlog <path>` to the wrapper call. This is a **best-effort** copy (`cp ... ||
+   true`) of the raw event log for that one call to `<path>`, made just before it would otherwise be
+   deleted — an unwritable or missing `<path>` silently produces no file, without failing the
+   review itself. Check `<path>` exists before extracting; if it doesn't, say "the review completed,
+   but no evidence capture file was produced" rather than reporting zero commands run as if that were
+   a confirmed finding. When it exists, extract the commands actually run with:
+   ```bash
+   jq -Rn -c '[inputs | fromjson? | select(.type == "item.completed" and .item.type == "command_execution") | .item.command]' <path>
+   ```
+   Report the resulting command list to the user (or "no commands were run — this review relied on
+   reading the diff/context text alone"), then delete `<path>` — it can contain the actual file
+   contents/command output the review inspected, so treat it as sensitive and never leave it lying
+   around after extracting what was asked for. Never enable this by default; only when the user
+   asks to see what was actually investigated.

@@ -222,7 +222,7 @@ while [ $# -gt 0 ]; do
       RUNS_OVERRIDE="$2"; shift 2 ;;
     --capture-investigation-evidence)
       # Captures each run's raw codex exec event log (via run-codex-
-      # review.sh's internal --eval-capture-eventlog flag) and extracts its
+      # review.sh's --capture-eventlog flag) and extracts its
       # command_execution items into investigation-evidence.json alongside
       # result.json/manifest.json -- lets a sweep be audited for whether
       # reviews actually investigated the repo (ran greps/tests/reads)
@@ -1576,7 +1576,7 @@ score_pair_member() {
 
   # run_id/run_dir: mkdir only moves ahead of the review invocation when
   # CAPTURE_INVESTIGATION_EVIDENCE actually needs an existing directory to
-  # point --eval-capture-eventlog at -- a /cc round caught that
+  # point --capture-eventlog at -- a /cc round caught that
   # unconditionally moving mkdir earlier (regardless of the flag) created a
   # persistent empty orphan run_dir on an INT/TERM interrupt mid-review even
   # on ordinary (capture-off) sweeps, since this file's shared
@@ -1597,7 +1597,7 @@ score_pair_member() {
   # focus/no-focus x capture/no-capture branches.
   local -a review_args=(--cwd "$snapshot_repo" --commit "$snapshot_sha")
   [ -n "$focus" ] && review_args+=(--focus "$focus")
-  [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ] && review_args+=(--eval-capture-eventlog "$run_dir/eventlog.jsonl")
+  [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ] && review_args+=(--capture-eventlog "$run_dir/eventlog.jsonl")
   "$REVIEW_SCRIPT" "${review_args[@]}" > "$REVIEW_OUT" 2>&1 &
   wait "$!"
   local result
@@ -2427,7 +2427,7 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
     fi
     # run_id/run_dir: mkdir only moves ahead of the review invocation when
     # CAPTURE_INVESTIGATION_EVIDENCE actually needs an existing directory to
-    # point --eval-capture-eventlog at -- a /cc round caught that
+    # point --capture-eventlog at -- a /cc round caught that
     # unconditionally moving mkdir earlier (regardless of the flag) created
     # a persistent empty orphan run_dir on an INT/TERM interrupt mid-review
     # even on ordinary (capture-off) sweeps, since this file's shared
@@ -2450,7 +2450,7 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
     # focus/no-focus x capture/no-capture branches.
     review_args=(--cwd "$CURRENT_TMP_REPO" --commit "$snapshot_sha")
     [ -n "$focus" ] && review_args+=(--focus "$focus")
-    [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ] && review_args+=(--eval-capture-eventlog "$run_dir/eventlog.jsonl")
+    [ "$CAPTURE_INVESTIGATION_EVIDENCE" -eq 1 ] && review_args+=(--capture-eventlog "$run_dir/eventlog.jsonl")
     "$REVIEW_SCRIPT" "${review_args[@]}" > "$REVIEW_OUT" 2>&1 &
     # `wait "$!"` rather than capturing the PID into a variable first --
     # see on_signal's comment above for why: a variable holding this PID
