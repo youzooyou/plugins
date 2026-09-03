@@ -1304,7 +1304,7 @@ score_bug_fixture_result() {
 # question framings), many times each, and reports the pooled agreement
 # rate plus each case's own per-case rate (no single-population confidence
 # interval is computed across the pooled total -- see the reporting block
-# below for why that would misrepresent 8 cases of differing difficulty as
+# below for why that would misrepresent 9 cases of differing difficulty as
 # one shared success probability). Dispatched via --calibrate-judge, in
 # place of the normal fixture sweep (see the dispatch site below, mirroring
 # run_pair_mode's own `if [ -n "$PAIR_A" ]; then ... exit $?` dispatch).
@@ -1319,7 +1319,7 @@ run_judge_calibration() {
   local calibration_dir="$STATE_ROOT/judge-calibration-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   mkdir "$calibration_dir" || { echo "error: calibration suite-id collision at $calibration_dir" >&2; return 1; }
 
-  # Parallel indexed arrays, 1-7 (bash 3.2 compat -- no associative arrays,
+  # Parallel indexed arrays, 1-10 (bash 3.2 compat -- no associative arrays,
   # matching this file's own documented constraint). Every string below is
   # byte-exact to the task spec: real corpus/model text is evidence, not
   # prose to be tidied up.
@@ -1371,23 +1371,40 @@ run_judge_calibration() {
   # implicit dispute counts, and that a different named function/path
   # still counts as disputing evidence. Re-calibrated after this change --
   # see this commit's message for the resulting numbers.
+  #
+  # REVISED AGAIN 2026-09-03: that fix traded the false-negative problem for
+  # a mild false-positive one, exactly the risk its own commit flagged as
+  # needing verification. A real single-run 26-fixture corpus sweep against
+  # the then-current wrapper scored fixture 18 (a genuinely clean
+  # control-group fixture) as a false positive: the question's "any way the
+  # stated safeguard could fail to protect against THE DESCRIBED RISK"
+  # let a finding about a DIFFERENT risk (no request timeout -> indefinite
+  # hang) count as disputing a safeguard about a DIFFERENT harm (body
+  # leaked ON A RETURN PATH) -- an indefinite hang is not a return path, so
+  # the finding never actually showed the safeguard's own claim failing, it
+  # just discussed the same defer/close mechanism. Fixed by requiring the
+  # finding show the SPECIFIC named protection failing to prevent the
+  # SPECIFIC named harm (not just discuss the same function/mechanism) --
+  # see case 10 below, which pins this exact real finding as a permanent
+  # regression test the same way case 8 pinned fixture 13's real near-miss.
+  # Re-calibrated after this second change too.
   CAL_CONTEXT_LABEL[5]="is claimed to be protected by the following safeguard"
   CAL_ASSERTION[5]="concurrent writes to the cache's underlying map are serialized by a mutex held around every read-modify-write, preventing a data race between goroutines"
-  CAL_QUESTION[5]="Does this finding describe or imply any way the stated safeguard could fail to actually apply or protect against the described risk -- even if the finding does not use words like missing, broken, or ineffective, and even if it discusses a different specific function, code path, or scenario than the one named in the safeguard claim?"
+  CAL_QUESTION[5]="Does this finding show a concrete way that the SPECIFIC protection named in the safeguard fails to hold, so that the exact harm the safeguard claims to prevent can still occur -- even if the finding does not use words like missing, broken, or ineffective, and even if it names a different function, code path, or scenario than the one in the safeguard claim? Answer no if the finding instead describes a separate, additional risk that can exist even while the safeguard's own stated protection works exactly as claimed."
   CAL_FINDING_TEXT[5]="This implementation correctly guards every read-modify-write access to the map with c.mu.Lock() and c.mu.Unlock(), so there is no data race between the concurrent goroutines here."
   CAL_EXPECTED[5]="no"
   CAL_LABEL[5]="constructed safeguard-confirmed negative"
 
   CAL_CONTEXT_LABEL[6]="is claimed to be protected by the following safeguard"
   CAL_ASSERTION[6]="concurrent writes to the cache's underlying map are serialized by a mutex held around every read-modify-write, preventing a data race between goroutines"
-  CAL_QUESTION[6]="Does this finding describe or imply any way the stated safeguard could fail to actually apply or protect against the described risk -- even if the finding does not use words like missing, broken, or ineffective, and even if it discusses a different specific function, code path, or scenario than the one named in the safeguard claim?"
+  CAL_QUESTION[6]="Does this finding show a concrete way that the SPECIFIC protection named in the safeguard fails to hold, so that the exact harm the safeguard claims to prevent can still occur -- even if the finding does not use words like missing, broken, or ineffective, and even if it names a different function, code path, or scenario than the one in the safeguard claim? Answer no if the finding instead describes a separate, additional risk that can exist even while the safeguard's own stated protection works exactly as claimed."
   CAL_FINDING_TEXT[6]="IncrementAll spawns goroutines that write to c.data[key]++ with no synchronization at all -- this is a data race that can corrupt the map or crash the program with Go's concurrent map write detector."
   CAL_EXPECTED[6]="yes"
   CAL_LABEL[6]="constructed safeguard-disputed positive"
 
   CAL_CONTEXT_LABEL[7]="is claimed to be protected by the following safeguard"
   CAL_ASSERTION[7]="VALID_TIERS is a small, fixed-size (4-entry) constant catalog that never grows with user input scale, so the linear membership scan here is effectively O(1) in practice and does not need to be converted to a set for performance."
-  CAL_QUESTION[7]="Does this finding describe or imply any way the stated safeguard could fail to actually apply or protect against the described risk -- even if the finding does not use words like missing, broken, or ineffective, and even if it discusses a different specific function, code path, or scenario than the one named in the safeguard claim?"
+  CAL_QUESTION[7]="Does this finding show a concrete way that the SPECIFIC protection named in the safeguard fails to hold, so that the exact harm the safeguard claims to prevent can still occur -- even if the finding does not use words like missing, broken, or ineffective, and even if it names a different function, code path, or scenario than the one in the safeguard claim? Answer no if the finding instead describes a separate, additional risk that can exist even while the safeguard's own stated protection works exactly as claimed."
   CAL_FINDING_TEXT[7]=$'The publicly exported mutable list lets any importer change the supposedly fixed set of valid tiers at runtime.\n`is_valid_tier` directly evaluates membership in VALID_TIERS; after tier_catalog.VALID_TIERS.append("attacker-tier"), is_valid_tier("attacker-tier") returns True. This contradicts the function\'s documented fixed known-tier set.'
   CAL_EXPECTED[7]="ambiguous"
   CAL_LABEL[7]="fixture-24 mutability, DELIBERATELY AMBIGUOUS"
@@ -1417,9 +1434,38 @@ run_judge_calibration() {
   CAL_EXPECTED[9]="yes"
   CAL_LABEL[9]="constructed hard low-lexical-overlap paraphrase positive"
 
+  # Case 10 added after a real 2026-09-03 single-run corpus sweep (--runs 1,
+  # all 26 fixtures against the then-current wrapper) scored fixture 18
+  # (clean-correct-resource-cleanup, should_flag==false) as a false positive
+  # under the OLD case 5-7 wording. Root cause (found by reading the actual
+  # saved judge-1.prompt.txt/judge-1.response.txt for that run): the old
+  # question's "any way the stated safeguard could fail to actually apply or
+  # protect against THE DESCRIBED RISK" let a finding about a DIFFERENT risk
+  # (no request timeout, so the call can hang indefinitely before ever
+  # returning) count as disputing a safeguard about a DIFFERENT one (the
+  # response body is always closed via defer "on any return path") -- an
+  # indefinite hang is not a return path at all, so the finding never
+  # actually shows the safeguard's own stated claim failing; it just shares
+  # the same code/mechanism. This is the mirror-image failure of case 6's
+  # original gap: case 6 needed the judge to count a dispute that was too
+  # narrowly missed; this needs the judge to stop counting a mere adjacency
+  # as a dispute. Fixed by requiring the finding show the SPECIFIC named
+  # protection failing to prevent the SPECIFIC named harm, not just discuss
+  # the same function/mechanism. This case pins that exact real-world
+  # finding text (verbatim from that run's judge-1.prompt.txt) as a
+  # permanent regression test, the same way case 8 pinned fixture 13's real
+  # near-miss.
+  CAL_CONTEXT_LABEL[10]="is claimed to be protected by the following safeguard"
+  CAL_ASSERTION[10]="the HTTP response body is closed via a defer immediately after a successful request, so it is always released and never leaked on any return path"
+  CAL_QUESTION[10]="Does this finding show a concrete way that the SPECIFIC protection named in the safeguard fails to hold, so that the exact harm the safeguard claims to prevent can still occur -- even if the finding does not use words like missing, broken, or ineffective, and even if it names a different function, code path, or scenario than the one in the safeguard claim? Answer no if the finding instead describes a separate, additional risk that can exist even while the safeguard's own stated protection works exactly as claimed."
+  CAL_FINDING_TEXT[10]="The request has no deadline or cancellation path, so a peer that accepts the connection but never finishes its response can block this call indefinitely.
+\`FetchBody\` calls \`http.Get(url)\` directly and the exported API has no \`context.Context\` or timeout parameter. The only cleanup (\`defer resp.Body.Close()\`) is registered after \`http.Get\` returns, so it cannot release a connection while the initial request or response headers are stalled."
+  CAL_EXPECTED[10]="no"
+  CAL_LABEL[10]="real fixture-18 false-positive negative (adjacent no-timeout risk, not a safeguard dispute)"
+
   local yes_count=() no_count=() error_count=()
   local i n
-  for i in 1 2 3 4 5 6 7 8 9; do
+  for i in 1 2 3 4 5 6 7 8 9 10; do
     yes_count[i]=0
     no_count[i]=0
     error_count[i]=0
@@ -1438,7 +1484,7 @@ run_judge_calibration() {
   echo ""
   echo "=== Judge calibration (N=$CALIBRATION_RUNS_PER_CASE runs/case) ==="
   local total_agree=0 total_scored=0 agree scored err_note
-  for i in 1 2 3 4 5 6 7 8 9; do
+  for i in 1 2 3 4 5 6 7 8 9 10; do
     # Printed in natural numeric order (including the unscored case 7 in
     # its own position) rather than looping the scored cases separately
     # and appending case 7 afterward -- purely cosmetic, but avoids the
@@ -1467,14 +1513,14 @@ run_judge_calibration() {
   done
 
   echo ""
-  echo "Overall judge accuracy (8 scored cases, excludes case 7 and judge errors):"
+  echo "Overall judge accuracy (9 scored cases, excludes case 7 and judge errors):"
   if [ "$total_scored" -gt 0 ]; then
     local pct
     pct="$(awk -v h="$total_agree" -v v="$total_scored" 'BEGIN { printf "%.1f", (h / v) * 100 }')"
     # A /cc round correctly rejected an earlier version of this report that
     # pooled all calls into a single binomial Wilson interval: that requires
     # every trial to be an independent draw from ONE shared success
-    # probability, but these calls are repeated trials on 8 DIFFERENT fixed
+    # probability, but these calls are repeated trials on 9 DIFFERENT fixed
     # cases, each with its own (likely different) true success rate --
     # exactly the kind of stratified/heterogeneous data a single-population
     # CI misrepresents (it understates uncertainty by ignoring between-case
@@ -1484,12 +1530,12 @@ run_judge_calibration() {
     # readers to the per-case lines above (each of which IS a same-input
     # repeat-call rate, the one thing this pooling could validly claim) for
     # case-level detail instead of a false aggregate confidence claim.
-    echo "  $total_agree/$total_scored ($pct%) pooled across 8 fixed cases"
-    echo "  (NOT a valid single-population confidence interval -- these 8 cases"
+    echo "  $total_agree/$total_scored ($pct%) pooled across 9 fixed cases"
+    echo "  (NOT a valid single-population confidence interval -- these 9 cases"
     echo "  have different underlying difficulty, so a binomial CI assuming one"
     echo "  shared success probability would misstate precision. See each"
     echo "  case's own N/N line above for case-level detail. More"
-    echo "  --calibration-runs adds more calls on these SAME 8 cases, it does"
+    echo "  --calibration-runs adds more calls on these SAME 9 cases, it does"
     echo "  not add scenario coverage.)"
   else
     echo "  N/A (no scored runs -- every scored case's calls all errored)"
@@ -2672,7 +2718,7 @@ for fixture_dir in "$CORPUS_DIR"/*/; do
           # numbers describe a prompt this call site no longer sends.
           judge_finding "is claimed to be protected by the following safeguard" \
             "$safeguard_assertion" \
-            "Does this finding describe or imply any way the stated safeguard could fail to actually apply or protect against the described risk -- even if the finding does not use words like missing, broken, or ineffective, and even if it discusses a different specific function, code path, or scenario than the one named in the safeguard claim?" \
+            "Does this finding show a concrete way that the SPECIFIC protection named in the safeguard fails to hold, so that the exact harm the safeguard claims to prevent can still occur -- even if the finding does not use words like missing, broken, or ineffective, and even if it names a different function, code path, or scenario than the one in the safeguard claim? Answer no if the finding instead describes a separate, additional risk that can exist even while the safeguard's own stated protection works exactly as claimed." \
             "$finding_text" \
             "$run_dir/judge-${judge_idx}.prompt.txt" "$run_dir/judge-${judge_idx}.response.txt"
           case "$JUDGE_VERDICT" in
