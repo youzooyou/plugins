@@ -18,7 +18,7 @@ tail -n +1 -F "$ROLLOUT" 2>/dev/null | while IFS= read -r line; do
           [ -n "$TEXT" ] && printf 'reasoning: %s\n' "$TEXT"
           ;;
         custom_tool_call)
-          CMD="$(printf '%s' "$line" | jq -r '.payload.arguments // empty' 2>/dev/null)"
+          CMD="$(printf '%s' "$line" | jq -r '.payload.input // empty' 2>/dev/null)"
           [ -n "$CMD" ] && printf 'investigating: %s\n' "$CMD"
           ;;
       esac
