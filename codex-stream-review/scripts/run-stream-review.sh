@@ -31,6 +31,24 @@ kill_process_group() {
   sleep 1
   kill -KILL -"$pid" 2>/dev/null
 }
+# resolve_rollout <threadId> -- rollout files live under
+# ~/.codex/sessions/<Y>/<M>/<D>/, so a thread started "now" almost always
+# resolves under today's date directory. Try that narrow, cheap lookup
+# first; only fall back to a full recursive scan of the whole sessions
+# tree (unbounded, grows with every session ever run) if today's
+# directory doesn't have it yet -- e.g. a call right at a midnight
+# rollover, or before the file has been created on disk. Always correct
+# (the fallback covers every case the narrow path could miss), just
+# cheaper in the common case.
+resolve_rollout() {
+  local tid="$1" f
+  f="$(find "$HOME/.codex/sessions/$(date +%Y/%m/%d 2>/dev/null)" -maxdepth 1 -name "rollout-*-${tid}.jsonl" 2>/dev/null | head -1)"
+  if [ -n "$f" ]; then
+    printf '%s' "$f"
+    return 0
+  fi
+  find "$HOME/.codex/sessions" -name "rollout-*-${tid}.jsonl" 2>/dev/null | head -1
+}
 on_signal() {
   kill_process_group "${CODEX_PID:-}"
   local job_pid
@@ -132,7 +150,7 @@ if [ -n "$RESUME_THREAD_ID" ]; then
   THREAD_ID="$RESUME_THREAD_ID"
   THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
   echo "THREAD_ID=$THREAD_ID" >&2
-  ROLLOUT="$(find "$HOME/.codex/sessions" -name "rollout-*-${THREAD_ID}.jsonl" 2>/dev/null | head -1)"
+  ROLLOUT="$(resolve_rollout "$THREAD_ID")"
   if [ -z "$ROLLOUT" ] || [ ! -f "$ROLLOUT" ]; then
     printf '{"ok":false,"reason":"resume_thread_not_found","threadId":%s,"detail":"no rollout file found for this threadId"}\n' "$THREAD_ID_JSON"
     exit 1
@@ -193,7 +211,7 @@ TIMED_OUT=0
 TASK_COMPLETE_SEEN=0
 while kill -0 "$CODEX_PID" 2>/dev/null; do
   if [ -z "$ROLLOUT" ]; then
-    ROLLOUT="$(find "$HOME/.codex/sessions" -name "rollout-*-${THREAD_ID}.jsonl" 2>/dev/null | head -1)"
+    ROLLOUT="$(resolve_rollout "$THREAD_ID")"
   fi
   if [ -n "$ROLLOUT" ] && [ -f "$ROLLOUT" ]; then
     CUR_COUNT="$(jq -c 'select(.type=="event_msg" and .payload.type=="task_complete")' "$ROLLOUT" 2>/dev/null | wc -l | tr -d ' ')"
