@@ -53,14 +53,15 @@ if [ "${1:-}" = "--cleanup" ]; then
     exit 1
   fi
   THREAD_ID="$2"
+  THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
   DELETE_OUT="$(codex delete "$THREAD_ID" --force 2>&1)"
   DELETE_STATUS=$?
   if [ "$DELETE_STATUS" -ne 0 ]; then
     DETAIL_JSON="$(printf '%s' "$DELETE_OUT" | jq -Rs '.')"
-    printf '{"ok":false,"reason":"cleanup_failed","threadId":"%s","detail":%s}\n' "$THREAD_ID" "$DETAIL_JSON"
+    printf '{"ok":false,"reason":"cleanup_failed","threadId":%s,"detail":%s}\n' "$THREAD_ID_JSON" "$DETAIL_JSON"
     exit 1
   fi
-  printf '{"ok":true,"threadId":"%s","deleted":true}\n' "$THREAD_ID"
+  printf '{"ok":true,"threadId":%s,"deleted":true}\n' "$THREAD_ID_JSON"
   exit 0
 fi
 
@@ -111,9 +112,10 @@ ROLLOUT=""
 BASELINE_TASK_COMPLETE=0
 if [ -n "$RESUME_THREAD_ID" ]; then
   THREAD_ID="$RESUME_THREAD_ID"
+  THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
   ROLLOUT="$(find "$HOME/.codex/sessions" -name "rollout-*-${THREAD_ID}.jsonl" 2>/dev/null | head -1)"
   if [ -z "$ROLLOUT" ] || [ ! -f "$ROLLOUT" ]; then
-    printf '{"ok":false,"reason":"resume_thread_not_found","threadId":"%s","detail":"no rollout file found for this threadId"}\n' "$THREAD_ID"
+    printf '{"ok":false,"reason":"resume_thread_not_found","threadId":%s,"detail":"no rollout file found for this threadId"}\n' "$THREAD_ID_JSON"
     exit 1
   fi
   BASELINE_TASK_COMPLETE="$(jq -c 'select(.type=="event_msg" and .payload.type=="task_complete")' "$ROLLOUT" 2>/dev/null | wc -l | tr -d ' ')"
@@ -159,6 +161,7 @@ if [ -z "$THREAD_ID" ]; then
     printf '{"ok":false,"reason":"no_thread_started","detail":"no thread.started event within %ss"}\n' "$THREAD_WAIT_SECS"
     exit 1
   fi
+  THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
 fi
 
 # Step 6: resolve (fresh round) and tail the rollout file until a NEW
@@ -204,19 +207,19 @@ fi
 rm -f "$EVENTLOG"
 
 if [ "$TIMED_OUT" -eq 1 ]; then
-  printf '{"ok":false,"reason":"timeout","threadId":"%s","detail":"round exceeded %ss"}\n' "$THREAD_ID" "$DEFAULT_TIMEOUT_SECS"
+  printf '{"ok":false,"reason":"timeout","threadId":%s,"detail":"round exceeded %ss"}\n' "$THREAD_ID_JSON" "$DEFAULT_TIMEOUT_SECS"
   exit 1
 fi
 if [ "$EXIT_CODE" -ne 0 ]; then
-  printf '{"ok":false,"reason":"nonzero_exit","threadId":"%s","detail":"codex exec exited %s"}\n' "$THREAD_ID" "$EXIT_CODE"
+  printf '{"ok":false,"reason":"nonzero_exit","threadId":%s,"detail":"codex exec exited %s"}\n' "$THREAD_ID_JSON" "$EXIT_CODE"
   exit 1
 fi
 if [ "$TASK_COMPLETE_SEEN" -eq 0 ]; then
-  printf '{"ok":false,"reason":"missing_task_complete","threadId":"%s","detail":"no task_complete event found in rollout file"}\n' "$THREAD_ID"
+  printf '{"ok":false,"reason":"missing_task_complete","threadId":%s,"detail":"no task_complete event found in rollout file"}\n' "$THREAD_ID_JSON"
   exit 1
 fi
 if [ -z "$ROLLOUT" ] || [ ! -f "$ROLLOUT" ]; then
-  printf '{"ok":false,"reason":"rollout_not_found","threadId":"%s","detail":"could not resolve rollout file for this threadId"}\n' "$THREAD_ID"
+  printf '{"ok":false,"reason":"rollout_not_found","threadId":%s,"detail":"could not resolve rollout file for this threadId"}\n' "$THREAD_ID_JSON"
   exit 1
 fi
 
@@ -230,17 +233,17 @@ FINAL_TEXT="$(jq -n -r '
   ' "$ROLLOUT" 2>/dev/null)"
 
 if [ -z "$FINAL_TEXT" ]; then
-  printf '{"ok":false,"reason":"no_final_answer","threadId":"%s","detail":"no final_answer message found in rollout file"}\n' "$THREAD_ID"
+  printf '{"ok":false,"reason":"no_final_answer","threadId":%s,"detail":"no final_answer message found in rollout file"}\n' "$THREAD_ID_JSON"
   exit 1
 fi
 
 if [ -n "$SCHEMA" ]; then
   if ! printf '%s' "$FINAL_TEXT" | jq -e . >/dev/null 2>&1; then
-    printf '{"ok":false,"reason":"invalid_json","threadId":"%s","detail":"final answer is not valid JSON despite --output-schema"}\n' "$THREAD_ID"
+    printf '{"ok":false,"reason":"invalid_json","threadId":%s,"detail":"final answer is not valid JSON despite --output-schema"}\n' "$THREAD_ID_JSON"
     exit 1
   fi
-  printf '{"ok":true,"threadId":"%s","verdict":%s}\n' "$THREAD_ID" "$(printf '%s' "$FINAL_TEXT" | jq -c .)"
+  printf '{"ok":true,"threadId":%s,"verdict":%s}\n' "$THREAD_ID_JSON" "$(printf '%s' "$FINAL_TEXT" | jq -c .)"
 else
-  printf '{"ok":true,"threadId":"%s","verdict":%s}\n' "$THREAD_ID" "$(printf '%s' "$FINAL_TEXT" | jq -Rs .)"
+  printf '{"ok":true,"threadId":%s,"verdict":%s}\n' "$THREAD_ID_JSON" "$(printf '%s' "$FINAL_TEXT" | jq -Rs .)"
 fi
 exit 0
