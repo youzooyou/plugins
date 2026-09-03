@@ -1,0 +1,210 @@
+# codex-stream-review — Design Spec
+
+> Status: draft, pending user review. Companion knowledge base:
+> `docs/superpowers/plans/2026-09-03-codex-appserver-streaming-knowledge.md`
+> (raw research notes — read that first if anything here seems to assume
+> undocumented context).
+
+## Goal
+
+A **separate, experimental** Claude Code plugin (does not replace `/cc` /
+`codex-direct-review`, which stay exactly as they are) that gives Codex
+reviews three things the current ephemeral-`codex exec`-per-round design
+cannot:
+
+1. **Live, real-time progress visibility** — see what Codex is doing
+   (reasoning, commands run, draft answer) as it happens, not only after
+   the whole call finishes.
+2. **Token/latency efficiency across multi-round follow-up** — reuse a
+   single Codex thread's own persisted context across rounds instead of
+   re-sending the full diff + prior findings every round.
+3. **Parallel reviewer orchestration** — run several review threads
+   concurrently and observe all of them live.
+
+Explicitly **not** a goal for v1: replacing `/cc`'s equal-partnership
+consensus loop, or matching its `--output-schema`-enforced structured
+JSON verdict shape (see "Structured output" below — this is a real,
+accepted limitation of this design, not an oversight).
+
+## Why not the app-server RPC / MCP paths (rejected alternatives)
+
+Both investigated and rejected for v1 — see the knowledge base for the
+full evidence trail:
+
+- **`codex mcp-server`**: explicitly deprecated by the CLI itself
+  (`warning: ... is deprecated and will be removed in a future release`),
+  no public replacement documented, and its `content` field is free text
+  with no `--output-schema`-equivalent enforcement. Do not build on it.
+- **`codex app-server` RPC socket** (the officially "correct"-looking
+  path, with a rich `ServerNotification` schema including token-level
+  streaming deltas): the fully-managed daemon lifecycle
+  (`codex app-server daemon start`) requires a "standalone" Codex install
+  that is a **separate installation from this machine's npm/nvm-installed
+  `codex`**, obtainable only via `curl -fsSL
+  https://chatgpt.com/codex/install.sh | sh` — which is blocked at this
+  organization's network/proxy level (redirects to an internal web-filter
+  block page). A manually-started `--listen unix://<path>` instance does
+  accept a raw connection, but the server silently closes it with zero
+  response and zero server-side log trace for the request — strong
+  evidence this ad-hoc path is talking to a narrow "control" endpoint,
+  not the full session RPC surface, independent of any install/auth
+  question. Revisit this path later only if the standalone install
+  becomes available (would need an IT/network exception); not a
+  prerequisite for v1.
+
+## The mechanism this design actually uses (confirmed working, 2026-09-03)
+
+No socket, no daemon, no new install, no auth changes. Three already-existing,
+independently-proven primitives:
+
+1. **`codex exec <prompt>`** (first round) / **`codex exec resume <threadId>
+   <prompt>`** (follow-up rounds) — starts or continues a **persisted**
+   thread (do **not** pass `--ephemeral` in this design — persistence is
+   required so the thread can be resumed later; see "Data retention"
+   below for the resulting privacy/cleanup obligation this creates).
+   Capture the `threadId` from the `thread.started` event in the
+   process's own `--json` stream on round 1.
+2. **`~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<threadId>.jsonl`**
+   — every thread's own live, append-only event log, one file per thread,
+   updated in real time while the thread is processing a turn. Tail this
+   file (`Monitor` with `tail -F`) for live progress, independent of
+   whether the round was started via `codex exec` or `codex exec resume`.
+   Confirmed live-tailed successfully today: new lines appeared within
+   ~1s of a round starting, well before the round finished.
+3. **Event vocabulary in the rollout file** (confirmed by direct
+   observation of a real turn): `response_item` entries with `payload.type`
+   of `message` (`payload.phase` distinguishes `commentary` — intermediate
+   narration, discard for the "answer" — from `final_answer` — the actual
+   text to surface), `reasoning`, `custom_tool_call` /
+   `custom_tool_call_output` (a command actually run + its result — this
+   is the same "did it actually investigate" evidence
+   `--capture-eventlog` extracts elsewhere in this project, available here
+   for free from the same file); `event_msg` entries with `payload.type`
+   of `item_completed`, `token_count`, and **`task_complete`** — the
+   definitive, unambiguous end-of-round signal (the same structural role
+   `codex exec --json`'s `turn.completed` already plays for `/cc`).
+
+## Round lifecycle (single reviewer)
+
+```
+1. Determine round number.
+   - Round 1: run `codex exec --json --sandbox workspace-write
+     --ask-for-approval on-request -c model_reasoning_effort=<level>
+     "<review prompt: diff + instructions>"` in the target repo, in the
+     background (matches /cc's existing backgrounded-Bash + PID-liveness-
+     watcher pattern — reuse that machinery, don't reinvent it).
+   - Round 2+: same, but `codex exec resume <threadId> --json ...
+     "<follow-up prompt: just the new rebuttal/question, NOT the diff
+     again>"` — this is where the token-efficiency goal is actually
+     realized: Codex already has the diff and prior findings in its own
+     persisted thread context.
+2. Parse the FIRST few lines of the process's own --json stdout stream
+   (not the rollout file) to capture `threadId` from `thread.started` —
+   this is available immediately, before the rollout file path is known
+   with certainty from the outside (the file is named using the thread's
+   own start timestamp, which this process determines, not the caller).
+3. Once threadId is known, resolve the rollout file path
+   (`~/.codex/sessions/<Y>/<M>/<D>/rollout-*-<threadId>.jsonl` — glob by
+   threadId suffix since the exact timestamp prefix isn't independently
+   predictable) and start tailing it live via `Monitor` for progress
+   narration (e.g., surface `custom_tool_call` commands as "investigating:
+   <command>" progress lines).
+4. Wait for `task_complete` in the tailed stream (defense in depth: also
+   apply /cc's existing PID+start-time liveness watcher on the `codex
+   exec`/`codex exec resume` process itself, exactly as today, in case the
+   rollout-file signal is somehow missed).
+5. Extract the final answer: last `response_item` with
+   `payload.type=="message"` and `payload.phase=="final_answer"`.
+6. If the safety model requires approval and the round produced an
+   approval-request event (see "Safety model" — exact event shape is an
+   open verification item, not yet observed live), the plugin must answer
+   it before the round can complete; this is the first thing to spike
+   during implementation, not assumed here.
+```
+
+## Safety model — approval-based, not blanket read-only (per user decision)
+
+Chosen direction: `--sandbox workspace-write --ask-for-approval on-request`
+instead of `/cc`'s blanket `--sandbox read-only`. This is a deliberate,
+finer-grained alternative: rather than a static yes/no on ALL writes,
+each individual write/exec attempt outside the sandbox becomes a discrete
+event Claude evaluates in real time — strictly more capable than
+`read-only`, but **only as safe as the actual approval logic that gets
+implemented**. A policy that auto-approves everything is worse than
+today's `read-only`, not better; this must not ship with a rubber-stamp
+default.
+
+**Explicitly unresolved, first implementation spike required**: this
+session confirmed the `queue`/`resume`/rollout-file mechanism end-to-end
+for a round with no approval-requiring actions. It did **not** confirm
+what an approval-request looks like in the rollout file for a **headless
+`codex exec`/`codex exec resume` call specifically** (as opposed to the
+interactive TUI, where a human sees a prompt), nor how to answer one
+programmatically. `--approve-for-me` ("Route approval requests through
+automatic review using the workspace-write sandbox") exists as a flag but
+its exact semantics need live verification — it may or may not be
+suitable depending on whether "automatic review" means an LLM-side
+self-check (acceptable) or a rubber-stamp (not acceptable for this
+design's stated safety goal). **Do not proceed past this spike with an
+assumed-safe answer** — if headless approval-handling turns out to be
+unreliable or unobservable, fall back to `--sandbox read-only` for v1
+and revisit the approval-based model once the mechanism is actually
+verified.
+
+## Data retention (new obligation this design introduces)
+
+Because rounds are **not** `--ephemeral` (persistence is required for
+`resume` to work), each review leaves a real, persisted thread + rollout
+JSONL file under `~/.codex/sessions/`. `/cc`'s existing design deliberately
+avoids exactly this kind of accumulation. This plugin must:
+
+- Delete or archive the thread at the end of a review (via whatever CLI
+  equivalent of `Thread/delete`/`Thread/archive` exists — `codex delete
+  <id>` / `codex archive <id>` were seen in `codex --help`'s top-level
+  command list; confirm exact semantics during implementation).
+- Never leave a completed review's persisted thread lying around
+  indefinitely as a silent default — this needs the same explicit,
+  documented retention-policy treatment `run-codex-review.sh`'s
+  `--capture-eventlog` handling and `/cc`'s review-history JSONL log
+  already went through this session (delete-by-default with an explicit,
+  documented exception for what's deliberately kept, not the other way
+  around) — follow that established pattern, don't reinvent it.
+
+## Structured output — accepted limitation
+
+Unlike `/cc`, there is no `--output-schema` enforcement available through
+this mechanism (`codex exec`'s own `--output-schema` still works for the
+FINAL message of a single call, actually — this may be usable per-round
+same as today; needs confirming it doesn't conflict with `--json`
+streaming or `resume`). If it does not compose cleanly, findings will need
+to be extracted from the free-text `final_answer` message via prompt
+instruction (ask Codex to answer in a specific parseable shape) rather
+than CLI-enforced schema — a real reliability step down from `/cc`,
+accepted as a v1 tradeoff for this experimental tool.
+
+## Parallel reviewer orchestration
+
+Multiple concurrent reviews = multiple concurrent `codex exec` processes
+(different threads), each with its own tailed rollout file. No new
+mechanism needed beyond running the single-reviewer lifecycle N times
+concurrently (mirrors `/cc`'s existing Phase 1 parallel-group dispatch
+pattern) — the file-per-thread design has no shared-state contention
+between concurrent reviewers to worry about.
+
+## Open items to spike first (in implementation order)
+
+1. **Approval-request event shape + answer mechanism** for a headless
+   `codex exec`/`resume` call (see "Safety model" — this can invalidate
+   the chosen safety model if it doesn't pan out; spike before writing
+   the rest of the plugin).
+2. Confirm `codex exec resume <threadId>` reuses context correctly (no
+   diff re-send needed) and measure the actual token savings vs. today's
+   `/cc` round.
+3. Confirm `--output-schema` behavior when combined with `--json` +
+   `resume` (does the final rollout `message`/`final_answer` conform to
+   the schema the same way `--output-last-message` does today for a
+   plain one-shot call?).
+4. Confirm thread deletion/archival CLI semantics for the retention
+   cleanup step.
+5. Only after 1-4 are confirmed: write the actual implementation plan
+   (`superpowers:writing-plans`) and build.
