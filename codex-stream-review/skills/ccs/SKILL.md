@@ -15,7 +15,7 @@ Execute the given task, then reach fact-based consensus with Codex — on a sing
 Codex thread for the whole run — before reporting to the user, or until a hard cap of 20 rounds
 is hit.
 
-This skill is structurally parallel to `~/.claude/commands/cc/SKILL.md` (equal-partnership
+This skill is structurally parallel to `/Users/hmc7279235/Work/Develop/plugins/codex-direct-review/skills/ccd/SKILL.md` (equal-partnership
 principles, the Why/History/Scope `--focus` discipline, the sentinel-file safe-read idiom, the
 PID-plus-start-time liveness watcher, the JSONL review-history log, the convergence/guard rules,
 the Korean-only final report) — read that file for the full reasoning behind any pattern only
@@ -46,7 +46,7 @@ path.
   reviewing pasted analysis/plan text with no real git diff) is not ported. `/ccs` v1 only
   reviews a real repo's diff (`--uncommitted` / `--base <ref>` / `--commit <sha>`). If Phase 0
   below finds nothing concrete to diff, or the material to review isn't a repo diff at all, tell
-  the user to use `/cc` instead — do not invent a workaround.
+  the user to use `codex-direct-review:ccd` instead — do not invent a workaround.
 
 These are deferred, addable-later features per the design doc, not abandoned ideas.
 
@@ -225,7 +225,7 @@ assume a shell variable survived.
    { jq -j '.plugins["codex-stream-review@youzooyou-plugins"][] | select(.scope=="user") | .installPath' ~/.claude/plugins/installed_plugins.json; printf 'x'; } > "$INSTALL_PATH_FILE"
    INSTALL_PATH="$(cat "$INSTALL_PATH_FILE")"; INSTALL_PATH="${INSTALL_PATH%x}"
    if [ -z "$INSTALL_PATH" ] || [ ! -x "$INSTALL_PATH/scripts/run-ccs-review.sh" ]; then
-     echo "codex-stream-review@youzooyou-plugins is not installed, or is missing run-ccs-review.sh (a stale/incomplete install) — run /plugin install codex-stream-review@youzooyou-plugins (or update it), or use /cc instead" >&2
+     echo "codex-stream-review@youzooyou-plugins is not installed, or is missing run-ccs-review.sh (a stale/incomplete install) — run /plugin install codex-stream-review@youzooyou-plugins (or update it), or use codex-direct-review:ccd instead" >&2
      rm -f "$INSTALL_PATH_FILE"
      exit 1
    fi
@@ -258,7 +258,7 @@ assume a shell variable survived.
      hash-object -t tree /dev/null` — never `git add -N`, which mutates the index).
    - **If still nothing concrete, or the material to review isn't a repo diff at all (a pasted
      plan, generated text, analysis with no git diff to point to): stop and tell the user to use
-     `/cc` instead** (see "v1 scope" above — there is no `CLEAN_REPO_DIR` non-repo-artifact path
+     `codex-direct-review:ccd` instead** (see "v1 scope" above — there is no `CLEAN_REPO_DIR` non-repo-artifact path
      in `/ccs` v1). Clean up before stopping:
      `rm -f "<literal REPO_ROOT_FILE>" "<literal INSTALL_PATH_FILE>"`.
 
@@ -690,4 +690,4 @@ Same structure `/cc` uses:
   mode split already prevents cleaning up a thread a caller is still trying to `--resume`).
 - Do not report to the user until Phase 3.
 - For a non-repo-artifact review, or when parallel multi-reviewer coverage is actually needed,
-  use `/cc` — do not attempt to bend `/ccs` v1 to cover either case.
+  use `codex-direct-review:ccd` — do not attempt to bend `/ccs` v1 to cover either case.

@@ -57,9 +57,9 @@ being trusted.
 - **`/codex-review`** — a single, one-shot review of uncommitted changes, a base-branch diff, or a
   specific commit. No cross-verification, just one Codex pass with findings presented for you to act
   on (nothing is auto-fixed).
-- **`/cc`** (a separate personal command, not bundled in this plugin) resolves this plugin's install
-  path dynamically and calls the same wrapper directly for its multi-round Claude+Codex adversarial
-  review loop.
+- **`codex-direct-review:ccd`** (bundled in this plugin, see `skills/ccd/SKILL.md`) is this plugin's
+  own multi-round Claude+Codex adversarial cross-review skill — the same review loop `codex-review`
+  above runs once, but iterated to consensus.
 
 #### How it works
 
