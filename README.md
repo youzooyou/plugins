@@ -100,8 +100,8 @@ exactly as they are.
   contract.
 - Every fresh round runs `--sandbox read-only`, the same boundary `/cc`/`codex-direct-review` use —
   there is no approval-gated write capability in this plugin.
-- **`/ccs`** — a full Claude+Codex adversarial cross-review loop built on top of the raw
-  `stream-review` skill above: same consensus outcome as `/cc`, but on a single resumable thread,
+- **`/ccs`** — a full Claude+Codex adversarial cross-review loop built on top of this plugin's
+  resumable-thread dispatch: same consensus outcome as `/cc`, but on a single resumable thread,
   so follow-up rounds are cheap (no diff re-send after round 1) and, in a tmux-capable
   environment, a live progress pane opens automatically. It also owns its thread's entire
   lifecycle, cleaning it up on every terminal path instead of leaving that to the caller. A
@@ -115,12 +115,17 @@ exactly as they are.
   `THREAD_ID=<uuid>` (the signal a caller uses for live tailing), then internally polls that
   thread's rollout file under `~/.codex/sessions/` for its own `task_complete` event and extracts
   the final answer directly from that file once the round is done. `--cleanup <threadId>` is a
-  separate mode that deletes the thread via `codex delete --force`.
+  separate mode that deletes the thread via `codex delete --force`. Used directly by the raw
+  `stream-review` skill below.
 - `skills/stream-review/SKILL.md` — how to start, continue, and clean up a review, and the current
   safety-model status.
+- `scripts/run-ccs-review.sh` — a separate wrapper `/ccs` dispatches through instead of
+  `run-stream-review.sh` above: combines `run-codex-review.sh`'s diff-collection/coverage logic
+  with the resumable-thread dispatch mechanism, since `run-stream-review.sh` itself has no
+  diff-collection capability.
 - `skills/ccs/SKILL.md` — the `/ccs` command: a single-reviewer, resumable-thread version of `/cc`'s
   adversarial consensus loop (max 20 rounds), with automatic thread cleanup and an auto-opening
-  tmux pane on top of the raw `run-stream-review.sh` mechanism above.
+  tmux pane.
 
 ## Contributing
 
