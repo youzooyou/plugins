@@ -129,7 +129,7 @@ failed round):
 | `reason` | When | `threadId` present? |
 |---|---|---|
 | `bad_args` | Malformed/missing/conflicting flags, or a leading-dash scope/resume value | No |
-| `git_error` | The `git diff`/`git show` call for a scope flag failed | No |
+| `git_error` | The `git diff`/`git show` call for a scope flag failed, or the untracked-file collector exited with a non-2 nonzero status | No |
 | `incomplete_collection` | The untracked-file collector exited status 2 | No |
 | `no_thread_started` | No `thread.started` event within 10s of a fresh dispatch | No |
 | `resume_thread_not_found` | No rollout file exists for the given `--resume` threadId (already cleaned up, or never valid) | Yes (the id given) |
@@ -165,9 +165,9 @@ the only thing that ever `--resume`s it — so it calls `--cleanup` on **every**
 (CLEAN, NOT CONVERGED, COULD NOT VERIFY, PARTIAL COVERAGE) automatically, with no separate opt-in
 step a human needs to remember. See "Phase 3 — Terminal path" below.
 
-> **Discrepancy note:** an earlier draft of this project's design doc referenced an
-> `--output-schema <path>` flag on this wrapper. The actual, current `run-ccs-review.sh` has no
-> such caller-facing flag — its argument parser only accepts `--cwd`, `--uncommitted`, `--base`,
+> **Discrepancy note:** this project's `task-2-brief.md` (the brief for the task that built this
+> wrapper) referenced an `--output-schema <path>` flag on it. The actual, current
+> `run-ccs-review.sh` has no such caller-facing flag — its argument parser only accepts `--cwd`, `--uncommitted`, `--base`,
 > `--commit`, `--focus`, `--resume`, `--timeout`, `--capture-eventlog`, and the separate
 > `--cleanup` mode. The JSON output schema (`schemas/review-verdict.schema.json`) is applied
 > internally and unconditionally to every `codex exec` call the wrapper itself makes — it is not
@@ -477,13 +477,18 @@ the loop — it is never re-collected on a resumed round.
   than memory) → stop early, report NOT CONVERGED rather than burning remaining rounds.
 - **Empty / failed review ≠ CLEAN.** `ok:false` → retry **once**, reusing the exact same
   dispatch shape as the round that failed:
-  - A failed **round 1** (fresh) retries the same scope flag fresh (no thread existed to resume,
-    or one leaked out of the failure — see the reason table's `threadId` column; if a threadId
-    is present even on this failure, hold onto it for eventual `--cleanup` even though the retry
-    itself dispatches fresh again).
+  - A failed **round 1** (fresh) retries the same scope flag fresh. Several failure reasons
+    (`interrupted`, `timeout`, `nonzero_exit`, `missing_task_complete`, `rollout_not_found`,
+    `no_final_answer`, `invalid_json` — see the reason table's `threadId` column) fire *after* a
+    thread already started, so the failed attempt can leak a real, still-live thread even though
+    the retry dispatches fresh and gets a **different** `threadId`. **Append any such leaked
+    threadId to `LEAKED_THREAD_IDS`** — a literal list Claude remembers for the rest of the run,
+    the same way `THREAD_ID`/`SESSION_ID` are remembered — so Phase 3's terminal path (below) can
+    clean it up alongside the run's final thread; it is never cleaned up here, only recorded.
   - A failed **round 2+** (resume) retries the exact same `--resume <threadId> --focus <same
     text>` call — the thread persists across a failed round, so resume is still valid and no
-    diff needs re-sending.
+    diff needs re-sending, and no new threadId is ever created (nothing to add to
+    `LEAKED_THREAD_IDS`).
   - If the retry still fails, stop and report **⚠️ COULD NOT VERIFY** — never declare CLEAN off a
     missing review. Still run the terminal-path cleanup (below) using whatever `threadId` is
     known, even from a failed response.
@@ -571,27 +576,40 @@ this JSONL audit log, which persists exactly like `/cc`'s own, for the same dura
 ## Phase 3 — Terminal path
 
 On **every** terminal outcome — `✅ CLEAN`, `⚠️ NOT CONVERGED`, `⚠️ COULD NOT VERIFY`, or
-`⚠️ PARTIAL COVERAGE` — do both of the following before reporting to the user. Neither is ever
-left to the user to remember; this is the deliberate difference from `stream-review`'s own
+`⚠️ PARTIAL COVERAGE` — do all of the following before reporting to the user. None of these is
+ever left to the user to remember; this is the deliberate difference from `stream-review`'s own
 caller-owns-cleanup contract (see "Mode 2 — cleanup" above).
 
-1. **Clean up the Codex thread**, if one was ever successfully obtained:
+1. **Clean up the run's final Codex thread**, if one was ever successfully obtained:
    ```bash
    "$INSTALL_PATH/scripts/run-ccs-review.sh" --cleanup "<literal THREAD_ID>"
    ```
    If no `THREAD_ID` was ever obtained at all (every round failed before a thread ever started —
-   `bad_args`/`no_thread_started` on every attempt), there is nothing to clean up; skip silently.
-   **A `cleanup_failed` result is surfaced plainly in the final report** (which thread, why) —
-   never hidden behind a clean-looking headline result. An undeleted thread means that review's
-   full diff/code content is still sitting on disk under `~/.codex/sessions/`.
+   `bad_args`/`no_thread_started` on every attempt), there is nothing to clean up here; skip
+   silently. **A `cleanup_failed` result is surfaced plainly in the final report** (which thread,
+   why) — never hidden behind a clean-looking headline result. An undeleted thread means that
+   review's full diff/code content is still sitting on disk under `~/.codex/sessions/`.
 
-2. **Close the tmux pane**, if one was opened in Phase 1 step 4:
+2. **Clean up every leaked thread in `LEAKED_THREAD_IDS`** (see Guards → "Empty / failed review ≠
+   CLEAN" above) — a round-1 retry after a post-`thread.started` failure abandons its first,
+   still-real thread the moment it dispatches fresh again, and nothing before this point ever
+   deletes it. This list is almost always empty (it only gains an entry when round 1 itself both
+   fails post-`thread.started` AND gets retried), but when it isn't, skipping this step is exactly
+   how a thread ends up permanently orphaned despite this skill's own cleanup guarantee. For each
+   `id` in `LEAKED_THREAD_IDS`:
+   ```bash
+   "$INSTALL_PATH/scripts/run-ccs-review.sh" --cleanup "<literal leaked threadId>"
+   ```
+   Same treatment as step 1's `cleanup_failed` handling — surface it plainly in the final report,
+   never hide it, and never let a failure here skip cleaning up any other id still in the list.
+
+3. **Close the tmux pane**, if one was opened in Phase 1 step 4:
    ```bash
    tmux kill-pane -t "$PANE_ID" 2>/dev/null || true
    ```
    Best-effort — a failure here is never worth surfacing to the user.
 
-3. **Clean up session-level temp files**, same fast path `/cc` uses:
+4. **Clean up session-level temp files**, same fast path `/cc` uses:
    ```bash
    rm -f "<literal REPO_ROOT_FILE>" "<literal INSTALL_PATH_FILE>"
    ```
@@ -608,8 +626,10 @@ Same structure `/cc` uses:
 - **소스 커버리지** — round 1이 `--uncommitted`였고 그 `coverage_source.status`가 한 번이라도
   `"partial"`/`"unknown"`이었다면, 결과와 무관하게 반드시 언급 — 어떤 파일이 왜 빠졌는지, 이후
   해결되었는지.
-- **스레드 정리 결과** — `--cleanup`이 성공했는지, 실패했다면 어떤 threadId가 왜 정리되지 않았는지
-  (ccs 고유 항목 — `/cc`에는 없는, 매 실행 종료 시 자동 정리되는 스레드의 존재를 반영).
+- **스레드 정리 결과** — 최종 스레드의 `--cleanup`이 성공했는지, 그리고 `LEAKED_THREAD_IDS`에 담긴
+  스레드(라운드 1이 실패 후 재시도되며 남긴 것)가 있었다면 그것들도 각각 정리에 성공했는지 — 실패한
+  threadId가 있다면 어떤 것이 왜 정리되지 않았는지 빠짐없이 언급 (ccs 고유 항목 — `/cc`에는 없는, 매
+  실행 종료 시 자동 정리되는 스레드의 존재를 반영).
 - **검증됨 / 미검증 / 남은 리스크·가정** — 정직하게, 작성만 하고 실행/검증하지 않은 것을 "완료"로
   포장하지 않는다.
 
