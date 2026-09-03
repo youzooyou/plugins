@@ -27,6 +27,16 @@ structured verdicts are NOT a limitation of this design — see "Structured
 output" below, which is a strict improvement over `/cc`'s current
 post-exit-only structured output.
 
+An earlier draft of this doc also planned a fourth capability —
+finer-grained, per-action approval control in place of `/cc`'s blanket
+`read-only` sandbox — as part of the original three-goal framing's safety
+model. **That capability does not exist to be gained on the installed CLI
+version and has been dropped**; see "Safety model" below. This plugin
+ships with the same `--sandbox read-only` boundary `/cc` already uses, no
+better and no worse on that specific axis — the three goals above (live
+streaming, token efficiency, parallel orchestration) are what it actually
+delivers.
+
 ## Why not the app-server RPC / MCP paths (rejected alternatives)
 
 Both investigated and rejected for v1 — see the knowledge base for the
@@ -89,11 +99,13 @@ independently-proven primitives:
 
 ```
 1. Determine round number.
-   - Round 1: run `codex exec --json --sandbox workspace-write
-     --ask-for-approval on-request -c model_reasoning_effort=<level>
-     "<review prompt: diff + instructions>"` in the target repo, in the
-     background (matches /cc's existing backgrounded-Bash + PID-liveness-
-     watcher pattern — reuse that machinery, don't reinvent it).
+   - Round 1: run `codex exec --json --sandbox read-only
+     -c model_reasoning_effort=<level>
+     "<review prompt: diff + instructions>" < /dev/null` in the target
+     repo, in the background (matches /cc's existing backgrounded-Bash +
+     PID-liveness-watcher pattern — reuse that machinery, don't reinvent
+     it; always redirect stdin from /dev/null — see the "Structured
+     output" section's stdin-hang gotcha).
    - Round 2+: same, but `codex exec resume <threadId> --json ...
      "<follow-up prompt: just the new rebuttal/question, NOT the diff
      again>"` — this is where the token-efficiency goal is actually
@@ -116,41 +128,62 @@ independently-proven primitives:
    rollout-file signal is somehow missed).
 5. Extract the final answer: last `response_item` with
    `payload.type=="message"` and `payload.phase=="final_answer"`.
-6. If the safety model requires approval and the round produced an
-   approval-request event (see "Safety model" — exact event shape is an
-   open verification item, not yet observed live), the plugin must answer
-   it before the round can complete; this is the first thing to spike
-   during implementation, not assumed here.
+6. No approval-request step exists in this lifecycle — see "Safety model"
+   below for why: headless `codex exec`/`resume` has no such mechanism on
+   this CLI version at all, confirmed by Task 1's live testing.
 ```
 
-## Safety model — approval-based, not blanket read-only (per user decision)
+## Safety model — `--sandbox read-only`, matching `/cc` (DECIDED 2026-09-03, reversing the original approval-based direction)
 
-Chosen direction: `--sandbox workspace-write --ask-for-approval on-request`
-instead of `/cc`'s blanket `--sandbox read-only`. This is a deliberate,
-finer-grained alternative: rather than a static yes/no on ALL writes,
-each individual write/exec attempt outside the sandbox becomes a discrete
-event Claude evaluates in real time — strictly more capable than
-`read-only`, but **only as safe as the actual approval logic that gets
-implemented**. A policy that auto-approves everything is worse than
-today's `read-only`, not better; this must not ship with a rubber-stamp
-default.
+**The originally-chosen "approval-based, not blanket read-only" direction
+is not achievable and has been dropped.** Task 1's spike (full evidence
+in the knowledge base's "Task 1 spike result" section) conclusively
+found: headless `codex exec`/`codex exec resume` has **no
+approval-requesting mode at all** on this CLI version (`0.151.0`) —
+`-a/--ask-for-approval` doesn't exist on either entrypoint (only on the
+interactive `codex` command), and the rollout file's own `turn_context`
+confirms `approval_policy` is **hardcoded to `"never"`**, independently
+confirmed for both a fresh and a resumed thread. `--approve-for-me`
+exists and is a real (non-rubber-stamp) check, but it is not
+interceptable or answerable by the calling process at all — the entire
+review happens inside an opaque, currently-flaky external service, with
+zero opportunity for Claude to apply its own judgment per action, which
+was the whole point of choosing an approval model in the first place.
+There is no approval-answering mechanism to build against.
 
-**Explicitly unresolved, first implementation spike required**: this
-session confirmed the `queue`/`resume`/rollout-file mechanism end-to-end
-for a round with no approval-requiring actions. It did **not** confirm
-what an approval-request looks like in the rollout file for a **headless
-`codex exec`/`codex exec resume` call specifically** (as opposed to the
-interactive TUI, where a human sees a prompt), nor how to answer one
-programmatically. `--approve-for-me` ("Route approval requests through
-automatic review using the workspace-write sandbox") exists as a flag but
-its exact semantics need live verification — it may or may not be
-suitable depending on whether "automatic review" means an LLM-side
-self-check (acceptable) or a rubber-stamp (not acceptable for this
-design's stated safety goal). **Do not proceed past this spike with an
-assumed-safe answer** — if headless approval-handling turns out to be
-unreliable or unobservable, fall back to `--sandbox read-only` for v1
-and revisit the approval-based model once the mechanism is actually
-verified.
+**Decision: `--sandbox read-only`, not `--sandbox workspace-write`.**
+Task 1's own report recommended `workspace-write` instead of the plan's
+originally-stated outcome-(b) fallback (`read-only`), reasoning that
+`workspace-write`'s small static writable-root allowlist (workspace root
++ `/tmp` + `$TMPDIR`) "costs nothing extra" since everything outside it
+still hard-fails immediately, same as `read-only`. That framing only
+weighs the *outside-the-repo* case, where the two sandbox modes are
+indeed equivalent — it does not weigh the *inside-the-repo* case, which
+is exactly where they differ and exactly where it matters: `read-only`
+permits **zero** writes anywhere, including inside the repo under
+review; `workspace-write` permits **silent, un-gated writes inside the
+repo itself**, since `approval_policy` is hardcoded to `"never"`
+regardless of sandbox mode — there is no confirmation step, and no event
+in the stream distinguishes an in-repo write from any other completed
+action. That is precisely the failure mode `/cc`'s own core principle
+("Codex stays read-only; Claude remains the sole editor") exists to
+prevent. Task 1's stated justification for wanting write access at all
+— "allowing the reviewer to write findings/notes inside the repo... if
+ever needed" — is not actually needed by this design: findings are
+already extracted from the live-tailed rollout file's own event stream
+(see "Structured output" below), never from a file Codex writes to disk.
+There is no real benefit here to offset a real, unmitigated risk.
+**`--sandbox read-only` is therefore the correct choice** — it matches
+`/cc`'s own precedent exactly (zero regression in the reviewer-never-
+edits-code guarantee), and costs nothing relative to `workspace-write`
+for anything outside the repo, since both hard-fail identically there.
+
+This is a genuine, accepted reduction in scope from the plan's original
+three-goal framing: this plugin gains live streaming and token-efficient
+multi-round follow-up, but not finer-grained per-action approval control
+— that specific capability does not exist to be gained on this CLI
+version. If a future CLI version adds a real headless approval-request
+mechanism, revisit this section.
 
 ## Data retention (new obligation this design introduces) — DECIDED 2026-09-03
 
@@ -242,15 +275,20 @@ concurrently (mirrors `/cc`'s existing Phase 1 parallel-group dispatch
 pattern) — the file-per-thread design has no shared-state contention
 between concurrent reviewers to worry about.
 
-## Open items to spike first (in implementation order)
+## Open items — all four spikes complete (2026-09-03), safety model finalized by the coordinator
 
-1. **Approval-request event shape + answer mechanism** for a headless
-   `codex exec`/`resume` call (see "Safety model" — this can invalidate
-   the chosen safety model if it doesn't pan out; spike before writing
-   the rest of the plugin).
-2. Confirm `codex exec resume <threadId>` reuses context correctly (no
-   diff re-send needed) and measure the actual token savings vs. today's
-   `/cc` round.
+1. ~~Approval-request event shape + answer mechanism for a headless `codex
+   exec`/`resume` call~~ — **CONFIRMED 2026-09-03**: no such mechanism
+   exists on this CLI version (`approval_policy` hardcoded to `"never"`
+   for both fresh and resumed threads). The design's safety model has
+   been revised to plain `--sandbox read-only`, matching `/cc` — see
+   "Safety model" above for the full reasoning, including why the
+   spike's own `workspace-write` recommendation was not adopted.
+2. ~~Confirm `codex exec resume <threadId>` reuses context correctly and
+   measure actual token savings~~ — **CONFIRMED 2026-09-03**: zero
+   tool-call re-investigation in the resumed round, ~63% cheaper
+   (21,611 vs. 58,683 tokens) than an equivalent fresh call. See the
+   knowledge base's "Task 2 spike result" section.
 3. ~~Confirm `--output-schema` behavior when combined with `--json` +
    `resume`~~ — **CONFIRMED 2026-09-03**: yes, it survives both cleanly,
    and the live rollout file already contains structured JSON before
@@ -260,5 +298,8 @@ between concurrent reviewers to worry about.
    cleanup step.~~ — **CONFIRMED 2026-09-03**: `codex delete <threadId>
    --force` is the chosen default; see "Data retention" above and the
    knowledge base's "Task 4 spike result" section.
-5. Only after 1-4 are confirmed: write the actual implementation plan
-   (`superpowers:writing-plans`) and build.
+
+All four items are resolved. Proceeding to the implementation plan's
+Task 6 (build the wrapper) with the finalized decisions above: `--sandbox
+read-only`, `codex delete --force` cleanup, and reading structured
+answers directly off the live-tailed rollout file.

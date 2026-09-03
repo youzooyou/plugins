@@ -245,15 +245,27 @@ Read `.claude-plugin/marketplace.json` first, then add a third entry (after `cle
 
 - [ ] **Step 4: Write the round-dispatch core**
 
+**Finalized by Task 5 (2026-09-03):** no approval flag exists on `codex
+exec` at all (Task 1's finding) — the safety model is plain `--sandbox
+read-only`, matching `/cc`. `--cwd` is **not** a real `codex exec` flag
+(confirmed: the actual flag is `-C`/`--cd`, and `run-codex-review.sh`
+doesn't even use that — it just `cd`s into the target directory in the
+shell before invoking `codex exec`; match that exact, already-working
+convention here too, don't invent a different one). `< /dev/null` is
+required on every invocation per Task 3's stdin-hang gotcha.
+
 Based on whether `--resume` was given, construct either:
 ```bash
-codex exec --json --sandbox <per Task 5's decision> [--ask-for-approval on-request] \
-  [-c model_reasoning_effort=xhigh] [--output-schema "$SCHEMA"] \
-  --cwd "$CWD" "$FOCUS_TEXT"
+cd "$CWD"
+codex exec --json --sandbox read-only \
+  -c model_reasoning_effort=xhigh ${SCHEMA:+--output-schema "$SCHEMA"} \
+  "$FOCUS_TEXT" < /dev/null
 ```
 or
 ```bash
-codex exec resume "$RESUME_THREAD_ID" --json [--output-schema "$SCHEMA"] "$FOCUS_TEXT"
+cd "$CWD"
+codex exec resume "$RESUME_THREAD_ID" --json \
+  ${SCHEMA:+--output-schema "$SCHEMA"} "$FOCUS_TEXT" < /dev/null
 ```
 Run it exactly the way `run-codex-review.sh` runs its own `codex exec` call (background dispatch + the same wall-clock timeout poll-loop pattern already implemented there — reuse that code, don't reimplement a timeout mechanism from scratch).
 
