@@ -467,9 +467,12 @@ before a thread was ever created — no thread ID to record for those two.)
 
 ## Task 2 spike result: resume context reuse
 
-**Date:** 2026-09-03. **CLI version:** `codex-cli 0.151.0`. Full evidence and
-raw JSON in `.superpowers/sdd/2026-09-03-codex-stream-review/task-2-report.md`
-— this section is the condensed, load-bearing summary.
+**Date:** 2026-09-03. **CLI version:** `codex-cli 0.151.0`. Raw evidence is
+embedded directly below, matching Task 1's standard (a fuller narrative
+walkthrough also exists at
+`.superpowers/sdd/2026-09-03-codex-stream-review/task-2-report.md`, but that
+path is gitignored and has no git history — nothing load-bearing in this
+section depends on it surviving).
 
 **Setup**: scratch repo with a committed baseline `utils.py::last_index()`
 (correct, with an empty-list `ValueError` guard) and an uncommitted diff that
@@ -483,26 +486,70 @@ model_reasoning_effort=low "Review the uncommitted diff in this repo for
 correctness bugs. Do not fix anything."` — thread `01a065b0-f399-7792-9335-996d27a8811a`.
 Codex found the diff itself via `git diff` (never pasted into the prompt),
 empirically verified the bug with a `python3 -c` assertion, and correctly
-reported it. Final `turn.completed.usage`: `input_tokens:113801,
-cached_input_tokens:93904, cache_write_input_tokens:19879, output_tokens:917,
-reasoning_output_tokens:297` — own-turn total **114,718 tokens**.
+reported it (`"ISSUES:\n\n1. utils.py:3 — last_index() returns len(lst),
+which is one past the final valid index. ... It also silently returns 0 for
+an empty list instead of raising the documented ValueError."`). Raw final
+`token_count` event for this round, from the rollout file
+(`grep '"type":"token_count"' <rollout> | grep '"ordinal":48,'`):
+
+```json
+{"timestamp":"2026-09-03T05:15:21.385Z","ordinal":48,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":113801,"cached_input_tokens":93904,"cache_write_input_tokens":19879,"output_tokens":917,"reasoning_output_tokens":297,"total_tokens":114718},"last_token_usage":{"input_tokens":19882,"cached_input_tokens":19720,"cache_write_input_tokens":159,"output_tokens":166,"reasoning_output_tokens":85,"total_tokens":20048},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":null,"secondary":null,"credits":null,"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}
+```
+
+Own-turn total (this is the thread's first turn, starting from 0):
+**114,718 tokens** (`total_token_usage.total_tokens`).
 
 **Round 2** (`codex exec resume 01a065b0-... --json "Which specific line
 number is the bug on, and why exactly does it cause a wrong result for an
-empty input?"`): answered correctly (line 3, empty-input reasoning matching
-Round 1's own finding) with **zero `command_execution`/`custom_tool_call`
-items** — confirmed by grepping the rollout file's round-2 portion
-(ordinals 49-62) for both substrings via `grep -c -E`: zero matches, cross-checked
-against a full listing of every `"type":"..."` token in that range. Codex
-answered directly from the resumed thread's own persisted context, with no
-re-investigation. Marginal cost for this round alone (see field-name findings
-below): **21,611 tokens**.
+empty input?"`): answered correctly (`"The bug is on utils.py:3: return
+len(lst). For an empty list, len(lst) is 0, so the function returns 0. But an
+empty list has no elements and therefore no valid index; the prior contract
+explicitly raised ValueError. Returning 0 incorrectly presents index 0 as
+valid, and any caller that uses it to access lst[0] will then get an
+IndexError."`) with **zero `command_execution`/`custom_tool_call` items**.
+Exact command run against the round-2 portion of the (shared, resumed) rollout
+file, ordinals 49-62:
+
+```bash
+awk -F'"ordinal":' '{split($2,a,","); print a[1]" "$0}' "$ROLLOUT" \
+  | awk '$1+0 > 48' \
+  | grep -c -E '"custom_tool_call|command_execution'
+```
+
+Output: `0`. Cross-checked against a full listing of every `"type":"..."`
+token in that same ordinal range (`grep -oE '"ordinal":[0-9]+|"type":"[a-zA-Z_]+"'`),
+which likewise contains no `command_execution`/`custom_tool_call` entry —
+only `event_msg`, `response_item`, `reasoning`, `message`, `token_count`, and
+`task_complete`/`task_started` types appear. Codex answered directly from the
+resumed thread's own persisted context, with no re-investigation. Raw final
+`token_count` event for this round (same rollout file, ordinal 61 — the
+thread's second turn):
+
+```json
+{"timestamp":"2026-09-03T05:16:04.541Z","ordinal":61,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":135200,"cached_input_tokens":93904,"cache_write_input_tokens":41275,"output_tokens":1129,"reasoning_output_tokens":406,"total_tokens":136329},"last_token_usage":{"input_tokens":21399,"cached_input_tokens":0,"cache_write_input_tokens":21396,"output_tokens":212,"reasoning_output_tokens":109,"total_tokens":21611},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":null,"secondary":null,"credits":null,"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}
+```
+
+Marginal cost for this round alone (see field-name findings below):
+**21,611 tokens** (= 136,329 total-since-thread-start minus Round 1's ending
+114,718).
 
 **Round 3** (fresh, non-resumed comparison call, same effort/sandbox, diff
 text + the same follow-up question combined into one prompt): Codex *still*
 ran `git diff -- utils.py` to re-verify the pasted diff from disk rather than
 trusting the prompt text, needed 2 tool-call round-trips (vs Round 1's 5), and
-gave the same correct answer. Own-turn total: **58,683 tokens**.
+gave the same correct answer (`"ISSUES:\n\n1. utils.py:3 — return len(lst) is
+incorrect. For an empty list, len(lst) is 0, so the function returns 0 even
+though an empty list has no valid last-element index; it should raise
+ValueError as the prior contract required."`). Raw final `token_count` event,
+from Round 3's own (fresh, standalone) rollout file:
+
+```json
+{"timestamp":"2026-09-03T05:17:40.230Z","ordinal":30,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":58085,"cached_input_tokens":36706,"cache_write_input_tokens":21370,"output_tokens":598,"reasoning_output_tokens":231,"total_tokens":58683},"last_token_usage":{"input_tokens":21373,"cached_input_tokens":19671,"cache_write_input_tokens":1699,"output_tokens":142,"reasoning_output_tokens":71,"total_tokens":21515},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":null,"secondary":null,"credits":null,"individual_limit":null,"spend_control_reached":null,"plan_type":null,"rate_limit_reached_type":null}}}
+```
+
+Own-turn total: **58,683 tokens** (`total_token_usage.total_tokens` — this is
+a fresh thread's only turn, so cumulative-since-thread-start equals the
+turn's own cost here).
 
 **Token-count field, resolved directly from data, not guessed**: every
 rollout `event_msg` with `payload.type=="token_count"` carries
@@ -533,27 +580,69 @@ summing Round 1 + Round 2 (full two-step conversation via resume) = 136,329
 tokens, which is *more* than Round 3 alone (58,683 tokens) achieving both the
 review and the follow-up answer in a single call. This is a confound, not
 evidence against resume: Round 1's prompt forced Codex to *discover* the diff
-itself (5 tool-call round-trips including reading two full skill files and an
-empirical Python check), a fundamentally more expensive task than Round 3's
-prompt, which handed Codex the diff text directly. **The valid, uncontaminated
+itself (5 `command_execution` tool calls — reading two full skill files, `git
+status`/`diff`, `nl`/`rg`, a failed `python` call, then a `python3 -c`
+assertion — plus a 6th, final model call that synthesized the answer; 6 total
+model-API completions, matching the 6 `token_count` events observed in Round
+1's rollout portion — "6 model-call round-trips" and "5 tool-call
+round-trips" in this doc/report refer to these two different counts, not a
+discrepancy), a fundamentally more expensive task than Round 3's prompt,
+which handed Codex the diff text directly. **The valid, uncontaminated
 comparison is Round 2 vs Round 3** (identical follow-up question, one via
 resume, one via a fresh call bearing equivalent context) — that comparison
-cleanly favors resume. A production caller (like `/cc` today) that already
-embeds the diff text on round 1 rather than asking Codex to discover it would
-not pay Round 1's inflated investigation cost, making the Round-2-vs-3-style
-comparison the correct one to generalize from, not the raw 1+2-vs-3 sum.
+cleanly favors resume. **Untested generalization, stated here as an inference
+and not established fact**: a production caller (like `/cc` today) that
+already embeds the diff text on round 1 rather than asking Codex to discover
+it would *likely* not pay Round 1's inflated investigation cost — this
+session's evidence suggests the Round-2-vs-3-style comparison is the more
+appropriate one to generalize from, not the raw 1+2-vs-3 sum, but this was
+never independently verified with a 4th run (a lean, diff-embedded Round-1
+prompt, then resumed for the follow-up). Task 5/future readers should treat
+this specific generalization as plausible-but-unverified, not confirmed.
 
 **A second, uncontaminated piece of evidence for resume's efficiency**: a
 fresh thread's first turn re-pays a large fixed "session bootstrap" cost that
-a resumed turn does not. Round 1's system-injected context (before the actual
-review prompt) totaled roughly 29,600 characters (`skills_instructions`
-19,621 chars, `<permissions instructions>` 341, `<plugins_instructions>`
-1,014, multi-agent-team preamble 2,264, `<multi_agent_mode>` 271, `# AGENTS.md
-instructions` 5,640, `<environment_context>` 457). Round 2's resumed turn
-re-sent only ~5,400 characters of system context (a short safe-commands
-notice, 198 chars, and a Ponytail-mode banner, 5,229 chars) — roughly 5.5x
-less repeated boilerplate, on the same machine, same environment, same
-session. This is genuine resume-specific savings, independent of the
+a resumed turn does not. Extraction command (run against each `response_item`
+of `payload.type=="message"` at the given ordinal, printing the length of
+each `content[].text`):
+
+```bash
+grep "\"ordinal\":$ORD," "$ROLLOUT" | python3 -c "
+import json,sys
+d=json.loads(sys.stdin.readline())
+for c in d['payload'].get('content', []):
+    t = c.get('text', '')
+    print(f'ordinal $ORD: len={len(t)} first60={t[:60]!r}')
+"
+```
+
+Literal output, Round 1's fresh-turn system-injected items (ordinals 2-5,
+before the actual review prompt at ordinal 10):
+
+```
+ordinal 2: len=19621 first60='<skills_instructions>\n## Skills\nA skill is a set of local in'
+ordinal 2: len=341 first60='<permissions instructions>\nFilesystem sandboxing defines whi'
+ordinal 2: len=1014 first60='<plugins_instructions>\n## Plugins\nA plugin is a local bundle'
+ordinal 3: len=2264 first60='You are `/root`, the primary agent in a team of agents colla'
+ordinal 4: len=271 first60='<multi_agent_mode>Any earlier instruction enabling proactive'
+ordinal 5: len=5640 first60='# AGENTS.md instructions\n\n<INSTRUCTIONS>\n# Codex Global Cont'
+ordinal 5: len=457 first60='<environment_context>\n  <cwd>/private/tmp/codex-resume-spike'
+```
+
+Sum: 19621+341+1014+2264+271+5640+457 = **29,608 characters** of
+system/environment boilerplate before Round 1's actual review prompt.
+
+Same extraction against Round 2's resumed-turn system-injected items
+(ordinals 53-54, before the follow-up question at ordinal 55):
+
+```
+ordinal 53: len=198 first60='Safe read-only bash commands (ls, cat, grep, find, pwd, curl,'
+ordinal 54: len=5229 first60='PONYTAIL MODE ACTIVE — level: full\n\n# Ponytail\n\nYou are a l'
+```
+
+Sum: 198+5229 = **5,427 characters** — roughly 5.5x less repeated boilerplate
+than Round 1's fresh-turn bootstrap, on the same machine, same environment,
+same session. This is genuine resume-specific savings, independent of the
 diff-investigation confound above.
 
 **Environment-specific caveat**: this machine's own `AGENTS.md`-driven
