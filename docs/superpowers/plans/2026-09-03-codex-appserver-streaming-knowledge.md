@@ -909,3 +909,331 @@ Scratch repo (`/tmp/codex-schema-spike-repo`) and all
 `/tmp/stream-review-schema.json`, `/tmp/schema-spike-round*.jsonl`,
 `/tmp/stream-review-round*-final.json` scratch files were deleted after
 capturing the evidence above.
+
+## Task 4 spike result: thread cleanup command
+
+**Date:** 2026-09-03. **CLI version:** `codex-cli 0.151.0`. **Outcome:
+`codex delete <threadId> --force` is the confirmed, chosen default cleanup
+command. It permanently removes the rollout JSONL file from disk (not just
+a session-index update) and clears the thread's rows from the sqlite
+index. `codex archive <threadId>` only relocates the file — same full
+content, indefinitely — which does not satisfy this plugin's retention
+goal.**
+
+### Step 1: enumerate candidate commands
+
+Exact command and output:
+
+```bash
+$ codex --help 2>&1 | grep -E "^\s+(delete|archive|unarchive)\s"
+  archive           Archive a saved session by id or session name
+  delete            Permanently delete a saved session by id or session name
+  unarchive         Unarchive a saved session by id or session name
+```
+
+`codex delete --help` (relevant excerpt, verbatim):
+
+```
+Permanently delete a saved session by id or session name
+
+Usage: codex delete [OPTIONS] <SESSION>
+
+Arguments:
+  <SESSION>
+          Session id (UUID) or session name. UUIDs take precedence if it parses
+...
+      --force
+          Delete without prompting. SESSION must be a UUID
+```
+
+`codex archive --help` (relevant excerpt, verbatim — no `--force`-equivalent
+flag exists for archive; same option set as `delete` minus `--force`):
+
+```
+Archive a saved session by id or session name
+
+Usage: codex archive [OPTIONS] <SESSION>
+
+Arguments:
+  <SESSION>
+          Session id (UUID) or session name. UUIDs take precedence if it parses
+...
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### Step 2: `codex delete` — real thread, before/after verification
+
+Created a throwaway thread in a trusted repo (`codex exec` refuses
+`--sandbox`-less/untrusted dirs with "Not inside a trusted directory and
+--skip-git-repo-check was not specified" when run from `/tmp` directly —
+ran from this plugin's own worktree instead):
+
+```bash
+$ cd /Users/hmc7279235/Work/Develop/plugins/.worktrees/codex-stream-review
+$ codex exec --json --sandbox read-only "say hello, nothing else" < /dev/null > /tmp/delete-spike.jsonl 2>&1
+$ cat /tmp/delete-spike.jsonl
+Reading additional input from stdin...
+{"type":"thread.started","thread_id":"01a06600-a19a-7453-ba98-b6f72876d462"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Hello"}}
+{"type":"turn.completed","usage":{"input_tokens":16867,"cached_input_tokens":0,"cache_write_input_tokens":16864,"output_tokens":22,"reasoning_output_tokens":15}}
+```
+
+Thread ID: `01a06600-a19a-7453-ba98-b6f72876d462`.
+
+**Before-delete state**, checked three independent ways (rollout file on
+disk, and the sqlite index that backs session listing/resume):
+
+```bash
+$ find ~/.codex/sessions -iname "*01a06600-a19a-7453-ba98-b6f72876d462*"
+/Users/hmc7279235/.codex/sessions/2026/09/03/rollout-2026-09-03T15-41-52-01a06600-a19a-7453-ba98-b6f72876d462.jsonl
+
+$ sqlite3 ~/.codex/thread_history_1.sqlite "SELECT count(*) FROM thread_items WHERE thread_id='01a06600-a19a-7453-ba98-b6f72876d462';"
+3
+$ sqlite3 ~/.codex/thread_history_1.sqlite "SELECT count(*) FROM thread_turns WHERE thread_id='01a06600-a19a-7453-ba98-b6f72876d462';"
+1
+```
+
+(Note: `~/.codex/session_index.jsonl` was also checked and does **not**
+contain this thread ID — that file is unrelated to per-thread rollout
+tracking, likely resume-picker display names only. The load-bearing index
+is `thread_history_1.sqlite`'s `thread_items`/`thread_turns` tables, which
+`find`-verified rollout-file presence independently corroborates.)
+
+Ran the delete command:
+
+```bash
+$ codex delete 01a06600-a19a-7453-ba98-b6f72876d462 --force
+Deleted session 01a06600-a19a-7453-ba98-b6f72876d462.
+```
+
+**After-delete state** — rollout file searched across the entire
+`~/.codex` tree (not just its origin subdirectory, in case it moved rather
+than vanished), plus the same two sqlite counts:
+
+```bash
+$ find ~/.codex -iname "*01a06600-a19a-7453-ba98-b6f72876d462*"
+(no output — file is gone, not moved anywhere under ~/.codex)
+
+$ sqlite3 ~/.codex/thread_history_1.sqlite "SELECT count(*) FROM thread_items WHERE thread_id='01a06600-a19a-7453-ba98-b6f72876d462';"
+0
+$ sqlite3 ~/.codex/thread_history_1.sqlite "SELECT count(*) FROM thread_turns WHERE thread_id='01a06600-a19a-7453-ba98-b6f72876d462';"
+0
+```
+
+**Conclusion: `codex delete <id> --force` permanently removes the rollout
+file from disk (confirmed absent everywhere under `~/.codex`, not merely
+moved) and deletes its rows from the sqlite thread index. This is a true
+delete, not a soft-delete/index-only flag.**
+
+### Non-interactive session-listing check
+
+The brief asked to check `codex agents --json`/whatever session-listing
+mechanism shows the thread. `codex agents` (`Browse all agent sessions on
+the shared local app-server daemon`) takes no `--json` flag at all
+(`error: unexpected argument '--json' found`) and is a TUI-only picker.
+`codex resume --all --include-non-interactive` is the more relevant
+session-listing/resume-picker command and is also TUI-only — confirmed by
+running it with stdin closed:
+
+```bash
+$ codex resume --all --include-non-interactive < /dev/null
+Error: stdin is not a terminal
+```
+
+This fails immediately and cleanly (no hang) rather than silently
+succeeding — there is no scriptable, non-interactive session-listing
+command on this CLI version. The `thread_history_1.sqlite` `thread_items`/
+`thread_turns` tables (which back that TUI picker) are the closest
+scriptable equivalent, and were used above as the before/after evidence
+instead.
+
+### Step 3: `codex delete` without `--force` — confirms it's required for scripting, and confirms no hang
+
+Verified directly (not inferred from `--help` text alone) against one of
+the real orphaned Task 1 spike threads, with stdin closed exactly as a
+real non-interactive caller would leave it:
+
+```bash
+$ codex delete 01a0659e-c295-7e21-ba0d-6234f4c987f4 < /dev/null
+Error: cannot confirm session deletion without an interactive terminal; rerun with --force and a session UUID
+```
+
+Exit code `1`. Fails fast and cleanly — no hang, no silent no-op. **`--force`
+is mandatory for any headless/scripted caller** (this plugin's cleanup step
+must always pass it).
+
+### Step 3 (repeated for archive): `codex archive` — real thread, before/after verification
+
+Created a second throwaway thread the same way:
+
+```bash
+$ cd /Users/hmc7279235/Work/Develop/plugins/.worktrees/codex-stream-review
+$ codex exec --json --sandbox read-only "say hello, nothing else" < /dev/null > /tmp/archive-spike.jsonl 2>&1
+$ cat /tmp/archive-spike.jsonl
+Reading additional input from stdin...
+{"type":"thread.started","thread_id":"01a06602-0003-7572-9610-5eb4be36fb8f"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I'm using the conversation-start skill to follow the workspace's required operating rules."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'cat /Users/hmc7279235/.codex/plugins/cache/claude-plugins-official/superpowers/6.3.0/skills/using-superpowers/SKILL.md'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution", ... ,"exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Hello"}}
+{"type":"turn.completed","usage":{"input_tokens":34717,"cached_input_tokens":16864,"cache_write_input_tokens":17847,"output_tokens":307,"reasoning_output_tokens":173}}
+```
+
+Thread ID: `01a06602-0003-7572-9610-5eb4be36fb8f`.
+
+**Before-archive state:**
+
+```bash
+$ find ~/.codex -iname "*01a06602-0003-7572-9610-5eb4be36fb8f*"
+/Users/hmc7279235/.codex/sessions/2026/09/03/rollout-2026-09-03T15-43-22-01a06602-0003-7572-9610-5eb4be36fb8f.jsonl
+
+$ sqlite3 ~/.codex/thread_history_1.sqlite "SELECT count(*) FROM thread_items WHERE thread_id='01a06602-0003-7572-9610-5eb4be36fb8f';"
+6
+$ sqlite3 ~/.codex/thread_history_1.sqlite "SELECT count(*) FROM thread_turns WHERE thread_id='01a06602-0003-7572-9610-5eb4be36fb8f';"
+1
+```
+
+Ran the archive command:
+
+```bash
+$ codex archive 01a06602-0003-7572-9610-5eb4be36fb8f
+Archived session 01a06602-0003-7572-9610-5eb4be36fb8f.
+```
+
+**After-archive state** — searched across all of `~/.codex` (not assuming
+the file stayed at its origin path):
+
+```bash
+$ find ~/.codex -iname "*01a06602-0003-7572-9610-5eb4be36fb8f*"
+/Users/hmc7279235/.codex/archived_sessions/rollout-2026-09-03T15-43-22-01a06602-0003-7572-9610-5eb4be36fb8f.jsonl
+
+$ sqlite3 ~/.codex/thread_history_1.sqlite "SELECT count(*) FROM thread_items WHERE thread_id='01a06602-0003-7572-9610-5eb4be36fb8f';"
+6
+$ sqlite3 ~/.codex/thread_history_1.sqlite "SELECT count(*) FROM thread_turns WHERE thread_id='01a06602-0003-7572-9610-5eb4be36fb8f';"
+1
+
+$ find ~/.codex -iname "*01a06602-0003-7572-9610-5eb4be36fb8f*" -exec wc -l {} \;
+26 /Users/hmc7279235/.codex/archived_sessions/rollout-2026-09-03T15-43-22-01a06602-0003-7572-9610-5eb4be36fb8f.jsonl
+```
+
+**Conclusion: `codex archive <id>` (no `--force` needed, and none exists
+for this subcommand) MOVES the rollout file from
+`~/.codex/sessions/<Y>/<M>/<D>/` to a flat `~/.codex/archived_sessions/`
+directory (no date subdirectories there) — the file is not truncated,
+redacted, or altered (still 26 lines, same as an unarchived thread of this
+size would have), and the sqlite index rows are left completely
+untouched (`thread_items`/`thread_turns` counts identical before and
+after). Archive is a pure relocation, not a retention reduction: the full
+diff/code content a review thread would contain remains on disk,
+indefinitely, just under a different path.**
+
+### Behavioral comparison (delete vs. archive, side by side)
+
+| | `codex delete <id> --force` | `codex archive <id>` |
+|---|---|---|
+| Rollout file | Permanently removed (confirmed gone via `find` across all of `~/.codex`) | Moved to `~/.codex/archived_sessions/`, content fully intact |
+| sqlite `thread_items`/`thread_turns` | Rows deleted (count → 0) | Rows unchanged |
+| Non-interactive safety | Refuses without `--force` (`Error: cannot confirm session deletion without an interactive terminal`), exit 1, no hang | No confirmation step observed; ran directly without any flag |
+| Reversible | No | Yes (`codex unarchive <id>` exists per Step 1's `--help` grep, not independently tested this session since it's out of scope for a delete-by-default recommendation) |
+| Net effect on sensitive content retention | Removes it | Keeps it, indefinitely, just relocated |
+
+### Decision: `delete`, not `archive` — reasoning tied to this project's own precedents
+
+This plugin's rollout files are the same class of risk as
+`run-codex-review.sh`'s raw eventlog, not `/cc`'s review-history JSONL log:
+
+- `/cc`'s review-history log is a **curated summary** of findings/verdicts
+  — a genuine audit trail, safe and useful to keep indefinitely. That
+  precedent favors `archive`-like retention.
+- `run-codex-review.sh`'s raw eventlog contains **the full unredacted
+  command/tool-call transcript** of a review run and is deleted
+  immediately after the useful summary is extracted from it — a
+  minimize-retention precedent, because the raw artifact itself (not a
+  derived summary) is the sensitive thing.
+- This design's rollout file is squarely the second case: per the design
+  doc's own "Round lifecycle" section, the prompt embeds "diff + review
+  instructions" directly, and the rollout file is the **full raw
+  transcript** of the review (every tool call, every intermediate
+  reasoning step, the full diff text, the full final answer) — not a
+  curated summary. `archive`, as confirmed above, does not reduce this
+  file's content or lifetime at all; it only changes its directory. That
+  is functionally equivalent to never cleaning it up, just under a less
+  discoverable path.
+
+**Decision: this plugin's cleanup step uses `codex delete <threadId>
+--force` as its default, at the end of a review's final round.** This
+has been written into the design doc's "Data retention" section
+(`docs/2026-09-03-codex-stream-review-design.md`), replacing the prior
+undecided "delete or archive" language with this concrete choice and its
+reasoning.
+
+### Bonus: cleanup sweep of all orphaned Task 1/2/3 spike threads
+
+Collected every thread ID recorded as "not yet archived/deleted" across
+this knowledge doc's Task 1, Task 2, and Task 3 spike-result sections
+(cross-checked by grepping this file for the UUID pattern and manually
+excluding two `turn_id` values that are not thread IDs —
+`01a065a0-e30c-71c3-a5e6-28f378873b3a` and
+`01a065ab-57e3-7df0-a08a-09dc351afc8a`, both `turn_context.payload.turn_id`
+values embedded in Task 1's own rollout-file excerpts, not `thread_id`
+values). Full list swept, each individually verified gone via `find`
+across all of `~/.codex` before and after:
+
+```bash
+$ for TID in \
+  01a0659e-c295-7e21-ba0d-6234f4c987f4 \
+  01a0659f-6a55-7340-b539-56a815568dda \
+  01a065a0-3edc-7d90-a6da-d427d6ace1a4 \
+  01a065a0-e269-7893-bfa5-7673ca9ba6cb \
+  01a065a2-3c73-7af0-b323-57179d2d4b6b \
+  01a065a3-55a4-7d73-a7a6-1be8236d39d1 \
+  01a065ab-0fdd-7f11-9118-1a66303c430f \
+  01a065b0-f399-7792-9335-996d27a8811a \
+  01a065b3-5637-7c31-90ba-ff4bf99cf8e4 \
+  01a065f7-ee00-7350-90c2-2be638e341d0 \
+; do codex delete "$TID" --force; done
+Deleted session 01a0659e-c295-7e21-ba0d-6234f4c987f4.
+Deleted session 01a0659f-6a55-7340-b539-56a815568dda.
+Deleted session 01a065a0-3edc-7d90-a6da-d427d6ace1a4.
+Deleted session 01a065a0-e269-7893-bfa5-7673ca9ba6cb.
+Deleted session 01a065a2-3c73-7af0-b323-57179d2d4b6b.
+Deleted session 01a065a3-55a4-7d73-a7a6-1be8236d39d1.
+Deleted session 01a065ab-0fdd-7f11-9118-1a66303c430f.
+Deleted session 01a065b0-f399-7792-9335-996d27a8811a.
+Deleted session 01a065b3-5637-7c31-90ba-ff4bf99cf8e4.
+Deleted session 01a065f7-ee00-7350-90c2-2be638e341d0.
+```
+
+Also deleted this task's own two test threads (the delete-test thread was
+already gone; the archive-test thread — `01a06602-0003-7572-9610-5eb4be36fb8f`
+— was deleted too, from its post-archive `archived_sessions/` location, to
+confirm `delete` also works on an already-archived session):
+
+```bash
+$ codex delete 01a06602-0003-7572-9610-5eb4be36fb8f --force
+Deleted session 01a06602-0003-7572-9610-5eb4be36fb8f.
+```
+
+**Final verification — all 12 IDs (10 orphaned + this task's own 2)
+independently re-checked with `find` across the entire `~/.codex` tree
+after all deletes, confirming zero remain:**
+
+```bash
+$ for TID in 01a0659e-c295-7e21-ba0d-6234f4c987f4 01a0659f-6a55-7340-b539-56a815568dda \
+  01a065a0-3edc-7d90-a6da-d427d6ace1a4 01a065a0-e269-7893-bfa5-7673ca9ba6cb \
+  01a065a2-3c73-7af0-b323-57179d2d4b6b 01a065a3-55a4-7d73-a7a6-1be8236d39d1 \
+  01a065ab-0fdd-7f11-9118-1a66303c430f 01a065b0-f399-7792-9335-996d27a8811a \
+  01a065b3-5637-7c31-90ba-ff4bf99cf8e4 01a065f7-ee00-7350-90c2-2be638e341d0 \
+  01a06600-a19a-7453-ba98-b6f72876d462 01a06602-0003-7572-9610-5eb4be36fb8f; do
+  R=$(find ~/.codex -iname "*${TID}*")
+  if [ -n "$R" ]; then echo "STILL PRESENT: $TID -> $R"; fi
+done
+(no output — all 12 confirmed gone)
+```
+
+**All 12 threads (10 orphaned from Tasks 1-3, plus this task's own 2 test
+threads) successfully cleaned up. Zero orphaned Codex threads remain from
+this plan's spike work as of this task's completion.**

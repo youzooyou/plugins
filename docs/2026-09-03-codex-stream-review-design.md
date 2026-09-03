@@ -152,24 +152,55 @@ unreliable or unobservable, fall back to `--sandbox read-only` for v1
 and revisit the approval-based model once the mechanism is actually
 verified.
 
-## Data retention (new obligation this design introduces)
+## Data retention (new obligation this design introduces) — DECIDED 2026-09-03
 
 Because rounds are **not** `--ephemeral` (persistence is required for
 `resume` to work), each review leaves a real, persisted thread + rollout
 JSONL file under `~/.codex/sessions/`. `/cc`'s existing design deliberately
-avoids exactly this kind of accumulation. This plugin must:
+avoids exactly this kind of accumulation.
 
-- Delete or archive the thread at the end of a review (via whatever CLI
-  equivalent of `Thread/delete`/`Thread/archive` exists — `codex delete
-  <id>` / `codex archive <id>` were seen in `codex --help`'s top-level
-  command list; confirm exact semantics during implementation).
+**Decision: use `codex delete <threadId> --force` at the end of every
+review, not `codex archive`.** Confirmed exact semantics (Task 4 spike,
+`codex-cli 0.151.0` — full embedded evidence in the knowledge base's "Task 4
+spike result" section):
+
+- `codex delete <id> --force` **permanently removes** the rollout JSONL file
+  from disk entirely (verified gone via `find` under all of `~/.codex`, not
+  just its origin directory) and deletes its rows from the
+  `thread_history_1.sqlite` index (`thread_items`/`thread_turns` both go to
+  0 rows). `--force` is required for any non-interactive/scripted caller —
+  without it, `codex delete` fails fast with `Error: cannot confirm session
+  deletion without an interactive terminal; rerun with --force and a
+  session UUID` (exit 1, no hang) when stdin isn't a TTY.
+- `codex archive <id>` (rejected as the default) only **moves** the rollout
+  file from `~/.codex/sessions/<Y>/<M>/<D>/` to a flat
+  `~/.codex/archived_sessions/` directory — full file content (all
+  `response_item`s) stays intact and readable, and the sqlite index rows
+  are **not** cleared. This does not reduce retention at all; it relocates
+  the same sensitive content indefinitely.
+
+**Reasoning, tied to this project's own precedents**: `/cc`'s
+review-history JSONL log is a curated *summary* of findings (an audit
+trail) — retaining it indefinitely is safe and useful. This plugin's
+rollout file is the opposite case: it is closer to
+`run-codex-review.sh`'s raw eventlog (deleted immediately after
+extraction) because it can contain the **full diff/code content** under
+review, not a curated summary — `archive` would leave that full content
+sitting on disk indefinitely under a different path, which is the raw
+eventlog's exact anti-pattern, not the audit-log's. `delete` is the
+correct fit, and matches the "delete-by-default, explicit documented
+exception only for what's deliberately kept" pattern already established
+this session.
+
+- The wrapper must call `codex delete <threadId> --force` as its cleanup
+  step at the end of every review round sequence (final round only — not
+  after each intermediate round, since `resume` needs the thread to still
+  exist for the next round).
 - Never leave a completed review's persisted thread lying around
-  indefinitely as a silent default — this needs the same explicit,
-  documented retention-policy treatment `run-codex-review.sh`'s
-  `--capture-eventlog` handling and `/cc`'s review-history JSONL log
-  already went through this session (delete-by-default with an explicit,
-  documented exception for what's deliberately kept, not the other way
-  around) — follow that established pattern, don't reinvent it.
+  indefinitely as a silent default — if `codex delete` itself fails for
+  any reason, that failure must be surfaced (not silently swallowed),
+  matching this project's "best-effort cleanup, never silently skip it"
+  convention.
 
 ## Structured output — confirmed working, a strict improvement over `/cc`
 
@@ -225,7 +256,9 @@ between concurrent reviewers to worry about.
    and the live rollout file already contains structured JSON before
    process exit (see "Structured output" above and the knowledge base's
    Task 3 spike result).
-4. Confirm thread deletion/archival CLI semantics for the retention
-   cleanup step.
+4. ~~Confirm thread deletion/archival CLI semantics for the retention
+   cleanup step.~~ — **CONFIRMED 2026-09-03**: `codex delete <threadId>
+   --force` is the chosen default; see "Data retention" above and the
+   knowledge base's "Task 4 spike result" section.
 5. Only after 1-4 are confirmed: write the actual implementation plan
    (`superpowers:writing-plans`) and build.
