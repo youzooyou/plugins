@@ -142,6 +142,7 @@ failed round):
 | `rollout_not_found` | Could not resolve `~/.codex/sessions/**/rollout-*-<threadId>.jsonl` | Yes |
 | `no_final_answer` | No `final_answer` message found in the rollout | Yes |
 | `invalid_json` | The final answer wasn't valid JSON despite the schema | Yes |
+| `schema_mismatch` | The final answer was valid JSON but failed the semantic verdict rules (CLEAN/findings cross-field consistency, nonblank evidence, complete dimension set) | Yes |
 
 An `ok:false` round is a **failed round, never a clean sign-off** — see Guards below.
 
@@ -405,13 +406,16 @@ already-quoted shell argument, not a value re-interpolated into a second string 
 shell re-parses). A quote-only check is not enough here: a value containing `$(...)` or a
 backtick needs no quote character to run a command when the pane's shell parses the
 double-quoted segment it ends up inside — so the guard denies everything except letters,
-digits, and `_./-`, checked *before* the pane exists so a rejected value never leaves an
+digits, `_./-`, and a literal space (a real install path can live under a directory whose name
+contains one, e.g. a macOS home directory like `/Users/John Doe/...` — a space is inert inside
+the double-quoted segment both values land in, so allowing it costs nothing while widening
+legitimate coverage), checked *before* the pane exists so a rejected value never leaves an
 orphaned blank pane behind:
 
 ```bash
 PANE_ID=""
 case "$INSTALL_PATH$THREAD_ID" in
-  *[!A-Za-z0-9_./-]*)
+  *[!-A-Za-z0-9_./\ ]*)
     :  # unsafe to interpolate into the pane's send-keys command; skip the pane this round
        # without ever creating one
     ;;
@@ -516,7 +520,8 @@ the loop — it is never re-collected on a resumed round.
   dispatch shape as the round that failed:
   - A failed **round 1** (fresh) retries the same scope flag fresh. Several failure reasons
     (`interrupted`, `timeout`, `nonzero_exit`, `missing_task_complete`, `rollout_not_found`,
-    `no_final_answer`, `invalid_json` — see the reason table's `threadId` column) fire *after* a
+    `no_final_answer`, `invalid_json`, `schema_mismatch` — see the reason table's `threadId`
+    column) fire *after* a
     thread already started, so the failed attempt can leak a real, still-live thread even though
     the retry dispatches fresh and gets a **different** `threadId`. **Append any such leaked
     threadId to `LEAKED_THREAD_IDS`** — a literal list Claude remembers for the rest of the run,

@@ -730,6 +730,41 @@ else
   elif [ -n "$SCHEMA" ] && ! printf '%s' "$FINAL_TEXT" | jq -e . >/dev/null 2>&1; then
     JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"invalid_json","threadId":%s,"detail":"final answer is not valid JSON despite --output-schema"}\n' "$THREAD_ID_JSON")"
     RESULT=1
+  # Schema-conformant JSON alone doesn't guarantee CLEAN<=>no-findings,
+  # ISSUES<=>at-least-one-finding, or nonblank verification/dimension
+  # evidence -- review-verdict.schema.json's plain type/enum/required checks
+  # can't express those cross-field rules (the backend's strict-structured-
+  # output mode rejects allOf/if-then outright), so this is the only
+  # enforcement point, mirroring codex-direct-review's own judge_result
+  # validator. This wrapper requires --focus unconditionally (checked in
+  # argument parsing above), so that validator's conditional "code-only
+  # review, no context given" summary-marker requirement never applies here
+  # and is omitted.
+  elif [ -n "$SCHEMA" ] && ! printf '%s' "$FINAL_TEXT" | jq -e '
+        (.verdict == "CLEAN" or .verdict == "ISSUES") and
+        has("summary") and (.summary == null or (.summary | type) == "string") and
+        ((keys_unsorted - ["verdict","findings","summary","dimensions"]) == []) and
+        (.findings | type == "array") and
+        (.findings | all(
+          (has("file") and (.file | type) == "string") and
+          (has("line") and (.line == null or ((.line | type) == "number" and (.line | floor) == .line and .line >= 1))) and
+          (has("severity") and (.severity == null or (.severity == "low" or .severity == "medium" or .severity == "high"))) and
+          (has("summary") and (.summary | type) == "string") and
+          (has("evidence") and (.evidence | type) == "string") and
+          (has("verification") and (.verification | type) == "string" and (.verification | test("\\S"))) and
+          ((keys_unsorted - ["file","line","severity","summary","evidence","verification"]) == [])
+        )) and
+        (if .verdict == "CLEAN" then (.findings | length == 0) else (.findings | length > 0) end) and
+        has("dimensions") and (.dimensions | type) == "object" and
+        ((.dimensions | keys_unsorted | sort) == ["contracts","correctness","intent","performance","resources_concurrency","reuse","security"]) and
+        (.dimensions | to_entries | all(.value |
+          (has("status") and (.status == "checked" or .status == "not_applicable" or .status == "blocked")) and
+          (has("evidence") and (.evidence | type) == "string" and (.evidence | test("\\S"))) and
+          ((keys_unsorted - ["status","evidence"]) == [])
+        ))
+      ' >/dev/null 2>&1; then
+    JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"schema_mismatch","threadId":%s,"detail":"final answer JSON does not satisfy review-verdict semantic rules"}\n' "$THREAD_ID_JSON")"
+    RESULT=1
   else
     if [ -n "$SCHEMA" ]; then
       VERDICT_JSON="$(printf '%s' "$FINAL_TEXT" | jq -c .)"
