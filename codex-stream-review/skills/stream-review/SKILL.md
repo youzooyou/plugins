@@ -44,14 +44,24 @@ A round can legitimately take up to 30 minutes, so don't assume a fast
 reply — run it in the background and wait for it rather than treating a
 long pause as a hang.
 
+Unlike `codex-direct-review`'s `run-codex-review.sh`, this wrapper has no
+`--uncommitted`/`--base`/`--commit` flags and gathers no diff itself — it
+forwards `--focus` verbatim as the prompt to `codex exec`. Scope is entirely
+the caller's responsibility: either embed the actual diff content in
+`--focus` directly, or give Codex explicit instructions for finding it
+itself (e.g. "review the uncommitted diff in this repo") and let it run
+`git diff` on its own — `--sandbox read-only` permits reads and shell exec,
+just not writes.
+
 The wrapper prints exactly one line of JSON:
 
 - `{"ok":false,"reason":"...","threadId":"...","detail":"..."}` — the run
   itself failed (bad arguments, no thread ever started, timeout, nonzero
-  exit, or no final answer found). Report this as a failed run, never as a
-  clean verdict. `threadId` may be present even on failure — hang onto it
-  when it is, since a failed round can still have left a thread on disk
-  that needs `--cleanup`.
+  exit, missing task-complete event, an unresolvable rollout file, no final
+  answer found, or an invalid-JSON final answer). Report this as a failed
+  run, never as a clean verdict. `threadId` may be present even on failure —
+  hang onto it when it is, since a failed round can still have left a
+  thread on disk that needs `--cleanup`.
 - `{"ok":true,"threadId":"...","verdict":...}` — `verdict` is a parsed JSON
   object when `--output-schema` was given, otherwise the raw answer text as
   a JSON string. Present it to the user; nothing here is auto-fixed.
