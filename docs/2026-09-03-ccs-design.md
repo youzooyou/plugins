@@ -257,11 +257,19 @@ Mirrors `/cc`'s existing guards exactly, applied to `/ccs`'s own rounds:
 
 ## Open Items
 
-- **Invocation form.** Whether `/ccs` is literally invocable as a bare
-  slash command from inside a plugin skill, or requires a
-  plugin-qualified form (e.g. `/codex-stream-review:ccs`, matching how
-  `stream-review` currently lists as `codex-stream-review:stream-review`
-  in this session's own available-skills listing), needs to be confirmed
-  during implementation — this affects the skill's own frontmatter/naming
-  but not this design's substance. Whichever form the harness actually
-  supports, "ccs" is the skill's own short name either way.
+- **Invocation form — CONFIRMED (2026-09-03).** `/ccs` is not invocable as
+  a bare slash command; it lists (and is invoked) plugin-qualified, as
+  `codex-stream-review:ccs`, matching every other plugin-supplied skill
+  observed across this entire session without exception (e.g.
+  `codex-stream-review:stream-review`, `codex-direct-review:codex-review`,
+  `atlassian:capture-tasks-from-meeting-notes`, `ponytail:ponytail`, etc.).
+  Confirmed two ways: (1) this consistent, exceptionless naming pattern
+  across every installed plugin's own skills observed this session, and
+  (2) `codex-stream-review/.claude-plugin/plugin.json` has no `skills`
+  field at all — skills under `skills/` are auto-discovered by directory
+  presence alone (the same mechanism that already exposed `stream-review`
+  with no explicit registration), so `ccs/SKILL.md` needs no manifest
+  change to be discovered; its qualified name is simply
+  `<plugin-name>:<skill-directory-name>`. "ccs" remains the skill's own
+  short name in its own frontmatter and in all documentation/user-facing
+  references — only the actual invocation syntax is plugin-qualified.
