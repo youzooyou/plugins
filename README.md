@@ -100,6 +100,13 @@ exactly as they are.
   contract.
 - Every fresh round runs `--sandbox read-only`, the same boundary `/cc`/`codex-direct-review` use —
   there is no approval-gated write capability in this plugin.
+- **`/ccs`** — a full Claude+Codex adversarial cross-review loop built on top of the raw
+  `stream-review` skill above: same consensus outcome as `/cc`, but on a single resumable thread,
+  so follow-up rounds are cheap (no diff re-send after round 1) and, in a tmux-capable
+  environment, a live progress pane opens automatically. It also owns its thread's entire
+  lifecycle, cleaning it up on every terminal path instead of leaving that to the caller. A
+  sibling option to `/cc`, not a replacement — no parallel multi-reviewer mode or
+  `--capture-evidence` in v1; see `skills/ccs/SKILL.md`.
 
 #### How it works
 
@@ -111,6 +118,9 @@ exactly as they are.
   separate mode that deletes the thread via `codex delete --force`.
 - `skills/stream-review/SKILL.md` — how to start, continue, and clean up a review, and the current
   safety-model status.
+- `skills/ccs/SKILL.md` — the `/ccs` command: a single-reviewer, resumable-thread version of `/cc`'s
+  adversarial consensus loop (max 20 rounds), with automatic thread cleanup and an auto-opening
+  tmux pane on top of the raw `run-stream-review.sh` mechanism above.
 
 ## Contributing
 
