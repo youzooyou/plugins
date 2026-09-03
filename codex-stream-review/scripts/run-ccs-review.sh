@@ -4,6 +4,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA="$SCRIPT_DIR/../schemas/review-verdict.schema.json"
 DEFAULT_TIMEOUT_SECS=1800
+THREAD_WAIT_SECS=10
 
 # register_temp_file PATH -> appends PATH to the cleanup registry
 # (TEMP_FILE_REGISTRY) so on_signal/cleanup_temp_files can remove it later,
@@ -231,10 +232,41 @@ build_review_prompt() {
   fi
 }
 
+# --cleanup <threadId>: the CALLER's explicit end-of-review step (Task 5's
+# retention decision) -- run only once the whole multi-round review is done,
+# never automatically after a single round, since `resume` needs the thread
+# to still exist for the next round. Deliberately its own tiny mode rather
+# than a flag combined with a round dispatch, so a caller cannot accidentally
+# clean up the very thread it just asked to `--resume`.
+if [ "${1:-}" = "--cleanup" ]; then
+  if [ $# -lt 2 ] || [ -z "$2" ]; then
+    printf '{"ok":false,"reason":"bad_args","detail":"--cleanup requires a threadId"}\n'
+    exit 1
+  fi
+  THREAD_ID="$2"
+  case "$THREAD_ID" in
+    -*)
+      DETAIL_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '"--cleanup threadId must not start with -: " + .')"
+      printf '{"ok":false,"reason":"bad_args","detail":%s}\n' "$DETAIL_JSON"
+      exit 1 ;;
+  esac
+  THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
+  DELETE_OUT="$(codex delete --force -- "$THREAD_ID" 2>&1)"
+  DELETE_STATUS=$?
+  if [ "$DELETE_STATUS" -ne 0 ]; then
+    DETAIL_JSON="$(printf '%s' "$DELETE_OUT" | jq -Rs '.')"
+    printf '{"ok":false,"reason":"cleanup_failed","threadId":%s,"detail":%s}\n' "$THREAD_ID_JSON" "$DETAIL_JSON"
+    exit 1
+  fi
+  printf '{"ok":true,"threadId":%s,"deleted":true}\n' "$THREAD_ID_JSON"
+  exit 0
+fi
+
 CWD=""
 SCOPE=""
 SCOPE_VALUE=""
 FOCUS=""
+RESUME_THREAD_ID=""
 TIMEOUT_SECS="$DEFAULT_TIMEOUT_SECS"
 # Declared here (not just inside the uncommitted case branch) so it's
 # always defined under `set -u` when emit_final_output reads it later,
@@ -270,6 +302,15 @@ while [ $# -gt 0 ]; do
     --focus)
       [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--focus requires a value"}\n'; exit 1; }
       FOCUS="$2"; shift 2 ;;
+    --resume)
+      [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--resume requires a value"}\n'; exit 1; }
+      case "$2" in
+        -*)
+          DETAIL_JSON="$(printf '%s' "$2" | jq -Rs '"--resume threadId must not start with -: " + .')"
+          printf '{"ok":false,"reason":"bad_args","detail":%s}\n' "$DETAIL_JSON"
+          exit 1 ;;
+      esac
+      RESUME_THREAD_ID="$2"; shift 2 ;;
     --timeout)
       [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--timeout requires a value"}\n'; exit 1; }
       BAD_TIMEOUT=0
@@ -302,15 +343,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "$CWD" ] || [ -z "$SCOPE" ]; then
+if [ -z "$CWD" ] || { [ -z "$SCOPE" ] && [ -z "$RESUME_THREAD_ID" ]; }; then
   printf '{"ok":false,"reason":"bad_args","detail":"require --cwd and exactly one of --uncommitted/--base/--commit"}\n'
   exit 1
 fi
 
-# kill_process_group PID -> TERM, brief wait, then KILL -- targets the
-# whole process GROUP (negative PID), not just PID itself, so a spawned
-# child (e.g. codex's own MCP host process) isn't left orphaned. Requires
-# `set -m` (enabled below) so every backgrounded job gets its own group.
+if [ -n "$RESUME_THREAD_ID" ] && [ -n "$SCOPE" ]; then
+  printf '{"ok":false,"reason":"bad_args","detail":"--resume cannot be combined with --uncommitted/--base/--commit -- a resumed round never re-collects the diff"}\n'
+  exit 1
+fi
+
+# kill_process_group PID -> TERM, brief wait, then KILL, targeting the whole
+# process group (codex is a Node wrapper that spawns real child processes).
 kill_process_group() {
   local pid="$1"
   [ -n "$pid" ] || return 0
@@ -318,38 +362,41 @@ kill_process_group() {
   sleep 1
   kill -KILL -"$pid" 2>/dev/null
 }
-
-# Installed before ANY background process (untracked-file collector
-# included), not just around codex exec, so an interrupt during either
-# subprocess is handled. UNTRACKED_PID/CODEX_PID use `${VAR:-}` since at
-# most one is ever set at a time.
+# resolve_rollout <threadId> -- rollout files live under
+# ~/.codex/sessions/<Y>/<M>/<D>/, so a thread started "now" almost always
+# resolves under today's date directory. Try that narrow, cheap lookup
+# first; only fall back to a full recursive scan of the whole sessions
+# tree (unbounded, grows with every session ever run) if today's
+# directory doesn't have it yet -- e.g. a call right at a midnight
+# rollover, or before the file has been created on disk. Always correct
+# (the fallback covers every case the narrow path could miss), just
+# cheaper in the common case.
+resolve_rollout() {
+  local tid="$1" f
+  f="$(find "$HOME/.codex/sessions/$(date +%Y/%m/%d 2>/dev/null)" -maxdepth 1 -name "rollout-*-${tid}.jsonl" 2>/dev/null | head -1)"
+  if [ -n "$f" ]; then
+    printf '%s' "$f"
+    return 0
+  fi
+  find "$HOME/.codex/sessions" -name "rollout-*-${tid}.jsonl" 2>/dev/null | head -1
+}
 on_signal() {
-  kill_process_group "${UNTRACKED_PID:-}"
   kill_process_group "${CODEX_PID:-}"
-  # Catch-all for the fork-to-assignment race: a signal can land after
-  # `( cmd ) &` forks but before `PID=$!` runs, when the checks above would
-  # still see it as empty. `jobs -p` reflects bash's job table synchronously
-  # at fork time, closing that gap regardless of variable timing.
   local job_pid
   for job_pid in $(jobs -p 2>/dev/null); do
     kill -KILL -"$job_pid" 2>/dev/null
   done
-  # Temp-file cleanup is handled by cleanup_temp_files' own EXIT trap, which
-  # still fires after this function's `exit 1` below.
-  printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
+  if [ -n "${THREAD_ID:-}" ]; then
+    local tid_json
+    tid_json="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
+    printf '{"ok":false,"reason":"interrupted","threadId":%s,"detail":"wrapper received a termination signal"}\n' "$tid_json"
+  else
+    printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
+  fi
   exit 1
 }
-
-# cleanup_temp_files -> sweeps every path in TEMP_FILE_REGISTRY and removes
-# the registry itself. Installed as an EXIT trap, so it runs on every exit
-# path in this script (including after on_signal's own `exit 1`) without a
-# hand-maintained cleanup call at each exit site.
 cleanup_temp_files() {
   if [ -n "${TEMP_FILE_REGISTRY:-}" ] && [ -f "$TEMP_FILE_REGISTRY" ]; then
-    # `|| [ -n "$reg_path" ]`: `read -d ''` returns non-zero at EOF without a
-    # final NUL delimiter, but still populates reg_path with the partial
-    # read -- without this fallback, a registry whose last entry lost its
-    # trailing NUL would have that one path silently skipped and leaked.
     while IFS= read -r -d '' reg_path || [ -n "$reg_path" ]; do
       [ -n "$reg_path" ] && rm -f "$reg_path"
     done < "$TEMP_FILE_REGISTRY"
@@ -368,6 +415,9 @@ set -m
 # review subcommand; instead we build the diff and JSON-shape instruction
 # ourselves and send both to generic `codex exec`, which does follow an
 # explicit in-prompt instruction.
+DIFF_TEXT=""
+SOURCE_COVERAGE_JSON=""
+if [ -z "$RESUME_THREAD_ID" ]; then
 case "$SCOPE" in
   base|commit)
     case "$SCOPE_VALUE" in
@@ -533,12 +583,28 @@ if [ "$GIT_STATUS" -ne 0 ]; then
   exit 1
 fi
 rm -f "$GIT_STDERR_FILE"
+fi
 
 if [ -z "$DIFF_TEXT" ] && _focus_is_empty; then
   # Canned verdict, synthesized here outside the model -- still needs a
   # schema-shaped dimensions ledger so callers get the same result shape.
   emit_final_output '{"ok":true,"verdict":{"verdict":"CLEAN","findings":[],"summary":null,"dimensions":{"correctness":{"status":"not_applicable","evidence":"no diff and no focus text -- nothing to review"},"security":{"status":"not_applicable","evidence":"no diff and no focus text -- nothing to review"},"performance":{"status":"not_applicable","evidence":"no diff and no focus text -- nothing to review"},"reuse":{"status":"not_applicable","evidence":"no diff and no focus text -- nothing to review"},"contracts":{"status":"not_applicable","evidence":"no diff and no focus text -- nothing to review"},"resources_concurrency":{"status":"not_applicable","evidence":"no diff and no focus text -- nothing to review"},"intent":{"status":"not_applicable","evidence":"no diff and no focus text -- nothing to review"}}}}'
   exit 0
+fi
+
+THREAD_ID=""
+ROLLOUT=""
+BASELINE_TASK_COMPLETE=0
+if [ -n "$RESUME_THREAD_ID" ]; then
+  THREAD_ID="$RESUME_THREAD_ID"
+  THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
+  echo "THREAD_ID=$THREAD_ID" >&2
+  ROLLOUT="$(resolve_rollout "$THREAD_ID")"
+  if [ -z "$ROLLOUT" ] || [ ! -f "$ROLLOUT" ]; then
+    printf '{"ok":false,"reason":"resume_thread_not_found","threadId":%s,"detail":"no rollout file found for this threadId"}\n' "$THREAD_ID_JSON"
+    exit 1
+  fi
+  BASELINE_TASK_COMPLETE="$(jq -c 'select(.type=="event_msg" and .payload.type=="task_complete")' "$ROLLOUT" 2>/dev/null | wc -l | tr -d ' ')"
 fi
 
 # Random per-run boundary token, unpredictable to whoever authored the diff
@@ -552,4 +618,116 @@ mktemp_registered PROMPT_FILE
 build_review_prompt > "$PROMPT_FILE"
 
 mktemp_registered EVENTLOG
-mktemp_registered OUTFILE
+
+(
+  cd "$CWD" || exit 127
+  if [ -n "$RESUME_THREAD_ID" ]; then
+    codex exec resume "$RESUME_THREAD_ID" --json \
+      ${SCHEMA:+--output-schema "$SCHEMA"} < "$PROMPT_FILE"
+  else
+    codex exec --json --sandbox read-only \
+      -c model_reasoning_effort=xhigh ${SCHEMA:+--output-schema "$SCHEMA"} \
+      < "$PROMPT_FILE"
+  fi
+) > "$EVENTLOG" 2>&1 &
+CODEX_PID=$!
+rm -f "$PROMPT_FILE"
+
+if [ -z "$THREAD_ID" ]; then
+  WAIT_DEADLINE=$((SECONDS + THREAD_WAIT_SECS))
+  while [ -z "$THREAD_ID" ]; do
+    if grep -q '"type":"thread.started"' "$EVENTLOG" 2>/dev/null; then
+      THREAD_ID="$(grep -m1 '"type":"thread.started"' "$EVENTLOG" | jq -r '.thread_id // empty' 2>/dev/null)"
+    fi
+    [ -n "$THREAD_ID" ] && break
+    kill -0 "$CODEX_PID" 2>/dev/null || break
+    [ "$SECONDS" -ge "$WAIT_DEADLINE" ] && break
+    sleep 0.5
+  done
+  if [ -z "$THREAD_ID" ]; then
+    kill_process_group "$CODEX_PID"
+    wait "$CODEX_PID" 2>/dev/null
+    CODEX_PID=""
+    printf '{"ok":false,"reason":"no_thread_started","detail":"no thread.started event within %ss"}\n' "$THREAD_WAIT_SECS"
+    exit 1
+  fi
+  THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
+  echo "THREAD_ID=$THREAD_ID" >&2
+fi
+
+DEADLINE=$((SECONDS + 10#$TIMEOUT_SECS))
+TIMED_OUT=0
+TASK_COMPLETE_SEEN=0
+while kill -0 "$CODEX_PID" 2>/dev/null; do
+  if [ -z "$ROLLOUT" ]; then
+    ROLLOUT="$(resolve_rollout "$THREAD_ID")"
+  fi
+  if [ -n "$ROLLOUT" ] && [ -f "$ROLLOUT" ]; then
+    CUR_COUNT="$(jq -c 'select(.type=="event_msg" and .payload.type=="task_complete")' "$ROLLOUT" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${CUR_COUNT:-0}" -gt "$BASELINE_TASK_COMPLETE" ]; then
+      TASK_COMPLETE_SEEN=1
+      break
+    fi
+  fi
+  if [ "$SECONDS" -ge "$DEADLINE" ]; then
+    TIMED_OUT=1
+    kill -TERM -"$CODEX_PID" 2>/dev/null
+    sleep 2
+    kill -KILL -"$CODEX_PID" 2>/dev/null
+    break
+  fi
+  sleep 1
+done
+wait "$CODEX_PID" 2>/dev/null
+EXIT_CODE=$?
+CODEX_PID=""
+if [ "$TASK_COMPLETE_SEEN" -eq 0 ] && [ "$TIMED_OUT" -eq 0 ] && [ -n "$ROLLOUT" ] && [ -f "$ROLLOUT" ]; then
+  CUR_COUNT="$(jq -c 'select(.type=="event_msg" and .payload.type=="task_complete")' "$ROLLOUT" 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${CUR_COUNT:-0}" -gt "$BASELINE_TASK_COMPLETE" ] && TASK_COMPLETE_SEEN=1
+fi
+
+if [ "$TIMED_OUT" -eq 1 ]; then
+  JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"timeout","threadId":%s,"detail":"round exceeded %ss"}\n' "$THREAD_ID_JSON" "$TIMEOUT_SECS")"
+  RESULT=1
+elif [ "$EXIT_CODE" -ne 0 ]; then
+  JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"nonzero_exit","threadId":%s,"detail":"codex exec exited %s"}\n' "$THREAD_ID_JSON" "$EXIT_CODE")"
+  RESULT=1
+elif [ "$TASK_COMPLETE_SEEN" -eq 0 ]; then
+  JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"missing_task_complete","threadId":%s,"detail":"no task_complete event found in rollout file"}\n' "$THREAD_ID_JSON")"
+  RESULT=1
+elif [ -z "$ROLLOUT" ] || [ ! -f "$ROLLOUT" ]; then
+  JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"rollout_not_found","threadId":%s,"detail":"could not resolve rollout file for this threadId"}\n' "$THREAD_ID_JSON")"
+  RESULT=1
+else
+  FINAL_TEXT="$(jq -n -r '
+      [inputs | select(.type=="response_item" and .payload.type=="message" and .payload.phase=="final_answer")]
+      | last
+      | if . == null then empty else (.payload.content // [] | map(select(.type=="output_text") | .text) | join("")) end
+    ' "$ROLLOUT" 2>/dev/null)"
+  if [ -z "$FINAL_TEXT" ]; then
+    JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"no_final_answer","threadId":%s,"detail":"no final_answer message found in rollout file"}\n' "$THREAD_ID_JSON")"
+    RESULT=1
+  elif [ -n "$SCHEMA" ] && ! printf '%s' "$FINAL_TEXT" | jq -e . >/dev/null 2>&1; then
+    JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"invalid_json","threadId":%s,"detail":"final answer is not valid JSON despite --output-schema"}\n' "$THREAD_ID_JSON")"
+    RESULT=1
+  else
+    if [ -n "$SCHEMA" ]; then
+      VERDICT_JSON="$(printf '%s' "$FINAL_TEXT" | jq -c .)"
+    else
+      VERDICT_JSON="$(printf '%s' "$FINAL_TEXT" | jq -Rs .)"
+    fi
+    JUDGE_OUTPUT="$(printf '{"ok":true,"threadId":%s,"verdict":%s}\n' "$THREAD_ID_JSON" "$VERDICT_JSON")"
+    RESULT=0
+  fi
+fi
+
+if [ -n "$CAPTURE_EVENTLOG_PATH" ]; then
+  cp "$EVENTLOG" "$CAPTURE_EVENTLOG_PATH" 2>/dev/null || true
+fi
+rm -f "$EVENTLOG"
+if [ "$RESULT" -eq 0 ]; then
+  emit_final_output "$JUDGE_OUTPUT"
+else
+  printf '%s\n' "$JUDGE_OUTPUT"
+fi
+exit "$RESULT"
