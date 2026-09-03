@@ -698,6 +698,25 @@ while kill -0 "$CODEX_PID" 2>/dev/null; do
   fi
   sleep 1
 done
+if [ "$TASK_COMPLETE_SEEN" -eq 1 ]; then
+  # task_complete lands in the rollout file -- a side channel independent of
+  # the dispatched process's own exit -- so observing it says nothing about
+  # whether the process is actually about to exit. Give it a bounded grace
+  # period to exit on its own before falling back to the same kill sequence
+  # the deadline branch above uses; without this, a process that emits
+  # task_complete but then hangs turns the unconditional `wait` below into
+  # an unbounded block, defeating the round's own --timeout guarantee.
+  GRACE_DEADLINE=$((SECONDS + 10))
+  while kill -0 "$CODEX_PID" 2>/dev/null && [ "$SECONDS" -lt "$GRACE_DEADLINE" ]; do
+    sleep 0.5
+  done
+  if kill -0 "$CODEX_PID" 2>/dev/null; then
+    TIMED_OUT=1
+    kill -TERM -"$CODEX_PID" 2>/dev/null
+    sleep 2
+    kill -KILL -"$CODEX_PID" 2>/dev/null
+  fi
+fi
 wait "$CODEX_PID" 2>/dev/null
 EXIT_CODE=$?
 CODEX_PID=""
