@@ -348,7 +348,7 @@ if [ -z "$CWD" ] || { [ -z "$SCOPE" ] && [ -z "$RESUME_THREAD_ID" ]; }; then
   exit 1
 fi
 
-if [ -z "$FOCUS" ]; then
+if _focus_is_empty; then
   printf '{"ok":false,"reason":"bad_args","detail":"require --focus -- on a fresh round it frames the diff, on --resume it carries the rebuttal/follow-up text"}\n'
   exit 1
 fi
