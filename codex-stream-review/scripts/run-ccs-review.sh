@@ -348,6 +348,11 @@ if [ -z "$CWD" ] || { [ -z "$SCOPE" ] && [ -z "$RESUME_THREAD_ID" ]; }; then
   exit 1
 fi
 
+if [ -z "$FOCUS" ]; then
+  printf '{"ok":false,"reason":"bad_args","detail":"require --focus -- on a fresh round it frames the diff, on --resume it carries the rebuttal/follow-up text"}\n'
+  exit 1
+fi
+
 if [ -n "$RESUME_THREAD_ID" ] && [ -n "$SCOPE" ]; then
   printf '{"ok":false,"reason":"bad_args","detail":"--resume cannot be combined with --uncommitted/--base/--commit -- a resumed round never re-collects the diff"}\n'
   exit 1
