@@ -1237,3 +1237,74 @@ done
 **All 12 threads (10 orphaned from Tasks 1-3, plus this task's own 2 test
 threads) successfully cleaned up. Zero orphaned Codex threads remain from
 this plan's spike work as of this task's completion.**
+
+## Task 5 addendum: fixing review findings on the coordinator's own safety-model decision
+
+A task review of Task 5's design-doc edits (the coordinator's own work,
+not a dispatched implementer — see the SDD ledger) found the ultimate
+`--sandbox read-only` decision sound, but caught three real evidentiary
+imprecisions in the *justifying prose*, which is fixed here rather than
+just in the design doc, since the design doc's fix references this
+addendum:
+
+1. **The `-C`/`--cd` flag claim had no citation anywhere in this
+   knowledge base** — it was asserted from memory of an earlier
+   `codex exec --help` check this session, never actually written down.
+   Re-verified directly, right now:
+   ```
+   $ codex exec --help 2>&1 | grep -A2 "cwd\|'-C'\|--cd\b"
+     -C, --cd <DIR>
+             Tell the agent to use the specified directory as its working root
+   ```
+   Confirmed: `codex exec` has no `--cwd` flag at all; the real flag is
+   `-C`/`--cd`. `run-codex-review.sh` uses neither — it `cd`s into the
+   target directory in the shell first (confirmed independently by the
+   Task 5 reviewer reading that script's source directly,
+   `codex-direct-review/scripts/run-codex-review.sh:2311-2325`,
+   `( cd "$CWD" || exit 127; codex exec ... )`). Task 6 should match that
+   exact, already-working convention (`cd` first, no `-C`/`--cd` flag),
+   not because `-C`/`--cd` wouldn't also work, but for consistency with
+   the established, already-reviewed pattern in this project.
+
+2. **"No event in the stream distinguishes an in-repo write from any
+   other completed action" (the design doc's original wording) is
+   contradicted by this knowledge base's own Task 1 evidence.** Task 1's
+   Step 1-2 baseline explicitly lists `file_change` as a distinct
+   observed item type, separate from `command_execution`/`agent_message`
+   (see that section above: "Event types observed... `agent_message,
+   command_execution, file_change, item.completed, item.started,
+   thread.started, turn.completed, turn.started`"). The stream DOES
+   distinguish a write via a dedicated `file_change` item — what it does
+   NOT do is gate/block it beforehand: since `approval_policy` is
+   hardcoded to `"never"`, the write has already completed by the time
+   `file_change` appears. The real risk `workspace-write` introduces is
+   **detectable-after-the-fact-but-not-preventable**, not
+   **indistinguishable** — still a materially weaker guarantee than
+   `read-only`'s zero-writes-possible, but the design doc's prose
+   overstated it and needed correcting to match this section's own
+   evidence.
+
+3. **The "read-only costs nothing outside the repo" claim was
+   misattributed to Task 1's Steps 3c/3d**, which tested `--sandbox
+   workspace-write` writing to `~/Desktop`, never `--sandbox read-only`
+   itself. The correct citation is this document's own separate
+   "Sandbox mechanics — `--add-dir` does NOT carve out exceptions under
+   `read-only`" section (above, pre-dating this plan's Task 1-4 spikes),
+   which directly tested `--sandbox read-only` and found it hard-denies
+   writes everywhere, including via `--add-dir` — that section, not
+   3c/3d, is the actual evidence for the read-only-outside-repo claim.
+   Separately: `approval_policy:"never"` is *directly observed* in
+   Task 1's embedded `turn_context` JSON only for `--sandbox
+   workspace-write` runs; that it also holds for `--sandbox read-only`
+   is a reasonable but *inferred* generalization (the `-a/--ask-for-
+   approval` flag is simply absent from `codex exec`/`codex exec resume
+   --help` entirely, independent of `--sandbox` choice) — not something
+   this session directly re-tested with `--sandbox read-only`
+   specifically. The design doc's fix states this distinction
+   explicitly rather than presenting both as equally directly-observed.
+
+The design doc itself (`docs/2026-09-03-codex-stream-review-design.md`,
+"Safety model" section) has been corrected to reflect all three points
+precisely. The bottom-line decision (`--sandbox read-only`, not
+`workspace-write`) is unchanged — the reviewer independently agreed with
+it on the merits — only the supporting prose's precision was fixed.

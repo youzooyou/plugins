@@ -161,22 +161,35 @@ weighs the *outside-the-repo* case, where the two sandbox modes are
 indeed equivalent — it does not weigh the *inside-the-repo* case, which
 is exactly where they differ and exactly where it matters: `read-only`
 permits **zero** writes anywhere, including inside the repo under
-review; `workspace-write` permits **silent, un-gated writes inside the
-repo itself**, since `approval_policy` is hardcoded to `"never"`
-regardless of sandbox mode — there is no confirmation step, and no event
-in the stream distinguishes an in-repo write from any other completed
-action. That is precisely the failure mode `/cc`'s own core principle
-("Codex stays read-only; Claude remains the sole editor") exists to
-prevent. Task 1's stated justification for wanting write access at all
-— "allowing the reviewer to write findings/notes inside the repo... if
-ever needed" — is not actually needed by this design: findings are
-already extracted from the live-tailed rollout file's own event stream
-(see "Structured output" below), never from a file Codex writes to disk.
-There is no real benefit here to offset a real, unmitigated risk.
-**`--sandbox read-only` is therefore the correct choice** — it matches
-`/cc`'s own precedent exactly (zero regression in the reviewer-never-
-edits-code guarantee), and costs nothing relative to `workspace-write`
-for anything outside the repo, since both hard-fail identically there.
+review; `workspace-write` permits writes inside the repo itself with no
+approval gate in front of them, since `approval_policy` is hardcoded to
+`"never"` (directly confirmed for `workspace-write` specifically, via
+the embedded `turn_context` JSON in the knowledge base's Task 1 section —
+inferred, not independently re-tested, to also hold for `read-only`,
+since the `-a/--ask-for-approval` flag is entirely absent from `codex
+exec`/`resume` regardless of `--sandbox` choice). To be precise about
+what this actually means: the event stream **does** surface a write via
+a distinct `file_change` item type (Task 1's own baseline test observed
+it) — the gap is not that a write is invisible, it's that it is only
+ever reported *after* it has already happened, with nothing upstream to
+approve or deny it first. Detectable-but-not-preventable is still a
+materially weaker guarantee than `read-only`'s zero-writes-possible, and
+is exactly the failure mode `/cc`'s own core principle ("Codex stays
+read-only; Claude remains the sole editor") exists to prevent. Task 1's
+stated justification for wanting write access at all — "allowing the
+reviewer to write findings/notes inside the repo... if ever needed" —
+is not actually needed by this design: findings are already extracted
+from the live-tailed rollout file's own event stream (see "Structured
+output" below), never from a file Codex writes to disk itself. There is
+no real benefit here to offset a real, if only partially-mitigated
+(detectable-after-the-fact), risk. **`--sandbox read-only` is therefore
+the correct choice** — it matches `/cc`'s own sandbox-flag precedent
+exactly, and costs nothing relative to `workspace-write` for anything
+outside the repo: both hard-deny identically there, confirmed directly
+for `read-only` itself by this session's earlier, separate "Sandbox
+mechanics" finding (see the knowledge base — that test, not Task 1's
+`workspace-write`-only Steps 3c/3d, is the actual evidence for the
+read-only-outside-repo claim).
 
 This is a genuine, accepted reduction in scope from the plan's original
 three-goal framing: this plugin gains live streaming and token-efficient
