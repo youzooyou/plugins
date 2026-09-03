@@ -221,16 +221,21 @@ assume a shell variable survived.
    INSTALL_PATH_FILE=$(mktemp "/tmp/ccs-${SESSION_ID}-install-path.txt.XXXXXX")
    { jq -j '.plugins["codex-stream-review@youzooyou-plugins"][] | select(.scope=="user") | .installPath' ~/.claude/plugins/installed_plugins.json; printf 'x'; } > "$INSTALL_PATH_FILE"
    INSTALL_PATH="$(cat "$INSTALL_PATH_FILE")"; INSTALL_PATH="${INSTALL_PATH%x}"
-   if [ -z "$INSTALL_PATH" ]; then
-     echo "codex-stream-review@youzooyou-plugins is not installed — run /plugin install codex-stream-review@youzooyou-plugins first, or use /cc instead" >&2
+   if [ -z "$INSTALL_PATH" ] || [ ! -x "$INSTALL_PATH/scripts/run-ccs-review.sh" ]; then
+     echo "codex-stream-review@youzooyou-plugins is not installed, or is missing run-ccs-review.sh (a stale/incomplete install) — run /plugin install codex-stream-review@youzooyou-plugins (or update it), or use /cc instead" >&2
      rm -f "$INSTALL_PATH_FILE"
      exit 1
    fi
    echo "INSTALL_PATH_FILE=$INSTALL_PATH_FILE"
    ```
-   If empty, **stop here** — before any round ever dispatches — and tell the user to install the
-   plugin. Otherwise remember the exact literal `INSTALL_PATH_FILE` path (`mktemp`'s random
-   suffix and all) for the rest of the run.
+   **Check both an empty path AND the actual script's presence, not just emptiness** — an empty
+   `INSTALL_PATH` means the plugin isn't installed at all, but a real, non-empty path can still be
+   a stale or incomplete install (e.g. a cached install from before this plugin shipped
+   `run-ccs-review.sh`) that would otherwise pass this check cleanly and fail confusingly much
+   later, at the first round's dispatch, with a generic "command not found" instead of a clear,
+   actionable message at the one point where the problem is actually diagnosable. If either check
+   fails, **stop here** — before any round ever dispatches. Otherwise remember the exact literal
+   `INSTALL_PATH_FILE` path (`mktemp`'s random suffix and all) for the rest of the run.
 
 3. **Repo root:**
    ```bash
@@ -350,6 +355,10 @@ defense-in-depth secondary signal, not the primary completion mechanism. See `/c
 the `GROUP` segment.
 
 ### Step 3 — early `THREAD_ID` signal (ccs-specific; drives the tmux pane)
+
+**Round 1 only — skip entirely on round 2+.** On a resume round, `THREAD_ID` is already known
+(it's the literal value passed to `--resume`), so this poll would be redundant work; same
+skip-on-resume logic as step 4's tmux pane below.
 
 A third, independent, bounded poll — this is a genuine "notify me once" case, so use Bash with
 `run_in_background: true` and an `until` loop that exits on its own, not `Monitor` (which is for
