@@ -71,6 +71,45 @@ being trusted.
   the wrapper reports success.
 - `skills/codex-review/SKILL.md` — the standalone `/codex-review` command.
 
+### codex-stream-review
+
+**Experimental.** Streams live progress from a Codex CLI review by tailing a persisted thread's
+own rollout file, and lets a follow-up round `codex exec resume` that same thread so it reuses the
+diff/prior-findings already in its own context instead of re-sending them.
+
+**Why:** `codex-direct-review`'s ephemeral-process-per-round design has no way to see what Codex is
+doing until the whole call finishes, and every round re-sends the full diff and prior findings from
+scratch. This plugin trades that for a persisted, resumable thread — live progress visibility and
+cheaper multi-round follow-up — at the cost of leaving a real thread and rollout file on disk that
+the caller must explicitly clean up. It does not replace `/cc` or `codex-direct-review`, which stay
+exactly as they are.
+
+#### Install
+
+```
+/plugin marketplace add youzooyou/plugins
+/plugin install codex-stream-review
+```
+
+#### Usage
+
+- Start a review with `--cwd` and `--focus`; continue it with `--resume <threadId>` and a
+  follow-up-only `--focus` (never the diff again); clean up with `--cleanup <threadId>` once the
+  whole review is done, not after every round — see `skills/stream-review/SKILL.md` for the full
+  contract.
+- Every fresh round runs `--sandbox read-only`, the same boundary `/cc`/`codex-direct-review` use —
+  there is no approval-gated write capability in this plugin.
+
+#### How it works
+
+- `scripts/run-stream-review.sh` — dispatches `codex exec`/`codex exec resume --json`, captures the
+  thread ID from the live stdout stream, tails that thread's rollout file under
+  `~/.codex/sessions/` for its `task_complete` event, and extracts the final answer directly from
+  that file. `--cleanup <threadId>` is a separate mode that deletes the thread via `codex delete
+  --force`.
+- `skills/stream-review/SKILL.md` — how to start, continue, and clean up a review, and the current
+  safety-model status.
+
 ## Contributing
 
 `main` is protected — changes go through a pull request.
