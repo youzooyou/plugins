@@ -636,7 +636,14 @@ mktemp_registered EVENTLOG
   fi
 ) > "$EVENTLOG" 2>&1 &
 CODEX_PID=$!
-rm -f "$PROMPT_FILE"
+# $PROMPT_FILE is NOT removed here: the dispatched subshell above still
+# needs to open it for its `< "$PROMPT_FILE"` stdin redirect, and
+# backgrounding it with `&` gives no guarantee the child has done so yet.
+# Deleting it immediately races the child's open() -- it is only safe to
+# remove once this script's own `wait "$CODEX_PID"` below has returned,
+# proving the child process (and therefore its one read of the file) is
+# done. See the `rm -f "$PROMPT_FILE"` call alongside `rm -f "$EVENTLOG"`
+# further down.
 
 if [ -z "$THREAD_ID" ]; then
   WAIT_DEADLINE=$((SECONDS + THREAD_WAIT_SECS))
@@ -649,6 +656,14 @@ if [ -z "$THREAD_ID" ]; then
     [ "$SECONDS" -ge "$WAIT_DEADLINE" ] && break
     sleep 0.5
   done
+  # One more check after the loop breaks: thread.started may have landed in
+  # $EVENTLOG in the narrow window between the loop's last `grep` (which
+  # found nothing that iteration) and the loop actually breaking (deadline
+  # hit, or the process dying) -- mirrors the same re-check already done for
+  # task_complete further down this file, just for this earlier event.
+  if [ -z "$THREAD_ID" ] && grep -q '"type":"thread.started"' "$EVENTLOG" 2>/dev/null; then
+    THREAD_ID="$(grep -m1 '"type":"thread.started"' "$EVENTLOG" | jq -r '.thread_id // empty' 2>/dev/null)"
+  fi
   if [ -z "$THREAD_ID" ]; then
     kill_process_group "$CODEX_PID"
     wait "$CODEX_PID" 2>/dev/null
@@ -730,6 +745,10 @@ if [ -n "$CAPTURE_EVENTLOG_PATH" ]; then
   cp "$EVENTLOG" "$CAPTURE_EVENTLOG_PATH" 2>/dev/null || true
 fi
 rm -f "$EVENTLOG"
+# Safe only now: `wait "$CODEX_PID"` above has returned, so the dispatched
+# subshell is fully done and its one read of $PROMPT_FILE (the `<
+# "$PROMPT_FILE"` stdin redirect at dispatch time) has definitely happened.
+rm -f "$PROMPT_FILE"
 if [ "$RESULT" -eq 0 ]; then
   emit_final_output "$JUDGE_OUTPUT"
 else

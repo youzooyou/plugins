@@ -5,9 +5,11 @@ description: Claude executes a task then runs a Claude+Codex adversarial cross-r
 
 # /ccs — Claude + Codex Cross-Review on a Resumable Thread
 
-**Usage:** `/ccs <task description>` — leave empty to review the work just done in this
-session. There is no `--capture-evidence` prefix in v1 (see "v1 scope" below) — any other free
-text is the TASK.
+**Usage:** `codex-stream-review:ccs <task description>` — this skill is not invocable as a bare
+`/ccs` slash command; it is invoked plugin-qualified, like every other plugin-supplied skill (see
+"Invocation form — CONFIRMED" in `docs/2026-09-03-ccs-design.md`'s Open Items). Leave the task
+description empty to review the work just done in this session. There is no `--capture-evidence`
+prefix in v1 (see "v1 scope" below) — any other free text is the TASK.
 
 Execute the given task, then reach fact-based consensus with Codex — on a single resumable
 Codex thread for the whole run — before reporting to the user, or until a hard cap of 20 rounds
@@ -408,6 +410,20 @@ exactly the real, live-learned lesson this session's own design doc records. Typ
 into an already-running shell via `send-keys` instead means the shell survives even if the typed
 command (or the `tail -F` inside `watch-rollout.sh`) ever exits.
 
+Before building the `send-keys` command, guard against either value containing a quote
+character — `$INSTALL_PATH` and `$THREAD_ID` are interpolated directly into a string that the
+*pane's own separate shell* re-parses as its command line, which is a different trust boundary
+than the sentinel-file idiom above (that idiom only protects a value passed as one already-quoted
+shell argument, not a value re-interpolated into a second string a different shell re-parses):
+
+```bash
+case "$INSTALL_PATH$THREAD_ID" in
+  *'"'*|*"'"*)
+    PANE_ID=""  # unsafe to interpolate into the pane's send-keys command; skip the pane this round
+    ;;
+esac
+```
+
 If `PANE_ID` is non-empty, resolve the round's rollout file and start watching it, all inside
 that pane's own shell:
 
@@ -417,10 +433,11 @@ tmux send-keys -t "$PANE_ID" 'R=$(find "$HOME/.codex/sessions/'"$(date +%Y/%m/%d
 
 This directly interpolates `$THREAD_ID` and `$INSTALL_PATH` rather than going through the
 sentinel-file idiom above — deliberately: `THREAD_ID` is a UUID Codex itself generated (not
-attacker-influenced), `INSTALL_PATH` was already safely resolved through the sentinel idiom
-earlier, and this command is a best-effort convenience typed into a pane for a human to watch,
-not an argument to the review wrapper itself — a malformed pane command only costs the live
-view, never the round's correctness.
+attacker-influenced) and, per the guard above, neither value reaching this point contains a quote
+character. `INSTALL_PATH` was already safely resolved through the sentinel idiom earlier for its
+own purpose (passing it as one shell argument), and this command is a best-effort convenience
+typed into a pane for a human to watch, not an argument to the review wrapper itself — a
+malformed or skipped pane command only costs the live view, never the round's correctness.
 
 `watch-rollout.sh` narrates `investigating: <command>` (from `custom_tool_call` events) and
 `round complete` (from `task_complete`) reliably; it may also print `reasoning: ...` lines
