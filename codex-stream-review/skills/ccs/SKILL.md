@@ -397,10 +397,30 @@ open from round 1 keeps tailing it with no action needed). Track "did I already 
 session" the same way `SESSION_ID` is tracked — a fact Claude itself remembers, not a live shell
 variable.
 
+Before ever creating the pane, guard against either value containing anything outside a strict
+path-safe charset — `$INSTALL_PATH` and `$THREAD_ID` are interpolated directly into a string
+that the *pane's own separate shell* re-parses as its command line, which is a different trust
+boundary than the sentinel-file idiom above (that idiom only protects a value passed as one
+already-quoted shell argument, not a value re-interpolated into a second string a different
+shell re-parses). A quote-only check is not enough here: a value containing `$(...)` or a
+backtick needs no quote character to run a command when the pane's shell parses the
+double-quoted segment it ends up inside — so the guard denies everything except letters,
+digits, and `_./-`, checked *before* the pane exists so a rejected value never leaves an
+orphaned blank pane behind:
+
 ```bash
-if [ -n "${TMUX:-}" ]; then
-  PANE_ID=$(tmux split-window -h -P -F '#{pane_id}' 2>/dev/null)
-fi
+PANE_ID=""
+case "$INSTALL_PATH$THREAD_ID" in
+  *[!A-Za-z0-9_./-]*)
+    :  # unsafe to interpolate into the pane's send-keys command; skip the pane this round
+       # without ever creating one
+    ;;
+  *)
+    if [ -n "${TMUX:-}" ]; then
+      PANE_ID=$(tmux split-window -h -P -F '#{pane_id}' 2>/dev/null)
+    fi
+    ;;
+esac
 ```
 
 `tmux split-window -h` with **no command argument** spawns the pane's normal interactive shell —
@@ -410,34 +430,25 @@ exactly the real, live-learned lesson this session's own design doc records. Typ
 into an already-running shell via `send-keys` instead means the shell survives even if the typed
 command (or the `tail -F` inside `watch-rollout.sh`) ever exits.
 
-Before building the `send-keys` command, guard against either value containing a quote
-character — `$INSTALL_PATH` and `$THREAD_ID` are interpolated directly into a string that the
-*pane's own separate shell* re-parses as its command line, which is a different trust boundary
-than the sentinel-file idiom above (that idiom only protects a value passed as one already-quoted
-shell argument, not a value re-interpolated into a second string a different shell re-parses):
-
-```bash
-case "$INSTALL_PATH$THREAD_ID" in
-  *'"'*|*"'"*)
-    PANE_ID=""  # unsafe to interpolate into the pane's send-keys command; skip the pane this round
-    ;;
-esac
-```
-
 If `PANE_ID` is non-empty, resolve the round's rollout file and start watching it, all inside
-that pane's own shell:
+that pane's own shell. The rollout file can genuinely not exist on disk yet at the instant this
+runs — the `THREAD_ID` stderr signal (Step 3) fires before Codex is guaranteed to have created
+the file — so the pane's own command retries the lookup itself for up to ~10s rather than
+passing a possibly-empty path straight to `watch-rollout.sh`, which would otherwise exit
+immediately on its own required-argument check and never reach its unrelated file-wait loop:
 
 ```bash
-tmux send-keys -t "$PANE_ID" 'R=$(find "$HOME/.codex/sessions/'"$(date +%Y/%m/%d)"'" -maxdepth 1 -name "rollout-*-'"$THREAD_ID"'.jsonl" 2>/dev/null | head -1); [ -z "$R" ] && R=$(find "$HOME/.codex/sessions" -name "rollout-*-'"$THREAD_ID"'.jsonl" 2>/dev/null | head -1); "'"$INSTALL_PATH"'/scripts/watch-rollout.sh" "$R"' Enter
+tmux send-keys -t "$PANE_ID" 'R=""; for _i in $(seq 1 20); do R=$(find "$HOME/.codex/sessions/'"$(date +%Y/%m/%d)"'" -maxdepth 1 -name "rollout-*-'"$THREAD_ID"'.jsonl" 2>/dev/null | head -1); [ -z "$R" ] && R=$(find "$HOME/.codex/sessions" -name "rollout-*-'"$THREAD_ID"'.jsonl" 2>/dev/null | head -1); [ -n "$R" ] && break; sleep 0.5; done; "'"$INSTALL_PATH"'/scripts/watch-rollout.sh" "$R"' Enter
 ```
 
 This directly interpolates `$THREAD_ID` and `$INSTALL_PATH` rather than going through the
 sentinel-file idiom above — deliberately: `THREAD_ID` is a UUID Codex itself generated (not
-attacker-influenced) and, per the guard above, neither value reaching this point contains a quote
-character. `INSTALL_PATH` was already safely resolved through the sentinel idiom earlier for its
-own purpose (passing it as one shell argument), and this command is a best-effort convenience
-typed into a pane for a human to watch, not an argument to the review wrapper itself — a
-malformed or skipped pane command only costs the live view, never the round's correctness.
+attacker-influenced) and, per the guard above, neither value reaching this point contains
+anything outside the safe charset. `INSTALL_PATH` was already safely resolved through the
+sentinel idiom earlier for its own purpose (passing it as one shell argument), and this command
+is a best-effort convenience typed into a pane for a human to watch, not an argument to the
+review wrapper itself — a malformed or skipped pane command only costs the live view, never the
+round's correctness.
 
 `watch-rollout.sh` narrates `investigating: <command>` (from `custom_tool_call` events) and
 `round complete` (from `task_complete`) reliably; it may also print `reasoning: ...` lines
