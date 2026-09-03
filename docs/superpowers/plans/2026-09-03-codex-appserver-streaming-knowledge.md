@@ -153,3 +153,236 @@ After the app-server RPC socket path proved blocked (see above), inspected what 
 - Whether `--listen ws://` requires the daemon to be restarted with that flag from a clean state, or can be layered onto the already-running per-project broker instances observed today. The currently-running app-server instances were started via `stdio://`/unix-socket broker wiring by the `openai-codex` plugin; unclear whether a second listener can be added without disrupting them.
 - Exact wire format for a "start a review, stream deltas, then answer an approval request" round trip has not been attempted end-to-end yet — schema files exist (`ClientRequest.json`, `ServerRequest.json`) but no live call has been made against app-server via its RPC interface (only against the deprecated `mcp-server`, and only via CLI wrappers like `queue`/`resume`/`agents` for app-server itself). **This is the first thing to prototype.**
 - GitHub PR search for the `mcp-server` deprecation rationale was rate-limited (429, retry-after 3600s) — worth retrying if a definitive answer becomes important later.
+
+## Task 1 spike result: approval-request handling
+
+**Date:** 2026-09-03. **Outcome: (b)** — no approval-request event ever surfaces for a
+headless `codex exec` call, for a more specific reason than "it hangs": the flag the
+design assumed (`--ask-for-approval on-request`) **does not exist on `codex exec` at
+all** on this installed CLI version (`codex-cli 0.151.0`), and the rollout file's own
+`turn_context` confirms the effective policy for headless exec is hardcoded to
+`approval_policy":"never"`. `--approve-for-me` **does** produce a different, observable
+behavior (a real "automatic approval review" call, not a rubber stamp) but it is not an
+event the calling process can intercept or answer — see below. **Task 6 must fall back to
+relying on `--sandbox workspace-write`'s own writable-root allowlist (or `--sandbox
+read-only`) rather than an approval-answering flow; there is nothing to build an
+approval-answering mechanism on top of in this CLI version.**
+
+### Step 0: flag discovery — `--ask-for-approval` is not valid on `codex exec`
+
+Ran `codex exec --sandbox workspace-write --ask-for-approval on-request --json "..."` per
+the task brief's literal Step 2 command. It failed immediately, before any thread was
+created:
+
+```
+error: unexpected argument '--ask-for-approval' found
+
+  tip: to pass '--ask-for-approval' as a value, use '-- --ask-for-approval'
+
+Usage: codex exec [OPTIONS] [PROMPT]
+       codex exec [OPTIONS] <COMMAND> [ARGS]
+```
+
+`codex exec --help` and `codex exec resume --help` both confirm this: neither subcommand
+lists `-a`/`--ask-for-approval`. Only the **top-level interactive** `codex --help` lists
+it:
+
+```
+  -a, --ask-for-approval <APPROVAL_POLICY>
+          Configure when the model requires human approval before executing a command
+
+          Possible values:
+          - on-request: The model decides when to ask the user for approval
+          - never:      Never ask for user approval Execution failures are immediately returned to
+            the model
+```
+
+`codex exec`'s actual approval/sandbox-relevant flags on this version are only:
+`-s/--sandbox <read-only|workspace-write|danger-full-access>`, `--approve-for-me`
+("Route approval requests through automatic review using the workspace-write sandbox"),
+and `--dangerously-bypass-approvals-and-sandbox`. There is no CLI-exposed way to request
+an interactive/on-request approval policy for headless `codex exec`.
+
+### Step 1-2: baseline (in-repo write, `workspace-write`, no approval flag) — succeeds silently
+
+```bash
+cd <scratch-repo>
+codex exec --sandbox workspace-write --json \
+  "Write the text hello to a file at ./inside-baseline.txt (inside this repo)." \
+  > /tmp/approval-spike-baseline2.jsonl 2>&1
+```
+
+Event types observed (`grep -o '"type":"[a-zA-Z._]*"' ... | sort -u`):
+`agent_message`, `command_execution`, `file_change`, `item.completed`, `item.started`,
+`thread.started`, `turn.completed`, `turn.started`. No approval-related event type of any
+kind. File was created (`hello`), confirming the baseline behaves as expected — a
+same-workspace write needs no approval and produces no approval event.
+
+### Step 3a: write to `/tmp` under `workspace-write` — also succeeds silently (false negative for "outside the sandbox")
+
+The task brief's own suggested test target, `/tmp/codex-stream-review-approval-spike.txt`,
+turned out to be a **bad test of "outside the sandbox"**: `/tmp` is one of
+`workspace-write`'s default writable roots regardless of cwd (confirmed directly from the
+rollout file's `permission_profile`, see Step 3c below — `slash_tmp` and `tmpdir` are
+listed as `access: "write"` unconditionally). The write succeeded with **zero
+approval-related events**, and the created file was verified byte-for-byte
+(`od -An -t x1` showed `68 65 6c 6c 6f 0a` = `"hello\n"`). This does not test the approval
+question at all — retargeted to a real non-workspace, non-temp path for Steps 3b-3c.
+
+### Step 3b: write to `~/Desktop` (a real non-workspace, non-temp path) via the model's own file-write tool — model self-declines without ever attempting it
+
+```bash
+codex exec --sandbox workspace-write --json \
+  "Write the text hello to a file at /Users/hmc7279235/Desktop/codex-stream-review-approval-spike-desktop.txt (this is your home directory's Desktop, NOT inside the current repo, and not a temp directory)." \
+  > /tmp/approval-spike-out2.jsonl 2>&1
+```
+
+The model reasoned about the request, then declined on its own, without a `file_change`
+item ever being attempted and with no approval event of any kind:
+
+```
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"현재 권한은 작업공간과 임시 디렉터리에만 쓰기를 허용합니다. 따라서 `/Users/hmc7279235/Desktop/codex-stream-review-approval-spike-desktop.txt`에는 생성할 수 없습니다."}}
+```
+
+(Translation: "Current permissions only allow writing to the workspace and temp
+directory. Therefore [the file] cannot be created at that path.") This is the *model's own
+judgment*, not the sandbox actually being exercised — no useful evidence either way, so
+Step 3c forced an actual attempt via a raw shell command instead.
+
+### Step 3c: forced actual attempt via raw shell command — hard OS-level sandbox denial, zero approval events, no hang
+
+```bash
+codex exec --sandbox workspace-write --json \
+  "Run this exact shell command regardless of whether you think it will succeed, and report back its raw exit code and any error output verbatim, do not pre-judge or skip it: echo hello > /Users/hmc7279235/Desktop/codex-stream-review-approval-spike-desktop.txt" \
+  > /tmp/approval-spike-out3.jsonl 2>&1
+```
+
+Full, exact captured result (process exited naturally in 5s — no hang):
+
+```
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Raw exit code: `1`\n\nError output (verbatim):\n\n```text\nzsh:1: operation not permitted: /Users/hmc7279235/Desktop/codex-stream-review-approval-spike-desktop.txt\n```"}}
+{"type":"turn.completed","usage":{"input_tokens":35079,"cached_input_tokens":17334,"cache_write_input_tokens":17739,"output_tokens":374,"reasoning_output_tokens":187}}
+```
+
+Event types in this run: `agent_message`, `item.completed`, `thread.started`,
+`turn.completed`, `turn.started` — no `command_execution` item lifecycle even appears (the
+sandbox denial happened at a layer below what gets a full item lifecycle logged to
+`--json` stdout), and critically **no approval/permission-request event of any kind**. The
+target file was never created. Exit code 1, `zsh: operation not permitted` is a hard
+macOS Seatbelt sandbox denial, immediate, not a suspended request.
+
+Checked the resolved rollout file for this thread
+(`~/.codex/sessions/2026/09/03/rollout-2026-09-03T13-57-17-01a065a0-e269-7893-bfa5-7673ca9ba6cb.jsonl`)
+for anything matching `approval`/`exec_approval`/`patch_approval`/etc. The only match was
+the `turn_context` record itself, which is the definitive evidence for this whole spike —
+**the effective policy for headless `codex exec` is hardcoded to `"never"`, and the
+writable-root allowlist is a small, static, per-turn list**:
+
+```json
+{"timestamp":"2026-09-03T04:57:19.100Z","ordinal":7,"type":"turn_context","payload":{"turn_id":"01a065a0-e30c-71c3-a5e6-28f378873b3a","cwd":"/private/var/folders/yn/tx2p1pgx36v98n59l2kwrw5h0000gn/T/codex-approval-spike.J2t5vmEpD8","workspace_roots":["/private/var/folders/yn/tx2p1pgx36v98n59l2kwrw5h0000gn/T/codex-approval-spike.J2t5vmEpD8"],"current_date":"2026-09-03","timezone":"Asia/Seoul","approval_policy":"never","approvals_reviewer":"user","sandbox_policy":{"type":"workspace-write","network_access":false,"exclude_tmpdir_env_var":false,"exclude_slash_tmp":false},"permission_profile":{"type":"managed","file_system":{"type":"restricted","entries":[{"path":{"type":"special","value":{"kind":"root"}},"access":"read"},{"path":{"type":"path","path":"/private/var/folders/yn/tx2p1pgx36v98n59l2kwrw5h0000gn/T/codex-approval-spike.J2t5vmEpD8"},"access":"write"},{"path":{"type":"special","value":{"kind":"slash_tmp"}},"access":"write"},{"path":{"type":"special","value":{"kind":"tmpdir"}},"access":"write"},{"path":{"type":"path","path":".../.git"},"access":"read","missing_path_behavior":"skip"},{"path":{"type":"path","path":".../.agents"},"access":"read","missing_path_behavior":"skip"},{"path":{"type":"path","path":".../.codex"},"access":"read","missing_path_behavior":"skip"}]},"network":"restricted"}, ...}}
+```
+
+`"approval_policy":"never"` here is not a placeholder or a value that only shows up
+because I omitted a flag by mistake — it is the confirmed, actual effective policy
+attached to every turn of this headless `codex exec` invocation, independent of the
+`-c key=value` config-override mechanism (no config key was set that could plausibly
+produce this — it is exec's own hardcoded default). This is the direct, load-bearing
+answer to the spike's central question: **headless `codex exec` cannot be put into an
+approval-requesting mode at all on this CLI version** — everything outside the small,
+static `permission_profile` allowlist (workspace root + `/tmp` + `$TMPDIR`) is a hard
+deny, not a suspendable request.
+
+### Step 4 (outcome (c) follow-up): `--approve-for-me` — a real (non-rubber-stamp) but non-interceptable, currently-unreliable mechanism
+
+`--approve-for-me` cannot be combined with `--sandbox` (`error: the argument '--sandbox
+<SANDBOX_MODE>' cannot be used with '--approve-for-me'`) — it implies its own sandbox
+mode. Re-ran without `--sandbox`, twice (to check reproducibility), against the same
+forced-shell-write prompt as Step 3c:
+
+```bash
+codex exec --approve-for-me --json \
+  "Write the text hello to a file at /Users/hmc7279235/Desktop/codex-stream-review-approval-spike-desktop.txt (outside this repo, not a temp dir). Actually attempt it via a shell command, do not pre-judge." \
+  > /tmp/approval-spike-out5.jsonl 2>&1
+# ...and again identically into /tmp/approval-spike-out6.jsonl
+```
+
+Both runs produced the **same** result, verbatim (reproducible, not a one-off glitch).
+This is a genuinely different, observable behavior from plain `workspace-write` (Step
+3c): the failed attempt gets a distinct `"status":"declined"` value (never seen in any
+other run in this spike — every other completed `command_execution`/`file_change` item
+uses `"status":"completed"`), plus a router-level error log line with an explicit,
+structured rejection reason:
+
+```
+{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"/bin/zsh -lc \"printf 'hello' > /Users/hmc7279235/Desktop/codex-stream-review-approval-spike-desktop.txt\"","aggregated_output":"","exit_code":null,"status":"declined"}}
+2026-09-03T04:59:02.502522Z ERROR codex_core::tools::router: error=exec_command failed for `/bin/zsh -lc "printf 'hello' > /Users/hmc7279235/Desktop/codex-stream-review-approval-spike-desktop.txt"`: CreateProcess { message: "Rejected(\"This action was rejected due to unacceptable risk.\nReason: Automatic approval review failed: We're currently experiencing high demand, which may cause temporary errors.\nThe agent must not attempt to achieve the same outcome via workaround, indirect execution, or policy circumvention. Proceed only with a materially safer alternative, or if the user explicitly approves the action after being informed of the risk. Otherwise, stop and request user input.\")" }
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Desktop 경로에 `printf 'hello' > …` 셸 쓰기를 실제로 시도했지만, 외부 경로 쓰기 승인 요청이 시스템의 일시적 고수요 오류로 거절되었습니다. 파일은 생성되지 않았습니다."}}
+```
+
+Interpretation, carefully: `--approve-for-me` really does route the write through a
+separate "automatic approval review" backend (this is a genuine check, not a rubber
+stamp — in both live attempts here, the file was **not** created, and the recorded reason
+is an explicit failure/deny, not silence). **However, this does not satisfy the design's
+goal at all**, for two independent reasons:
+
+1. **Not interceptable or answerable by the calling process.** There is no separate
+   "approval-request" event exposed via `--json` stdout or the rollout file for the
+   plugin (Claude) to observe and answer — the entire review happens as an opaque,
+   fully-automatic internal step inside the `command_execution` item's own lifecycle,
+   surfacing only as a terminal `status: "declined"` plus a `codex_core::tools::router`
+   stderr-style log line. There is nothing here shaped like `ApplyPatchApprovalParams`/
+   `ExecCommandApprovalParams` (the app-server `ServerRequest` types this session
+   previously confirmed exist, but only over the blocked RPC socket path) — this is a
+   different, CLI/exec-only mechanism, and it gives the caller zero opportunity to
+   apply its own judgment per-action, which was the entire point of choosing an
+   approval-based model over blanket `read-only` in the first place.
+2. **The review backend itself is an external dependency that was actively erroring**
+   in this environment both times it was exercised ("We're currently experiencing high
+   demand, which may cause temporary errors"). Its fail-safe behavior on that error is to
+   deny (good — not a rubber stamp on failure), but this means `--approve-for-me`'s
+   reliability is gated on a hosted service's uptime/rate limits, not something local and
+   deterministic — a new, unverified failure mode this design would inherit if it
+   depended on this flag.
+
+Per the task brief's explicit rule ("If it's a rubber stamp ... do not use
+`--approve-for-me`"): it is **not** a rubber stamp, but it is also not usable for this
+plugin's actual goal (Claude answering each approval in real time) — there is no answer
+surface, and the plugin would just be waiting on an opaque, currently-flaky remote
+service instead. Recommend not building on `--approve-for-me` for a different reason than
+"rubber stamp": there is no interception point, full stop.
+
+### Conclusion for Task 6
+
+**Outcome (b), precisely characterized**: no approval-request event exists for headless
+`codex exec`/`codex exec resume` on this CLI version (`0.151.0`) because there is no
+approval-*requesting* mode reachable at all for that entrypoint — `approval_policy` is
+hardcoded to `"never"` (confirmed directly from `turn_context` in the rollout file), the
+`-a/--ask-for-approval` flag that would set it doesn't exist on `codex exec`, and
+`--approve-for-me` substitutes a different, non-interceptable, currently-unreliable
+automatic-review mechanism rather than a client-answerable request. Writes/execs outside
+the small static `permission_profile` allowlist (workspace root, `/tmp`, `$TMPDIR`) are
+hard OS-level denials, immediate, never a hang and never a suspended request.
+
+**Task 6 should drop the "approval-based, not blanket read-only" safety model from the
+design doc entirely for v1** — there is no mechanism in this CLI version to build it on.
+The realistic choices are: (a) plain `--sandbox workspace-write` with no approval flag,
+accepting its small fixed writable-root allowlist (workspace + OS temp dirs) as the
+*entire* safety boundary — writes outside it simply fail loudly and immediately, which is
+functionally similar to `--sandbox read-only` for anything outside the repo, or (b)
+`--sandbox read-only` outright, matching `/cc`'s existing choice. Given `workspace-write`
+already restricts to a small explicit allowlist with hard-fail-outside-it semantics and
+no way to expand it interactively/approval-based anyway, `workspace-write` (allowing the
+reviewer to write findings/notes inside the repo or temp dirs if ever needed) is a
+reasonable v1 choice over `read-only` — but the design doc's language about Claude
+"evaluating each write/exec attempt in real time" must be removed; that capability does
+not exist for this entrypoint.
+
+**Spike thread IDs created during this investigation** (all under
+`~/.codex/sessions/2026/09/03/`, not yet archived/deleted — record for Task 4/5's
+cleanup pass once the exact archive/delete CLI semantics are confirmed):
+`01a0659e-c295-7e21-ba0d-6234f4c987f4`, `01a0659f-6a55-7340-b539-56a815568dda`,
+`01a065a0-3edc-7d90-a6da-d427d6ace1a4`, `01a065a0-e269-7893-bfa5-7673ca9ba6cb`,
+`01a065a2-3c73-7af0-b323-57179d2d4b6b`, `01a065a3-55a4-7d73-a7a6-1be8236d39d1`. (A
+seventh attempt with the literal task-brief flag combination, and an eighth with
+`--approve-for-me --sandbox workspace-write` together, both failed CLI argument parsing
+before a thread was ever created — no thread ID to record for those two.)
