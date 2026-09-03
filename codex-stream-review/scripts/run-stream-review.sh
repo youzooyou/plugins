@@ -37,8 +37,10 @@ on_signal() {
   for job_pid in $(jobs -p 2>/dev/null); do
     kill -KILL -"$job_pid" 2>/dev/null
   done
-  if [ -n "${THREAD_ID_JSON:-}" ]; then
-    printf '{"ok":false,"reason":"interrupted","threadId":%s,"detail":"wrapper received a termination signal"}\n' "$THREAD_ID_JSON"
+  if [ -n "${THREAD_ID:-}" ]; then
+    local tid_json
+    tid_json="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
+    printf '{"ok":false,"reason":"interrupted","threadId":%s,"detail":"wrapper received a termination signal"}\n' "$tid_json"
   else
     printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
   fi
