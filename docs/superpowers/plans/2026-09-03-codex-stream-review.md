@@ -4,6 +4,16 @@
 
 **Goal:** Build `codex-stream-review`, a new, separate, experimental Claude Code plugin that runs Codex reviews via persisted `codex exec`/`codex exec resume` threads, streams live progress by tailing each thread's own rollout JSONL file, and (pending Task 1's spike result) uses an approval-based safety model instead of a blanket read-only sandbox — without touching `/cc` or `codex-direct-review`, which remain exactly as they are today.
 
+**Finalized by Task 5/6 (2026-09-03):** the Goal and Architecture text above
+describes this plan's STARTING assumptions, written before the spikes ran —
+"pending Task 1's spike result," "an approval-based safety model," and
+"deletes/archives" were all still open questions at that point. They are no
+longer open: the actual finalized decisions are plain `--sandbox read-only`
+(no approval-based flow — Task 1 found no programmatic approval-answering
+mechanism on the installed CLI) and `codex delete --force` (delete, not
+archive) for cleanup. See the Task 5 section below and
+`docs/2026-09-03-codex-stream-review-design.md` for the full evidence trail.
+
 **Architecture:** A new plugin directory (`codex-stream-review/`) in the `youzooyou/plugins` marketplace repo bundles a wrapper script (`run-stream-review.sh`) that: starts or resumes a Codex thread via `codex exec`/`codex exec resume --json`, captures the `threadId` from the process's own stdout stream, locates and tails that thread's rollout file (`~/.codex/sessions/<Y>/<M>/<D>/rollout-*-<threadId>.jsonl`) for live progress, waits for the `task_complete` event, extracts the `final_answer`-phase message, and deletes/archives the thread afterward per the data-retention rule. A companion skill documents when/how to invoke it. Tasks 1-5 are verification spikes (see the design doc's own "Open items to spike first") that must each produce a recorded, reproducible finding — appended to the knowledge base doc — before Task 6 (the actual wrapper) is written, because the wrapper's exact shape (sandbox flags, approval-handling code path) depends on what Tasks 1-4 find.
 
 **Tech Stack:** Bash (wrapper script, matching `codex-direct-review`'s own convention — no new language runtime), `jq` (already installed), `codex` CLI (npm/nvm-installed, the exact one already in use this session — no new install), Claude Code plugin/marketplace conventions (`.claude-plugin/plugin.json`, `skills/<name>/SKILL.md`, `${CLAUDE_PLUGIN_ROOT}`).

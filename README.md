@@ -73,9 +73,10 @@ being trusted.
 
 ### codex-stream-review
 
-**Experimental.** Streams live progress from a Codex CLI review by tailing a persisted thread's
-own rollout file, and lets a follow-up round `codex exec resume` that same thread so it reuses the
-diff/prior-findings already in its own context instead of re-sending them.
+**Experimental.** Runs a Codex CLI review as a persisted thread and signals its threadId early (on
+stderr, before the round finishes) so the CALLER can resolve and tail that thread's own rollout
+file for live progress narration; lets a follow-up round `codex exec resume` that same thread so it
+reuses the diff/prior-findings already in its own context instead of re-sending them.
 
 **Why:** `codex-direct-review`'s ephemeral-process-per-round design has no way to see what Codex is
 doing until the whole call finishes, and every round re-sends the full diff and prior findings from
@@ -103,10 +104,11 @@ exactly as they are.
 #### How it works
 
 - `scripts/run-stream-review.sh` — dispatches `codex exec`/`codex exec resume --json`, captures the
-  thread ID from the live stdout stream, tails that thread's rollout file under
-  `~/.codex/sessions/` for its `task_complete` event, and extracts the final answer directly from
-  that file. `--cleanup <threadId>` is a separate mode that deletes the thread via `codex delete
-  --force`.
+  thread ID from the process's own stdout stream and immediately echoes it to stderr as
+  `THREAD_ID=<uuid>` (the signal a caller uses for live tailing), then internally polls that
+  thread's rollout file under `~/.codex/sessions/` for its own `task_complete` event and extracts
+  the final answer directly from that file once the round is done. `--cleanup <threadId>` is a
+  separate mode that deletes the thread via `codex delete --force`.
 - `skills/stream-review/SKILL.md` — how to start, continue, and clean up a review, and the current
   safety-model status.
 

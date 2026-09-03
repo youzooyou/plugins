@@ -44,6 +44,28 @@ A round can legitimately take up to 30 minutes, so don't assume a fast
 reply — run it in the background and wait for it rather than treating a
 long pause as a hang.
 
+**Getting live progress:** the wrapper's own final verdict only ever
+appears on stdout once the whole round is done, but it signals the
+threadId early — on **stderr**, as its own line (`THREAD_ID=<uuid>`) — as
+soon as the thread starts, well before the round completes. To see live
+progress, redirect stdout and stderr to SEPARATE files (never combine them
+with `2>&1` if you want this):
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/run-stream-review.sh" \
+  --cwd "<dir>" --focus "<prompt>" \
+  > result.json 2>stderr.log &
+```
+
+Watch `stderr.log` for the `THREAD_ID=` line (e.g. with the `Monitor`
+tool). Once it appears, resolve `~/.codex/sessions/**/rollout-*-<uuid>.jsonl`
+and tail that file for genuine live progress narration — the wrapper itself
+does not tail or narrate anything; that is entirely the caller's job, using
+this early signal. A caller who doesn't care about live progress and just
+redirects everything together (`> out.json 2>&1`) will see one harmless
+extra `THREAD_ID=` line mixed into that combined file alongside the final
+JSON verdict.
+
 Unlike `codex-direct-review`'s `run-codex-review.sh`, this wrapper has no
 `--uncommitted`/`--base`/`--commit` flags and gathers no diff itself — it
 forwards `--focus` verbatim as the prompt to `codex exec`. Scope is entirely

@@ -37,7 +37,11 @@ on_signal() {
   for job_pid in $(jobs -p 2>/dev/null); do
     kill -KILL -"$job_pid" 2>/dev/null
   done
-  printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
+  if [ -n "${THREAD_ID_JSON:-}" ]; then
+    printf '{"ok":false,"reason":"interrupted","threadId":%s,"detail":"wrapper received a termination signal"}\n' "$THREAD_ID_JSON"
+  else
+    printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
+  fi
   exit 1
 }
 
@@ -53,8 +57,14 @@ if [ "${1:-}" = "--cleanup" ]; then
     exit 1
   fi
   THREAD_ID="$2"
+  case "$THREAD_ID" in
+    -*)
+      DETAIL_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '"--cleanup threadId must not start with -: " + .')"
+      printf '{"ok":false,"reason":"bad_args","detail":%s}\n' "$DETAIL_JSON"
+      exit 1 ;;
+  esac
   THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
-  DELETE_OUT="$(codex delete "$THREAD_ID" --force 2>&1)"
+  DELETE_OUT="$(codex delete --force -- "$THREAD_ID" 2>&1)"
   DELETE_STATUS=$?
   if [ "$DELETE_STATUS" -ne 0 ]; then
     DETAIL_JSON="$(printf '%s' "$DELETE_OUT" | jq -Rs '.')"
@@ -80,6 +90,12 @@ while [ $# -gt 0 ]; do
       FOCUS="$2"; shift 2 ;;
     --resume)
       [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--resume requires a value"}\n'; exit 1; }
+      case "$2" in
+        -*)
+          DETAIL_JSON="$(printf '%s' "$2" | jq -Rs '"--resume threadId must not start with -: " + .')"
+          printf '{"ok":false,"reason":"bad_args","detail":%s}\n' "$DETAIL_JSON"
+          exit 1 ;;
+      esac
       RESUME_THREAD_ID="$2"; shift 2 ;;
     --output-schema)
       [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--output-schema requires a value"}\n'; exit 1; }
@@ -113,6 +129,7 @@ BASELINE_TASK_COMPLETE=0
 if [ -n "$RESUME_THREAD_ID" ]; then
   THREAD_ID="$RESUME_THREAD_ID"
   THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
+  echo "THREAD_ID=$THREAD_ID" >&2
   ROLLOUT="$(find "$HOME/.codex/sessions" -name "rollout-*-${THREAD_ID}.jsonl" 2>/dev/null | head -1)"
   if [ -z "$ROLLOUT" ] || [ ! -f "$ROLLOUT" ]; then
     printf '{"ok":false,"reason":"resume_thread_not_found","threadId":%s,"detail":"no rollout file found for this threadId"}\n' "$THREAD_ID_JSON"
@@ -132,11 +149,11 @@ mktemp_registered EVENTLOG
   cd "$CWD" || exit 127
   if [ -n "$RESUME_THREAD_ID" ]; then
     codex exec resume "$RESUME_THREAD_ID" --json \
-      ${SCHEMA:+--output-schema "$SCHEMA"} "$FOCUS" < /dev/null
+      ${SCHEMA:+--output-schema "$SCHEMA"} -- "$FOCUS" < /dev/null
   else
     codex exec --json --sandbox read-only \
       -c model_reasoning_effort=xhigh ${SCHEMA:+--output-schema "$SCHEMA"} \
-      "$FOCUS" < /dev/null
+      -- "$FOCUS" < /dev/null
   fi
 ) > "$EVENTLOG" 2>&1 &
 CODEX_PID=$!
@@ -162,6 +179,7 @@ if [ -z "$THREAD_ID" ]; then
     exit 1
   fi
   THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
+  echo "THREAD_ID=$THREAD_ID" >&2
 fi
 
 # Step 6: resolve (fresh round) and tail the rollout file until a NEW
