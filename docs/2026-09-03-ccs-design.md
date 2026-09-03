@@ -43,7 +43,7 @@ for a human to watch — not an interactive session a human types into.
 ## Architecture
 
 ```
-Round 1: run-stream-review.sh --uncommitted|--base <ref>|--commit <sha> \
+Round 1: run-ccs-review.sh --uncommitted|--base <ref>|--commit <sha> \
            --focus "<Why/History/Scope framing>"
          -> fresh codex exec, thread created, diff collected BY THE WRAPPER
          -> threadId known (stderr signal, ~seconds in)
@@ -51,7 +51,7 @@ Round 1: run-stream-review.sh --uncommitted|--base <ref>|--commit <sha> \
             formatted as narration, not raw JSON
          -> round completes -> verdict + findings + coverage
 
-Round 2+: run-stream-review.sh --resume <threadId> \
+Round 2+: run-ccs-review.sh --resume <threadId> \
             --focus "<rebuttal/new-scope text only, never the diff again>"
          -> same thread, no diff re-send
          -> same tmux pane keeps tailing (same rollout file)
@@ -59,7 +59,7 @@ Round 2+: run-stream-review.sh --resume <threadId> \
 
 ... repeat until CLEAN, NOT CONVERGED (20-round cap), or COULD NOT VERIFY ...
 
-Terminal state: run-stream-review.sh --cleanup <threadId>  [ALWAYS, automatic]
+Terminal state: run-ccs-review.sh --cleanup <threadId>  [ALWAYS, automatic]
                 close tmux pane (if opened)                [best-effort]
                 final Korean report to user
 ```
@@ -72,43 +72,70 @@ with no separate opt-in step a human needs to remember.
 
 ## Components
 
-### 1. `run-stream-review.sh` gains `--uncommitted` / `--base <ref>` / `--commit <sha>`
+### 1. New file: `run-ccs-review.sh` — a merge of `run-codex-review.sh`'s collection logic and `run-stream-review.sh`'s resume dispatch
 
-**The gap this closes:** the wrapper currently has no diff-gathering of
+**The gap this closes:** `run-stream-review.sh` has no diff-gathering of
 its own — `--focus` is forwarded verbatim to `codex exec`, entirely the
 caller's responsibility (documented in `stream-review/SKILL.md`'s "Unlike
 `codex-direct-review`'s `run-codex-review.sh`..." passage). `/cc`'s own
 rigor depends on `run-codex-review.sh` collecting the diff itself
 (tracked + untracked files, symlink/oversize/binary handling, `git diff
---no-ext-diff --no-textconv` safety) and reporting a structured
-`coverage.source` object (`complete`/`partial`+`omitted`). Without an
-equivalent, `/ccs` would either re-implement this collection logic
-independently (real risk of missing an edge case `/cc`'s own "Known
-Failure Patterns" section already learned the hard way — see that
-section's symlink-dereference/TOCTOU-race/FIFO-hang history) or ship
-without structured coverage tracking at all.
+--no-ext-diff --no-textconv` safety, a dedicated Python subprocess —
+`collect_untracked_files.py` — for TOCTOU-safe untracked-file reading) and
+reporting a structured `coverage.source` object
+(`complete`/`partial`+`omitted`). This is roughly 400 lines of logic that
+has already absorbed several real, subtle bug fixes across past `/cc`
+review rounds (a TOCTOU race between two separate git calls, a
+regex-based binary-file detector that mis-parsed real filenames, an
+unborn-HEAD git repo failing outright, a bash-3.2.57 empty-array
+"unbound variable" quirk, command-substitution silently stripping a
+file's genuine trailing newline). Re-deriving this from scratch for
+`/ccs` risks reintroducing bugs `codex-direct-review` already paid to
+fix once.
 
-**The fix:** add the same three scope flags `run-codex-review.sh` already
-has, **porting its collection + coverage logic verbatim** — not calling
-into it at runtime. `codex-direct-review` and `codex-stream-review` are
-two independently-installable plugins (a user may have either without
-the other), so `run-stream-review.sh` cannot take a runtime dependency on
-`codex-direct-review`'s own script being present. "Reuse" here means:
-copy the proven collection logic (tracked+untracked file gathering,
-symlink/oversize/binary classification, the `--no-ext-diff --no-textconv`
-safety, the `coverage.source` object construction) directly into
-`run-stream-review.sh` as its own self-contained code, byte-identical in
-behavior to `run-codex-review.sh`'s own — not re-derived from scratch,
-but also not a shared library or cross-plugin call. Two copies of the
-same proven logic, each plugin fully self-contained. When one of these
-flags is given, `run-stream-review.sh` collects the diff itself and
-folds it into the prompt sent to `codex exec` (alongside `--focus`'s
-Why/History/Scope framing text, which becomes pure instructions/context
-now, never the diff itself), and includes a `coverage` object in its
-JSON result matching `run-codex-review.sh`'s existing shape exactly.
-`--focus` remains required in all cases; providing one of the three
-scope flags does not make `--focus` optional, it just changes what
-`--focus` is for.
+**The fix (revised from an earlier draft of this section that proposed
+patching flags directly into `run-stream-review.sh` in place):** create a
+**new file**, `codex-stream-review/scripts/run-ccs-review.sh`, used only
+by `/ccs` — `run-stream-review.sh` and its existing `stream-review` skill
+are untouched, since other usage may already depend on their current,
+shipped contract. `run-ccs-review.sh` starts as a full copy of
+`run-codex-review.sh` (plus its companion `collect_untracked_files.py`,
+also copied verbatim into `codex-stream-review/scripts/`), then:
+
+- **Keeps, unchanged:** the `--uncommitted`/`--base <ref>`/`--commit <sha>`
+  flag parsing and validation, the tracked-diff collection (`git diff
+  --no-ext-diff --no-textconv --patch --numstat`, the unborn-HEAD
+  empty-tree fallback, the combined-call TOCTOU fix), the untracked-file
+  collection (delegated to the copied `collect_untracked_files.py`), and
+  the `coverage.source` JSON construction (`emit_final_output`'s
+  coverage-splicing logic).
+- **Removes:** the ephemeral single-shot `codex exec` dispatch and its
+  PID-liveness watching — no longer needed, replaced by resume-capable
+  dispatch (next bullet). Also removes/adapts whatever self-test and
+  integration-test harness sections are specific to the old dispatch
+  model, keeping (and adapting) whatever exercises the collection/coverage
+  logic itself, since that logic is unchanged and still needs its own
+  tests.
+- **Replaces the dispatch layer with:** `run-stream-review.sh`'s
+  already-proven resume-capable mechanism — fresh-round `codex exec`
+  dispatch (`--sandbox read-only`, stdin from `/dev/null`, `--` before
+  the prompt text), the stderr `THREAD_ID=` early signal, rollout-file
+  resolution and `task_complete` tailing, `--resume <threadId>` for
+  round 2+, and the leading-dash argument-injection guards. Ported the
+  same way as the collection logic — copied from the proven source, not
+  re-derived.
+- **Adds:** a `--cleanup <threadId>` mode, identical to
+  `run-stream-review.sh`'s own.
+
+Net result: one new, purpose-built, self-contained script combining both
+proven subsystems, with neither existing script modified. Two plugins,
+two independent copies of the collection logic (`codex-direct-review`'s
+own copy stays exactly as it is) — no cross-plugin runtime dependency,
+matching the "independently installable" constraint.
+
+`--focus` remains required on every call; when a scope flag is given, it
+holds pure Why/History/Scope framing text (never the diff itself, which
+the wrapper now collects on its own).
 
 On `--resume`, the diff is never re-collected (Codex already has it in
 thread context) — the three scope flags are only meaningful on a fresh
@@ -120,9 +147,10 @@ The orchestration logic Claude follows — structurally parallel to `/cc`'s
 own SKILL.md (equal-partnership principles, the Why/History/Scope
 `--focus` discipline, the re-verification requirement, the whole-flow
 re-check step, the convergence/guard rules, the JSONL review history log)
-but scoped down per the v1 decision below, and swapping every
-`run-codex-review.sh --uncommitted` round-dispatch for `run-stream-review.sh`
-fresh-then-resume dispatch.
+but scoped down per the v1 decision below, and using `run-ccs-review.sh`
+(component 1 above) for every round's dispatch instead of `/cc`'s
+`run-codex-review.sh` — fresh round with a scope flag for round 1,
+`--resume <threadId>` for every round after.
 
 **v1 scope — core loop only, explicitly deferred:**
 - **No parallel multi-reviewer mode.** `/cc`'s parallel mode dispatches
@@ -208,12 +236,12 @@ Mirrors `/cc`'s existing guards exactly, applied to `/ccs`'s own rounds:
 
 ## Testing
 
-1. **`run-stream-review.sh`'s new scope flags:** a live scratch-repo test
+1. **`run-ccs-review.sh`'s collection logic:** a live scratch-repo test
    confirming `--uncommitted`/`--base <ref>` produce a diff+coverage
    result equivalent to `run-codex-review.sh`'s own output for the
    identical repo state (same files, same coverage status) — proving the
-   ported collection logic behaves identically to its source, not
-   subtly diverged during the port.
+   copied collection logic behaves identically to its source, not
+   subtly diverged during the copy/trim.
 2. **`/ccs` end-to-end:** a real small diff with an intentional, findable
    bug — confirm round 1 finds it, a resumed rebuttal round answers
    without re-investigating the diff (rollout inspection, zero new
