@@ -660,3 +660,252 @@ archived/deleted — record for Task 4/5's cleanup pass): `01a065b0-f399-7792-93
 (Round 1 + Round 2, resumed), `01a065b3-5637-7c31-90ba-ff4bf99cf8e4` (Round 3,
 fresh/standalone). Scratch repo and all `/tmp/resume-spike-*` files were
 deleted after capturing the evidence above.
+
+## Task 3 spike result: --output-schema under resume
+
+**Date:** 2026-09-03. **CLI version:** `codex-cli 0.151.0`. **Outcome:
+`--output-schema` DOES survive `--json` + `resume` cleanly — both rounds'
+`--output-last-message` files validate against the schema, AND the live
+rollout file's own `response_item`/`message`/`final_answer` entry for both
+rounds already contains the exact same structured JSON (not free text),
+written to disk ~250-330ms before that round's `task_complete` event. This
+is a genuine improvement over `/cc`'s current post-exit-only structured
+output.**
+
+### Environment gotcha found and fixed first: `codex exec` hangs indefinitely reading stdin unless stdin is explicitly closed
+
+The very first invocation of this spike hung for the full 50-minute Bash
+timeout (`exit 143`, i.e. killed by `SIGTERM` on timeout) with the only
+output being `Reading additional input from stdin...`. Root cause, confirmed
+from `codex exec --help`'s own `[PROMPT]` documentation:
+
+```
+[PROMPT]
+    Initial instructions for the agent. If not provided as an argument (or if `-` is used),
+    instructions are read from stdin. If stdin is piped and a prompt is also provided, stdin
+    is appended as a `<stdin>` block
+```
+
+Even though a prompt string was given as an argument, `codex exec` also
+tried to read stdin to append as a `<stdin>` block — this Bash tool's stdin
+is left open/non-EOF by default, so the read blocked forever. Fix: always
+redirect `< /dev/null` explicitly when scripting `codex exec` non-interactively.
+Every command below uses this. **This is a real, reusable gotcha for the
+plugin's own implementation** — any wrapper that shells out to `codex exec`
+non-interactively must close stdin explicitly or risk an indefinite hang
+with no error message, only a silent "Reading additional input from
+stdin..." line.
+
+### Setup: schema file and scratch repo
+
+Schema file, exact content (matches the task brief's literal schema, `cat`'d
+back from disk to confirm, not retyped from memory):
+
+```bash
+$ cat /tmp/stream-review-schema.json
+{"type":"object","properties":{"verdict":{"type":"string","enum":["CLEAN","ISSUES"]},"summary":{"type":"string"}},"required":["verdict","summary"],"additionalProperties":false}
+```
+
+Scratch repo (fresh, `/tmp/codex-schema-spike-repo`): committed baseline
+`utils.py` with a correct `last_index()` (empty-list `ValueError` guard +
+`len(lst) - 1`), then an uncommitted edit that strips the guard and
+introduces an off-by-one (`return len(lst)`). Confirmed real, uncommitted
+diff via `git diff -- utils.py`:
+
+```diff
+diff --git a/utils.py b/utils.py
+index ab1b618..44f08a1 100644
+--- a/utils.py
++++ b/utils.py
+@@ -1,4 +1,2 @@
+ def last_index(lst):
+-    if not lst:
+-        raise ValueError("empty list has no last index")
+-    return len(lst) - 1
++    return len(lst)
+```
+
+### Round 1: fresh thread, `--json` + `--output-schema` + `--output-last-message`
+
+Exact command run:
+
+```bash
+cd /tmp/codex-schema-spike-repo
+codex exec --json --sandbox read-only --output-schema /tmp/stream-review-schema.json \
+  --output-last-message /tmp/stream-review-round1-final.json \
+  "Review the uncommitted diff. Reply only in the given JSON shape." \
+  < /dev/null > /tmp/schema-spike-round1.jsonl 2>&1
+```
+
+Exit code: `0`. Thread ID created: `01a065f7-ee00-7350-90c2-2be638e341d0`.
+Codex investigated the diff itself via shell tool calls (`git diff`, `rg`,
+`nl`) rather than trusting the prompt alone, then produced its final
+`agent_message` item as raw JSON text (from the `--json` stdout stream,
+verbatim):
+
+```json
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"{\"verdict\":\"ISSUES\",\"summary\":\"1. utils.py:2 — `last_index` now returns `len(lst)`, which is one past the final valid index. For example, `[1]` returns `1` although its only valid index is `0`; retain `len(lst) - 1` (and the empty-list guard if that contract is intended).\"}"}}
+```
+
+`--output-last-message` file content, exact (`cat` of the actual file on
+disk):
+
+```json
+{"verdict":"ISSUES","summary":"1. utils.py:2 — `last_index` now returns `len(lst)`, which is one past the final valid index. For example, `[1]` returns `1` although its only valid index is `0`; retain `len(lst) - 1` (and the empty-list guard if that contract is intended)."}
+```
+
+Validation, per the task brief's specified method (`jq -e .` + manual
+required-fields/enum check, no new JSON-schema-validation dependency):
+
+```bash
+$ jq -e . < /tmp/stream-review-round1-final.json
+{ ... }          # pretty-printed, parses cleanly — jq exit 0
+$ jq 'has("verdict") and has("summary") and (.verdict as $v | ["CLEAN","ISSUES"] | index($v) != null)' /tmp/stream-review-round1-final.json
+true
+```
+
+**Round 1 validates cleanly: both required fields present, `verdict` is one
+of the enum's two allowed values, `additionalProperties: false` respected
+(only `verdict`/`summary` present).**
+
+### Round 2: `codex exec resume`, same `--output-schema`, different `--output-last-message`
+
+Exact command run:
+
+```bash
+cd /tmp/codex-schema-spike-repo
+codex exec resume 01a065f7-ee00-7350-90c2-2be638e341d0 --json \
+  --output-schema /tmp/stream-review-schema.json \
+  --output-last-message /tmp/stream-review-round2-final.json \
+  "Reply again in the same JSON shape, updating the verdict if the first answer missed anything." \
+  < /dev/null > /tmp/schema-spike-round2.jsonl 2>&1
+```
+
+Exit code: `0`. Full `--json` stdout, verbatim (this round needed zero
+`command_execution`/tool-call items — matching Task 2's finding that a
+resumed round answers directly from persisted context):
+
+```json
+{"type":"thread.started","thread_id":"01a065f7-ee00-7350-90c2-2be638e341d0"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"verdict\":\"ISSUES\",\"summary\":\"1. utils.py:2 — `last_index` returns `len(lst)`, which is one past the final valid index; `[1]` returns `1` instead of `0`. Return `len(lst) - 1`.\\n2. utils.py:2 — the prior explicit empty-list contract was removed: `[]` now returns `0` instead of raising `ValueError`. Restore the guard unless callers are intentionally being migrated to the new behavior.\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":98890,"cached_input_tokens":76632,"cache_write_input_tokens":22243,"output_tokens":1075,"reasoning_output_tokens":459}}
+```
+
+`--output-last-message` file content, exact:
+
+```json
+{"verdict":"ISSUES","summary":"1. utils.py:2 — `last_index` returns `len(lst)`, which is one past the final valid index; `[1]` returns `1` instead of `0`. Return `len(lst) - 1`.\n2. utils.py:2 — the prior explicit empty-list contract was removed: `[]` now returns `0` instead of raising `ValueError`. Restore the guard unless callers are intentionally being migrated to the new behavior."}
+```
+
+Validation, same method as Round 1:
+
+```bash
+$ jq -e . < /tmp/stream-review-round2-final.json
+{ ... }          # parses cleanly — jq exit 0
+$ jq 'has("verdict") and has("summary") and (.verdict as $v | ["CLEAN","ISSUES"] | index($v) != null)' /tmp/stream-review-round2-final.json
+true
+```
+
+**Round 2 (resumed) validates cleanly too — `--output-schema` is not
+silently ignored or dropped by `resume`, and the resumed round improved on
+Round 1's finding (added the empty-list-guard regression Round 1 didn't
+mention), demonstrating the resume mechanism itself still works normally
+under a schema constraint.**
+
+### Critical check: does the LIVE rollout file already contain structured JSON, or free text?
+
+Confirmed both rounds share the **same** rollout file (one file per
+thread, `resume` appends to it — same file path used for both checks
+below): `~/.codex/sessions/2026/09/03/rollout-2026-09-03T15-32-22-01a065f7-ee00-7350-90c2-2be638e341d0.jsonl`.
+
+Extracted every `response_item` whose `payload.type == "message"` and
+`payload.role == "assistant"` and `payload.phase == "final_answer"` (the
+same filter Task 2's BREAKTHROUGH section already established as "the
+answer, not intermediate narration") via a small Python script reading the
+file directly — exact output:
+
+```
+ORDINAL: 33 TIMESTAMP: 2026-09-03T06:32:42.363Z
+TEXT: {"verdict":"ISSUES","summary":"1. utils.py:2 — `last_index` now returns `len(lst)`, which is one past the final valid index. For example, `[1]` returns `1` although its only valid index is `0`; retain `len(lst) - 1` (and the empty-list guard if that contract is intended)."}
+PARSED OK, keys: ['verdict', 'summary']
+---
+ORDINAL: 46 TIMESTAMP: 2026-09-03T06:33:26.377Z
+TEXT: {"verdict":"ISSUES","summary":"1. utils.py:2 — `last_index` returns `len(lst)`, which is one past the final valid index; `[1]` returns `1` instead of `0`. Return `len(lst) - 1`.\n2. utils.py:2 — the prior explicit empty-list contract was removed: `[]` now returns `0` instead of raising `ValueError`. Restore the guard unless callers are intentionally being migrated to the new behavior."}
+PARSED OK, keys: ['verdict', 'summary']
+```
+
+**Both rollout entries — ordinal 33 (Round 1) and ordinal 46 (Round 2,
+resumed) — are the exact same structured JSON text as their respective
+`--output-last-message` files, byte-for-byte identical, not a free-text
+pre-formatting draft.** `json.loads()` on each `text` field succeeds and
+yields exactly the two schema-required keys.
+
+**Ordering relative to the turn-completion signal** (the specific thing
+that makes this actionable for a live tailer, not just a post-hoc fact):
+extracted every rollout entry's `ordinal`/`type`/timestamp in the range
+spanning both rounds' endings —
+
+```
+30 event_msg item_completed 2026-09-03T06:32:42.035Z
+31 response_item reasoning   2026-09-03T06:32:42.038Z
+32 event_msg item_completed 2026-09-03T06:32:42.360Z
+33 response_item message     2026-09-03T06:32:42.363Z   <- Round 1 structured final_answer
+34 event_msg token_count     2026-09-03T06:32:42.370Z
+35 event_msg task_complete   2026-09-03T06:32:42.690Z   <- Round 1 turn-done signal
+36 event_msg thread_settings_applied 2026-09-03T06:33:19.846Z
+37 event_msg task_started    2026-09-03T06:33:19.850Z
+38 turn_context              2026-09-03T06:33:20.858Z
+39 response_item message     2026-09-03T06:33:21.205Z
+40 response_item message     2026-09-03T06:33:21.205Z
+41 response_item message     2026-09-03T06:33:21.506Z
+42 event_msg item_completed 2026-09-03T06:33:21.507Z
+43 event_msg item_completed 2026-09-03T06:33:25.883Z
+44 response_item reasoning   2026-09-03T06:33:25.886Z
+45 event_msg item_completed 2026-09-03T06:33:26.374Z
+46 response_item message     2026-09-03T06:33:26.377Z   <- Round 2 structured final_answer
+47 event_msg token_count     2026-09-03T06:33:26.401Z
+48 event_msg task_complete   2026-09-03T06:33:26.628Z   <- Round 2 turn-done signal
+```
+
+Round 1's structured `final_answer` (ordinal 33, `06:32:42.363Z`) is written
+**327ms before** its `task_complete` (ordinal 35, `06:32:42.690Z`). Round
+2's structured `final_answer` (ordinal 46, `06:33:26.377Z`) is written
+**251ms before** its `task_complete` (ordinal 48, `06:33:26.628Z`). Both
+`codex exec` processes then exited normally afterward (exit code `0` for
+both, confirmed above) — i.e., the structured JSON hits disk measurably
+before the process itself exits and before `--output-last-message` is
+written, in both a fresh round and a resumed round. Combined with Task 2's
+already-established live-tailing mechanism (a `Monitor`/`tail -F` on this
+same rollout file sees new lines within ~1 second of being written, well
+before turn completion), **a caller tailing the rollout file live during a
+schema-constrained round gets the fully-structured, schema-valid answer
+before the process exits — this was not independently re-run with a live
+`Monitor` in this spike (to avoid redundant cost, since Task 2 already
+proved the live-tailing latency claim on this same file mechanism), but the
+combination of "the persisted content is structured" (this task's new
+finding) + "the file is tailable in near-real-time" (Task 2's finding)
+together fully answers the question this spike was scoped to answer.**
+
+### Conclusion
+
+**`--output-schema` survives `--json` streaming and `codex exec resume`
+cleanly on this CLI version (`0.151.0`)**: both a fresh round and a resumed
+round produce `--output-last-message` files that validate against the
+schema (required fields present, enum respected, no extra properties), and
+critically, **the live rollout file's own `final_answer` message entry is
+already the structured JSON for both rounds** — not a free-text draft that
+gets reformatted only at process exit. This is a genuine, verified
+improvement over `/cc`'s current design, which only obtains structured
+output after full process exit via `--output-last-message`; a
+`codex-stream-review` implementation could read the schema-valid verdict
+directly off the live-tailed rollout file the moment the `final_answer`
+message entry appears, without waiting for process exit at all.
+
+**Spike thread IDs created during this investigation** (not yet
+archived/deleted — record for Task 4/5's cleanup pass): `01a065f7-ee00-7350-90c2-2be638e341d0`
+(Round 1 + Round 2, resumed — both rounds ran against this single thread).
+Scratch repo (`/tmp/codex-schema-spike-repo`) and all
+`/tmp/stream-review-schema.json`, `/tmp/schema-spike-round*.jsonl`,
+`/tmp/stream-review-round*-final.json` scratch files were deleted after
+capturing the evidence above.

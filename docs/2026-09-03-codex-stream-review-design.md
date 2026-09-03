@@ -22,9 +22,10 @@ cannot:
    concurrently and observe all of them live.
 
 Explicitly **not** a goal for v1: replacing `/cc`'s equal-partnership
-consensus loop, or matching its `--output-schema`-enforced structured
-JSON verdict shape (see "Structured output" below — this is a real,
-accepted limitation of this design, not an oversight).
+consensus loop. Unlike an earlier draft of this doc assumed, `--output-schema`
+structured verdicts are NOT a limitation of this design — see "Structured
+output" below, which is a strict improvement over `/cc`'s current
+post-exit-only structured output.
 
 ## Why not the app-server RPC / MCP paths (rejected alternatives)
 
@@ -170,17 +171,36 @@ avoids exactly this kind of accumulation. This plugin must:
   documented exception for what's deliberately kept, not the other way
   around) — follow that established pattern, don't reinvent it.
 
-## Structured output — accepted limitation
+## Structured output — confirmed working, a strict improvement over `/cc`
 
-Unlike `/cc`, there is no `--output-schema` enforcement available through
-this mechanism (`codex exec`'s own `--output-schema` still works for the
-FINAL message of a single call, actually — this may be usable per-round
-same as today; needs confirming it doesn't conflict with `--json`
-streaming or `resume`). If it does not compose cleanly, findings will need
-to be extracted from the free-text `final_answer` message via prompt
-instruction (ask Codex to answer in a specific parseable shape) rather
-than CLI-enforced schema — a real reliability step down from `/cc`,
-accepted as a v1 tradeoff for this experimental tool.
+**Spiked and live-tested 2026-09-03 (see the knowledge base's "Task 3 spike
+result" section for full embedded evidence)**: `--output-schema` composes
+cleanly with both `--json` streaming and `codex exec resume`. A fresh round
+and a resumed round both produced `--output-last-message` files that
+validate against the schema (required fields present, enum respected, no
+extra properties). More importantly, **the live rollout file's own
+`response_item`/`message`/`final_answer` entry already contains the exact
+same structured JSON for both rounds — not a free-text draft that only gets
+shaped into schema form at process exit** — written to disk ~250-330ms
+before that round's `task_complete` event, in both the fresh and the
+resumed round.
+
+This means a `codex-stream-review` implementation can read the
+schema-valid verdict directly off the live-tailed rollout file the moment
+the `final_answer` message entry appears, without waiting for
+`--output-last-message` or process exit at all — a genuine capability
+`/cc` does not have today (it only obtains structured output after full
+process exit via `--output-last-message`). No prompt-engineered
+free-text-parsing fallback is needed for this.
+
+One operational gotcha found during this spike, relevant to any
+implementation that shells out to `codex exec` non-interactively: **always
+redirect stdin from `/dev/null` explicitly** (e.g. `codex exec ... < /dev/null`).
+`codex exec`'s `[PROMPT]` argument handling also tries to read stdin to
+append as a `<stdin>` block even when a prompt is supplied as an argument;
+if the calling process's stdin is left open (not already closed/redirected),
+`codex exec` hangs indefinitely waiting for EOF, with no error — only a
+silent `Reading additional input from stdin...` line.
 
 ## Parallel reviewer orchestration
 
@@ -200,10 +220,11 @@ between concurrent reviewers to worry about.
 2. Confirm `codex exec resume <threadId>` reuses context correctly (no
    diff re-send needed) and measure the actual token savings vs. today's
    `/cc` round.
-3. Confirm `--output-schema` behavior when combined with `--json` +
-   `resume` (does the final rollout `message`/`final_answer` conform to
-   the schema the same way `--output-last-message` does today for a
-   plain one-shot call?).
+3. ~~Confirm `--output-schema` behavior when combined with `--json` +
+   `resume`~~ — **CONFIRMED 2026-09-03**: yes, it survives both cleanly,
+   and the live rollout file already contains structured JSON before
+   process exit (see "Structured output" above and the knowledge base's
+   Task 3 spike result).
 4. Confirm thread deletion/archival CLI semantics for the retention
    cleanup step.
 5. Only after 1-4 are confirmed: write the actual implementation plan
