@@ -464,3 +464,110 @@ round 2 ran against this same thread id). (A seventh attempt with the literal ta
 flag combination, and an eighth with `--approve-for-me --sandbox workspace-write`
 together, both failed CLI argument parsing
 before a thread was ever created — no thread ID to record for those two.)
+
+## Task 2 spike result: resume context reuse
+
+**Date:** 2026-09-03. **CLI version:** `codex-cli 0.151.0`. Full evidence and
+raw JSON in `.superpowers/sdd/2026-09-03-codex-stream-review/task-2-report.md`
+— this section is the condensed, load-bearing summary.
+
+**Setup**: scratch repo with a committed baseline `utils.py::last_index()`
+(correct, with an empty-list `ValueError` guard) and an uncommitted diff that
+strips the guard and introduces a concrete off-by-one (`return len(lst)`
+instead of `return len(lst) - 1`) — checkable answer: line 3, wrong for every
+non-empty list (off-by-one), and for an empty list specifically returns `0`
+(looks like a valid index) instead of signaling "no last index exists."
+
+**Round 1** (fresh thread): `codex exec --json --sandbox read-only -c
+model_reasoning_effort=low "Review the uncommitted diff in this repo for
+correctness bugs. Do not fix anything."` — thread `01a065b0-f399-7792-9335-996d27a8811a`.
+Codex found the diff itself via `git diff` (never pasted into the prompt),
+empirically verified the bug with a `python3 -c` assertion, and correctly
+reported it. Final `turn.completed.usage`: `input_tokens:113801,
+cached_input_tokens:93904, cache_write_input_tokens:19879, output_tokens:917,
+reasoning_output_tokens:297` — own-turn total **114,718 tokens**.
+
+**Round 2** (`codex exec resume 01a065b0-... --json "Which specific line
+number is the bug on, and why exactly does it cause a wrong result for an
+empty input?"`): answered correctly (line 3, empty-input reasoning matching
+Round 1's own finding) with **zero `command_execution`/`custom_tool_call`
+items** — confirmed by grepping the rollout file's round-2 portion
+(ordinals 49-62) for both substrings via `grep -c -E`: zero matches, cross-checked
+against a full listing of every `"type":"..."` token in that range. Codex
+answered directly from the resumed thread's own persisted context, with no
+re-investigation. Marginal cost for this round alone (see field-name findings
+below): **21,611 tokens**.
+
+**Round 3** (fresh, non-resumed comparison call, same effort/sandbox, diff
+text + the same follow-up question combined into one prompt): Codex *still*
+ran `git diff -- utils.py` to re-verify the pasted diff from disk rather than
+trusting the prompt text, needed 2 tool-call round-trips (vs Round 1's 5), and
+gave the same correct answer. Own-turn total: **58,683 tokens**.
+
+**Token-count field, resolved directly from data, not guessed**: every
+rollout `event_msg` with `payload.type=="token_count"` carries
+`payload.info.total_token_usage` (cumulative for the entire thread since it
+started — confirmed strictly increasing across Round 1 → Round 2 on the same
+thread: 114,718 → 136,329) and `payload.info.last_token_usage` (delta since
+the *immediately preceding* `token_count` event, i.e. **per individual model
+API call, not per full turn** — a multi-tool-call turn like Round 1 or 3 emits
+several of these, none individually equal to the turn's total cost). The
+`--json` stdout stream's `turn.completed.usage` field is identical to that
+turn's ending `total_token_usage` — which means **for `codex exec resume`,
+`turn.completed.usage` is cumulative across the whole thread, not that
+round's marginal cost**; a caller must subtract the previous round's ending
+`total_token_usage` to get the true per-round cost (Round 2's diffed marginal
+cost of 21,611 happens to equal its own final `last_token_usage.total_tokens`
+only because that particular turn consisted of exactly one model API call —
+this equality does not generalize to a resumed round that needs tool calls).
+
+**Headline comparison (the brief's specific ask, Round 2 vs Round 3): resume's
+follow-up cost 21,611 tokens vs 58,683 tokens for a fresh call re-establishing
+context and asking the same question — resume is ~2.7x cheaper (~63%
+reduction) for the follow-up round alone.** This directly confirms the design
+doc's per-round token-efficiency goal for a follow-up round, with real
+measured numbers.
+
+**Important caveat — do not over-generalize to "resume always wins":**
+summing Round 1 + Round 2 (full two-step conversation via resume) = 136,329
+tokens, which is *more* than Round 3 alone (58,683 tokens) achieving both the
+review and the follow-up answer in a single call. This is a confound, not
+evidence against resume: Round 1's prompt forced Codex to *discover* the diff
+itself (5 tool-call round-trips including reading two full skill files and an
+empirical Python check), a fundamentally more expensive task than Round 3's
+prompt, which handed Codex the diff text directly. **The valid, uncontaminated
+comparison is Round 2 vs Round 3** (identical follow-up question, one via
+resume, one via a fresh call bearing equivalent context) — that comparison
+cleanly favors resume. A production caller (like `/cc` today) that already
+embeds the diff text on round 1 rather than asking Codex to discover it would
+not pay Round 1's inflated investigation cost, making the Round-2-vs-3-style
+comparison the correct one to generalize from, not the raw 1+2-vs-3 sum.
+
+**A second, uncontaminated piece of evidence for resume's efficiency**: a
+fresh thread's first turn re-pays a large fixed "session bootstrap" cost that
+a resumed turn does not. Round 1's system-injected context (before the actual
+review prompt) totaled roughly 29,600 characters (`skills_instructions`
+19,621 chars, `<permissions instructions>` 341, `<plugins_instructions>`
+1,014, multi-agent-team preamble 2,264, `<multi_agent_mode>` 271, `# AGENTS.md
+instructions` 5,640, `<environment_context>` 457). Round 2's resumed turn
+re-sent only ~5,400 characters of system context (a short safe-commands
+notice, 198 chars, and a Ponytail-mode banner, 5,229 chars) — roughly 5.5x
+less repeated boilerplate, on the same machine, same environment, same
+session. This is genuine resume-specific savings, independent of the
+diff-investigation confound above.
+
+**Environment-specific caveat**: this machine's own `AGENTS.md`-driven
+mandatory skill-injection behavior (`using-superpowers` requires invoking a
+skill "before ANY response," causing Codex to read the `using-superpowers`
+and `ponytail` skill files in full on Rounds 1 and 3) added real but
+environment-specific overhead not inherent to Codex itself — a differently
+configured environment (e.g. a CI runner without personal `AGENTS.md`/plugin
+skills) would likely show smaller absolute token figures across all three
+rounds, though the *relative* resume-vs-fresh comparisons above should still
+hold in direction if not exact magnitude.
+
+**Spike thread IDs created during this investigation** (not yet
+archived/deleted — record for Task 4/5's cleanup pass): `01a065b0-f399-7792-9335-996d27a8811a`
+(Round 1 + Round 2, resumed), `01a065b3-5637-7c31-90ba-ff4bf99cf8e4` (Round 3,
+fresh/standalone). Scratch repo and all `/tmp/resume-spike-*` files were
+deleted after capturing the evidence above.
