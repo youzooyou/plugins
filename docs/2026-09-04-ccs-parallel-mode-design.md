@@ -1,9 +1,13 @@
 # `ccs` Parallel Multi-Reviewer Mode — Design
 
-> Status: approved (plugin author confirmed round-level synchronized convergence, 2026-09-04).
-> Companion reading: `docs/2026-09-03-ccs-design.md` (the core `/ccs` design this extends) and
-> `codex-direct-review/skills/ccd/SKILL.md` (the pattern this ports from, `ccd`'s own "Phase 1 —
-> Determine Review Mode (Parallel vs Single)" section and `groups[]` bookkeeping throughout).
+> Status: approved (plugin author confirmed round-level synchronized convergence, 2026-09-04) and
+> implemented — this design is now live in `codex-stream-review/skills/ccs/SKILL.md`.
+> Companion reading: `docs/2026-09-03-ccs-design.md` (the core `/ccs` design this extends).
+> **Note (2026-09-04):** the `codex-direct-review` plugin this design originally ported the
+> parallel-mode pattern from (its own "Phase 1 — Determine Review Mode (Parallel vs Single)"
+> section and `groups[]` bookkeeping) has since been removed from this repo — that companion
+> reference is now dead. The reasoning it captured is preserved in this document's own body below,
+> which remains the accurate historical record of how and why this design was made.
 
 ## Goal
 

@@ -4,7 +4,7 @@ set -u
 DEFAULT_TIMEOUT_SECS=1800
 THREAD_WAIT_SECS=10
 
-# --- temp-file registry, straight from codex-direct-review's run-codex-review.sh ---
+# --- temp-file registry ---
 register_temp_file() {
   [ -n "${TEMP_FILE_REGISTRY:-}" ] && printf '%s\0' "$1" >> "$TEMP_FILE_REGISTRY"
 }
