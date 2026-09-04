@@ -101,12 +101,15 @@ exactly as they are.
 - Every fresh round runs `--sandbox read-only`, the same boundary `codex-direct-review:ccd`/`codex-direct-review` use —
   there is no approval-gated write capability in this plugin.
 - **`codex-stream-review:ccs`** — a full Claude+Codex adversarial cross-review loop built on top of this plugin's
-  resumable-thread dispatch: same consensus outcome as `codex-direct-review:ccd`, but on a single resumable thread,
-  so follow-up rounds are cheap (no diff re-send after round 1) and, in a tmux-capable
-  environment, a live progress pane opens automatically. It also owns its thread's entire
-  lifecycle, cleaning it up on every terminal path instead of leaving that to the caller. A
-  sibling option to `codex-direct-review:ccd`, not a replacement — no parallel multi-reviewer mode or
-  `--capture-evidence` in v1; see `skills/ccs/SKILL.md`.
+  resumable-thread dispatch: same consensus outcome as `codex-direct-review:ccd`, but on a resumable thread per
+  reviewer, so follow-up rounds are cheap (no diff re-send after round 1) and, in a tmux-capable
+  environment, a live progress pane opens automatically per reviewer. It also owns its threads'
+  entire lifecycle, cleaning them up on every terminal path instead of leaving that to the caller.
+  Supports both single-reviewer and parallel multi-reviewer (N concurrent, dimension-focused
+  reviewers, each on its own resumable thread) modes, and can review a non-repo artifact (a design
+  doc, a plan, pasted analysis text) via a throwaway isolated repo, not just a live diff. A sibling
+  option to `codex-direct-review:ccd`, not a replacement — no `--capture-evidence` in v1; see
+  `skills/ccs/SKILL.md`.
 
 #### How it works
 
@@ -123,9 +126,10 @@ exactly as they are.
   `run-stream-review.sh` above: combines `run-codex-review.sh`'s diff-collection/coverage logic
   with the resumable-thread dispatch mechanism, since `run-stream-review.sh` itself has no
   diff-collection capability.
-- `skills/ccs/SKILL.md` — the `codex-stream-review:ccs` command: a single-reviewer, resumable-thread version of `codex-direct-review:ccd`'s
+- `skills/ccs/SKILL.md` — the `codex-stream-review:ccs` command: a resumable-thread version of `codex-direct-review:ccd`'s
   adversarial consensus loop (max 20 rounds), with automatic thread cleanup and an auto-opening
-  tmux pane.
+  tmux pane — single-reviewer or parallel multi-reviewer (each group on its own persistent
+  resumable thread), and non-repo-artifact reviews via a throwaway isolated repo.
 
 ## Contributing
 
