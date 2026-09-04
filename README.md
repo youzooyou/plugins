@@ -32,58 +32,19 @@ To get a fully blank context with no auto-restore, delete `.claude/handoff/lates
 - `skills/clear-prep/SKILL.md` — the skill that drives the backup pass
 - `hooks/hooks.json` + `hooks/session-resume-handoff.py` — a `SessionStart` hook (matcher: `clear`) that, only when the session started because of `/clear`, reads `.claude/handoff/latest.md` from the project you were in and re-injects it
 
-### codex-direct-review
-
-Runs a Codex CLI review as a fresh, one-shot process — no shared broker, no silent failures. Every
-review call spawns a brand-new `codex exec` process, judges its result strictly (exit code, event
-log, schema-valid output), and never returns silence: a failure always comes back as a structured
-`{"ok":false,"reason":"...","detail":"..."}` you can act on.
-
-**Why:** the alternative (a long-lived shared broker process behind Codex-invoking subagents) can
-silently fail, finish a turn early on an ambiguous message, or stall under context pressure with no
-error at all. This plugin trades that shared, stateful path for a wrapper script where every call is
-independently fresh, bounded by a wall-clock timeout, and validated against a JSON schema before
-being trusted.
-
-#### Install
-
-```
-/plugin marketplace add youzooyou/plugins
-/plugin install codex-direct-review
-```
-
-#### Usage
-
-- **`/codex-review`** — a single, one-shot review of uncommitted changes, a base-branch diff, or a
-  specific commit. No cross-verification, just one Codex pass with findings presented for you to act
-  on (nothing is auto-fixed).
-- **`codex-direct-review:ccd`** (bundled in this plugin, see `skills/ccd/SKILL.md`) is this plugin's
-  own multi-round Claude+Codex adversarial cross-review skill — the same review loop `codex-review`
-  above runs once, but iterated to consensus.
-
-#### How it works
-
-- `scripts/run-codex-review.sh` — the wrapper: gathers the diff itself (`--uncommitted` / `--base` /
-  `--commit`), builds a hand-written prompt (not the `codex exec review` subcommand, which does not
-  honor `--output-schema`), and runs generic `codex exec --ephemeral --sandbox read-only` with a
-  wall-clock timeout and process-group cleanup on both timeout and interrupt.
-- `schemas/review-verdict.schema.json` — the JSON Schema every verdict is validated against before
-  the wrapper reports success.
-- `skills/codex-review/SKILL.md` — the standalone `/codex-review` command.
-
 ### codex-stream-review
 
-**Experimental.** Runs a Codex CLI review as a persisted thread and signals its threadId early (on
-stderr, before the round finishes) so the CALLER can resolve and tail that thread's own rollout
+Runs a Codex CLI review as a persisted, resumable thread and signals its threadId early (on
+stderr, before the round finishes) so the caller can resolve and tail that thread's own rollout
 file for live progress narration; lets a follow-up round `codex exec resume` that same thread so it
-reuses the diff/prior-findings already in its own context instead of re-sending them.
+reuses the diff/prior findings already in its own context instead of re-sending them.
 
-**Why:** `codex-direct-review`'s ephemeral-process-per-round design has no way to see what Codex is
-doing until the whole call finishes, and every round re-sends the full diff and prior findings from
-scratch. This plugin trades that for a persisted, resumable thread — live progress visibility and
-cheaper multi-round follow-up — at the cost of leaving a real thread and rollout file on disk that
-the caller must explicitly clean up. It does not replace `codex-direct-review:ccd` or `codex-direct-review`, which stay
-exactly as they are.
+**Why:** an ephemeral-process-per-round design has no way to see what Codex is doing until the
+whole call finishes, and every round re-sends the full diff and prior findings from scratch. This
+plugin trades that for a persisted, resumable thread — live progress visibility and cheaper
+multi-round follow-up — at the cost of leaving a real thread and rollout file on disk that the
+caller must explicitly clean up (for the raw `stream-review` skill) or that `/ccs` cleans up for
+you automatically (see below).
 
 #### Install
 
@@ -94,22 +55,20 @@ exactly as they are.
 
 #### Usage
 
-- Start a review with `--cwd` and `--focus`; continue it with `--resume <threadId>` and a
-  follow-up-only `--focus` (never the diff again); clean up with `--cleanup <threadId>` once the
-  whole review is done, not after every round — see `skills/stream-review/SKILL.md` for the full
-  contract.
-- Every fresh round runs `--sandbox read-only`, the same boundary `codex-direct-review:ccd`/`codex-direct-review` use —
-  there is no approval-gated write capability in this plugin.
-- **`codex-stream-review:ccs`** — a full Claude+Codex adversarial cross-review loop built on top of this plugin's
-  resumable-thread dispatch: same consensus outcome as `codex-direct-review:ccd`, but on a resumable thread per
-  reviewer, so follow-up rounds are cheap (no diff re-send after round 1) and, in a tmux-capable
-  environment, a live progress pane opens automatically per reviewer. It also owns its threads'
-  entire lifecycle, cleaning them up on every terminal path instead of leaving that to the caller.
-  Supports both single-reviewer and parallel multi-reviewer (N concurrent, dimension-focused
-  reviewers, each on its own resumable thread) modes, and can review a non-repo artifact (a design
-  doc, a plan, pasted analysis text) via a throwaway isolated repo, not just a live diff. A sibling
-  option to `codex-direct-review:ccd`, not a replacement — no `--capture-evidence` in v1; see
-  `skills/ccs/SKILL.md`.
+- **`codex-stream-review:ccs`** — a full Claude+Codex adversarial cross-review loop (max 20
+  rounds) on a resumable thread per reviewer, so follow-up rounds are cheap (no diff re-send after
+  round 1) and, in a tmux-capable environment, a live progress pane opens automatically per
+  reviewer. It owns its threads' entire lifecycle, cleaning them up on every terminal path
+  automatically. Supports both single-reviewer and parallel multi-reviewer (N concurrent,
+  dimension-focused reviewers, each on its own resumable thread) modes, non-repo-artifact reviews
+  (a design doc, a plan, pasted analysis text) via a throwaway isolated repo, and opt-in
+  investigation-evidence capture (`--capture-evidence`) — see `skills/ccs/SKILL.md`.
+- `stream-review` — the lower-level, single-reviewer building block `/ccs` is built on. Start a
+  review with `--cwd` and `--focus`; continue it with `--resume <threadId>` and a follow-up-only
+  `--focus` (never the diff again); clean up with `--cleanup <threadId>` once the whole review is
+  done, not after every round — see `skills/stream-review/SKILL.md` for the full contract. Every
+  fresh round runs `--sandbox read-only` — there is no approval-gated write capability in this
+  plugin.
 
 #### How it works
 
@@ -119,17 +78,17 @@ exactly as they are.
   thread's rollout file under `~/.codex/sessions/` for its own `task_complete` event and extracts
   the final answer directly from that file once the round is done. `--cleanup <threadId>` is a
   separate mode that deletes the thread via `codex delete --force`. Used directly by the raw
-  `stream-review` skill below.
+  `stream-review` skill above.
 - `skills/stream-review/SKILL.md` — how to start, continue, and clean up a review, and the current
   safety-model status.
 - `scripts/run-ccs-review.sh` — a separate wrapper `/ccs` dispatches through instead of
-  `run-stream-review.sh` above: combines `run-codex-review.sh`'s diff-collection/coverage logic
-  with the resumable-thread dispatch mechanism, since `run-stream-review.sh` itself has no
-  diff-collection capability.
-- `skills/ccs/SKILL.md` — the `codex-stream-review:ccs` command: a resumable-thread version of `codex-direct-review:ccd`'s
+  `run-stream-review.sh` above: adds diff-collection/coverage logic on top of the resumable-thread
+  dispatch mechanism, since `run-stream-review.sh` itself has no diff-collection capability.
+- `skills/ccs/SKILL.md` — the `codex-stream-review:ccs` command: a resumable-thread Claude+Codex
   adversarial consensus loop (max 20 rounds), with automatic thread cleanup and an auto-opening
   tmux pane — single-reviewer or parallel multi-reviewer (each group on its own persistent
-  resumable thread), and non-repo-artifact reviews via a throwaway isolated repo.
+  resumable thread), non-repo-artifact reviews via a throwaway isolated repo, and opt-in
+  investigation-evidence capture.
 
 ## Contributing
 
