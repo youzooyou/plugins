@@ -142,14 +142,31 @@ def list_untracked_files(cwd_bytes, timeout_secs):
     repo state) could hang the entire collection indefinitely, before the
     deadline-tracking loop even started. subprocess.run's own timeout
     handling kills the child process itself on expiry, so a timed-out git
-    process is not left running either."""
+    process is not left running either.
+
+    GIT_SAFE_BIN (an absolute git path) and GIT_SAFE_HOME (an isolated,
+    empty HOME) must be passed in via the environment by the caller
+    (run-ccs-review.sh, which already resolves both for its own git_safe()
+    wrapper) -- this call is otherwise a completely separate, unprotected
+    git invocation from the ones git_safe() covers, and was confirmed
+    exploitable via ambient GIT_CONFIG_* config injection. Fails closed
+    (never falls back to a bare "git" lookup) if either is missing/invalid,
+    matching git_safe()'s own `env -i` isolation exactly rather than
+    approximating it."""
+    git_safe_bin = os.environ.get("GIT_SAFE_BIN", "")
+    if not git_safe_bin or not os.path.isabs(git_safe_bin):
+        return None, "GIT_SAFE_BIN is not set to an absolute path"
+    git_safe_home = os.environ.get("GIT_SAFE_HOME", "")
+    if not git_safe_home:
+        return None, "GIT_SAFE_HOME is not set"
     try:
         result = subprocess.run(
-            ["git", "ls-files", "-z", "--others", "--exclude-standard"],
+            [git_safe_bin, "-c", "core.fsmonitor=", "ls-files", "-z", "--others", "--exclude-standard"],
             cwd=cwd_bytes,
             capture_output=True,
             check=False,
             timeout=timeout_secs,
+            env={"PATH": "/usr/bin:/bin", "HOME": git_safe_home, "GIT_CONFIG_NOSYSTEM": "1"},
         )
     except subprocess.TimeoutExpired:
         return None, f"git ls-files did not complete within {timeout_secs}s"
@@ -441,6 +458,13 @@ def _parts_to_text(parts):
 def _selftest():
     import shutil
     import tempfile
+
+    # list_untracked_files() now fails closed without these -- set here (not
+    # git isolation itself under test, just this file's own untracked-file
+    # collection logic) so every case below, plus the subprocess-based case
+    # 14 (which inherits the current environment by default), keeps working.
+    os.environ["GIT_SAFE_BIN"] = shutil.which("git") or ""
+    os.environ["GIT_SAFE_HOME"] = tempfile.mkdtemp()
 
     failures = []
 

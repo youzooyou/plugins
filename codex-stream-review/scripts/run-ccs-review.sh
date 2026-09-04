@@ -280,6 +280,11 @@ TIMEOUT_SECS="$DEFAULT_TIMEOUT_SECS"
 # regardless of which scope ran.
 SOURCE_COVERAGE_JSON=""
 CAPTURE_EVENTLOG_PATH=""
+# Reset up front so cleanup_temp_files()'s "${SAFE_GIT_HOME:-}" guard always
+# sees an explicit empty string on any exit path before the real
+# `mktemp -d` assignment below runs, never an env value inherited from
+# whatever invoked this script.
+SAFE_GIT_HOME=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -526,7 +531,8 @@ case "$SCOPE" in
       # this asks it to write that to its own file rather than trusting the
       # model to self-report it. Only read below on success (status 0).
       mktemp_registered UNTRACKED_COVERAGE_FILE
-      python3 "$SCRIPT_DIR/collect_untracked_files.py" "$CWD" --deadline-secs 30 --max-bytes 1048576 \
+      GIT_SAFE_BIN="$GIT_BIN" GIT_SAFE_HOME="$SAFE_GIT_HOME" \
+        python3 "$SCRIPT_DIR/collect_untracked_files.py" "$CWD" --deadline-secs 30 --max-bytes 1048576 \
         --coverage-out "$UNTRACKED_COVERAGE_FILE" \
         > "$UNTRACKED_OUT_FILE" 2>"$UNTRACKED_ERR_FILE" &
       UNTRACKED_PID=$!
