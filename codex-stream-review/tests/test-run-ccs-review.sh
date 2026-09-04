@@ -15,6 +15,7 @@ LIB_GIT_SAFE="$SCRIPT_DIR/../scripts/lib/git-safe.sh"
 FAILURES=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAILURES=$((FAILURES + 1)); }
+must() { "$@" || { echo "SETUP FAILED: $*" >&2; exit 1; }; }
 
 # --- wrapper contract regressions (arg parsing, no git/codex involved) ---
 
@@ -50,15 +51,15 @@ fi
 # --- git isolation fixtures -- exercise git_safe() directly, no codex exec ---
 
 TMP_REPO="$(mktemp -d)"
-git -C "$TMP_REPO" init -q
-git -C "$TMP_REPO" -c user.email=test@example.com -c user.name=test commit --allow-empty -q -m init
-echo "content" > "$TMP_REPO/file.txt"
-git -C "$TMP_REPO" add file.txt
-git -C "$TMP_REPO" -c user.email=test@example.com -c user.name=test commit -q -m "add file"
-echo "changed" > "$TMP_REPO/file.txt"
+must git -C "$TMP_REPO" init -q
+must git -C "$TMP_REPO" -c user.email=test@example.com -c user.name=test commit --allow-empty -q -m init
+echo "content" > "$TMP_REPO/file.txt" || { echo "SETUP FAILED: writing file.txt (content)" >&2; exit 1; }
+must git -C "$TMP_REPO" add file.txt
+must git -C "$TMP_REPO" -c user.email=test@example.com -c user.name=test commit -q -m "add file"
+echo "changed" > "$TMP_REPO/file.txt" || { echo "SETUP FAILED: writing file.txt (changed)" >&2; exit 1; }
 
 DECOY_REPO="$(mktemp -d)"
-git -C "$DECOY_REPO" init -q
+must git -C "$DECOY_REPO" init -q
 
 CWD="$TMP_REPO"
 SAFE_GIT_HOME="$(mktemp -d)"
@@ -69,30 +70,32 @@ source "$LIB_GIT_SAFE"
 # to the decoy repo, or change how git interprets the target repo.
 ACTUAL="$(GIT_DIR="$DECOY_REPO/.git" GIT_WORK_TREE="$DECOY_REPO" \
   GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.bare GIT_CONFIG_VALUE_0=true \
-  git_safe rev-parse --show-toplevel 2>&1)"
+  git_safe rev-parse --show-toplevel 2>/dev/null)"
+GIT_SAFE_STATUS=$?
 ACTUAL_RESOLVED="$(cd "$ACTUAL" 2>/dev/null && pwd -P)"
 EXPECTED_RESOLVED="$(cd "$TMP_REPO" && pwd -P)"
-if [ -n "$ACTUAL_RESOLVED" ] && [ "$ACTUAL_RESOLVED" = "$EXPECTED_RESOLVED" ]; then
+if [ "$GIT_SAFE_STATUS" -eq 0 ] && [ -n "$ACTUAL_RESOLVED" ] && [ "$ACTUAL_RESOLVED" = "$EXPECTED_RESOLVED" ]; then
   pass "git_safe ignores hostile GIT_DIR/GIT_WORK_TREE/GIT_CONFIG_* and resolves the real target repo"
 else
-  fail "git_safe should resolve to $TMP_REPO regardless of hostile env, got: $ACTUAL"
+  fail "git_safe should resolve to $TMP_REPO regardless of hostile env, got: $ACTUAL (exit $GIT_SAFE_STATUS)"
 fi
 
 # (b) a hostile PATH set AFTER GIT_BIN was already resolved must not divert
 # execution to a decoy `git` placed earlier on it.
 DECOY_BIN_DIR="$(mktemp -d)"
 MARKER_FILE="$(mktemp -u)"
-cat > "$DECOY_BIN_DIR/git" <<EOF
+cat > "$DECOY_BIN_DIR/git" <<EOF || { echo "SETUP FAILED: writing decoy git script" >&2; exit 1; }
 #!/bin/sh
 touch "$MARKER_FILE"
 exit 1
 EOF
-chmod +x "$DECOY_BIN_DIR/git"
+must chmod +x "$DECOY_BIN_DIR/git"
 PATH="$DECOY_BIN_DIR:$PATH" git_safe diff --no-ext-diff --no-textconv >/dev/null 2>&1
-if [ ! -e "$MARKER_FILE" ]; then
+GIT_SAFE_STATUS=$?
+if [ "$GIT_SAFE_STATUS" -eq 0 ] && [ ! -e "$MARKER_FILE" ]; then
   pass "git_safe ignores a hostile PATH decoy git executable"
 else
-  fail "git_safe executed a decoy git binary from a hostile PATH"
+  fail "git_safe executed a decoy git binary from a hostile PATH, or failed outright (exit $GIT_SAFE_STATUS)"
   rm -f "$MARKER_FILE"
 fi
 rm -rf "$DECOY_BIN_DIR"
@@ -101,15 +104,38 @@ rm -rf "$DECOY_BIN_DIR"
 # the one thing env-var sanitization alone cannot reach, since it lives in
 # the target repo's own tracked .git/config.
 FSMON_MARKER="$(mktemp -u)"
-git -C "$TMP_REPO" config core.fsmonitor "touch $FSMON_MARKER; true"
+must git -C "$TMP_REPO" config core.fsmonitor "touch $FSMON_MARKER; true"
 git_safe diff --no-ext-diff --no-textconv >/dev/null 2>&1
-if [ ! -e "$FSMON_MARKER" ]; then
+GIT_SAFE_STATUS=$?
+if [ "$GIT_SAFE_STATUS" -eq 0 ] && [ ! -e "$FSMON_MARKER" ]; then
   pass "git_safe disables a repo-local core.fsmonitor hook"
 else
-  fail "git_safe let a repo-local core.fsmonitor hook execute"
+  fail "git_safe let a repo-local core.fsmonitor hook execute, or failed outright (exit $GIT_SAFE_STATUS)"
   rm -f "$FSMON_MARKER"
 fi
-git -C "$TMP_REPO" config --unset core.fsmonitor
+must git -C "$TMP_REPO" config --unset core.fsmonitor
+
+# (d) collect_untracked_files.py's OWN git subprocess (the actual vulnerable
+# path Issue 2 fixed) must also resist hostile core.fsmonitor config plus
+# GIT_CONFIG_* env-var injection -- the 3 fixtures above only exercise
+# git_safe() directly, never this separate subprocess the collector runs,
+# invoked here the same way run-ccs-review.sh now invokes it post-fix.
+COLLECT_PY="$SCRIPT_DIR/../scripts/collect_untracked_files.py"
+COLLECT_FSMON_MARKER="$(mktemp -u)"
+must git -C "$TMP_REPO" config core.fsmonitor "touch $COLLECT_FSMON_MARKER; true"
+COLLECT_COVERAGE_OUT="$(mktemp)"
+GIT_SAFE_BIN="$GIT_BIN" GIT_SAFE_HOME="$SAFE_GIT_HOME" \
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0="touch $COLLECT_FSMON_MARKER; true" \
+  python3 "$COLLECT_PY" "$TMP_REPO" --deadline-secs 5 --max-bytes 65536 --coverage-out "$COLLECT_COVERAGE_OUT" \
+  >/dev/null 2>&1
+COLLECT_STATUS=$?
+if [ "$COLLECT_STATUS" -eq 0 ] && [ ! -e "$COLLECT_FSMON_MARKER" ]; then
+  pass "collect_untracked_files.py's own git subprocess ignores hostile core.fsmonitor + GIT_CONFIG_* injection"
+else
+  fail "collect_untracked_files.py should exit 0 without firing the fsmonitor hook (exit $COLLECT_STATUS, marker exists: $([ -e "$COLLECT_FSMON_MARKER" ] && echo yes || echo no))"
+fi
+must git -C "$TMP_REPO" config --unset core.fsmonitor
+rm -f "$COLLECT_FSMON_MARKER" "$COLLECT_COVERAGE_OUT"
 
 rm -rf "$TMP_REPO" "$DECOY_REPO" "$SAFE_GIT_HOME"
 
