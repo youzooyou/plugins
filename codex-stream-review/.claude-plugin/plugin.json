@@ -1,6 +1,6 @@
 {
   "name": "codex-stream-review",
-  "version": "0.2.1",
+  "version": "0.4.0",
   "description": "Experimental: stream live Codex review progress by tailing a persisted thread's rollout file, with multi-round follow-up via codex exec resume (no diff re-send). Separate from and does not replace codex-direct-review.",
   "author": {
     "name": "youzooyou",
