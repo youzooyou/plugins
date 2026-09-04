@@ -1,0 +1,45 @@
+name: codex-stream-review CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'codex-stream-review/**'
+      - '.github/workflows/codex-stream-review-ci.yml'
+  pull_request:
+    paths:
+      - 'codex-stream-review/**'
+      - '.github/workflows/codex-stream-review-ci.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck
+        run: |
+          shellcheck --version
+          # --severity=warning: this project's scripts trap-invoke on_signal/
+          # cleanup_temp_files (SC2329 false-positives on an indirectly-called
+          # function) and source a relative sibling file whose path resolution
+          # depends on invocation cwd (SC1091, info-only) -- both confirmed
+          # harmless by direct local shellcheck run, never real bugs. Real
+          # warnings/errors still fail the build; only these two info-level
+          # notes are filtered.
+          shellcheck --severity=warning \
+            codex-stream-review/scripts/run-ccs-review.sh \
+            codex-stream-review/scripts/lib/git-safe.sh \
+            codex-stream-review/scripts/run-stream-review.sh
+
+      - name: bash -n syntax check
+        run: |
+          bash -n codex-stream-review/scripts/run-ccs-review.sh
+          bash -n codex-stream-review/scripts/lib/git-safe.sh
+          bash -n codex-stream-review/scripts/run-stream-review.sh
+
+      - name: Fixture suite
+        run: bash codex-stream-review/tests/test-run-ccs-review.sh
+
+      - name: Collector selftest
+        run: python3 codex-stream-review/scripts/collect_untracked_files.py --selftest

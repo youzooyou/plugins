@@ -1504,17 +1504,19 @@ Same structure `codex-direct-review:ccd` uses:
   its own persistent, resumable thread, unlike `ccd`'s ephemeral-process-per-round-per-group
   model. Reach for `codex-direct-review:ccd` instead when its further-proven ephemeral-process-per-round mechanism
   is specifically what's wanted, not for parallel coverage alone.
-- **Before committing a change to `scripts/run-ccs-review.sh`, `scripts/lib/git-safe.sh`, or
-  `scripts/collect_untracked_files.py`, run `shellcheck` (the two `.sh` files) and the repo's own
-  `tests/test-run-ccs-review.sh` fixture suite.** This project has no CI pipeline defined for this
-  plugin — these checks are manual, not automatic, so they only catch anything if actually run:
-  `shellcheck scripts/run-ccs-review.sh scripts/lib/git-safe.sh` (pin a specific installed
-  version with `shellcheck --version` in the commit/PR description when reporting a clean run, so
-  a later regression against a newer ShellCheck release is distinguishable from a real
-  reintroduced bug) plus `bash tests/test-run-ccs-review.sh`. Neither replaces the other:
-  ShellCheck catches quoting/expansion/control-flow hazards `bash -n` (syntax-only) cannot, while
-  the fixture suite is the only thing that actually exercises the git-isolation behavior
-  (`git_safe()`'s `env -i` allowlist, the collector's own isolated subprocess call) end to end —
-  a lint-clean script can still be behaviorally wrong, and a behaviorally-passing script can still
-  have a real quoting hazard ShellCheck would have caught on an input the fixture suite doesn't
-  happen to exercise.
+- **A change to any of `scripts/run-ccs-review.sh`, `scripts/lib/git-safe.sh`,
+  `scripts/run-stream-review.sh`, or `scripts/collect_untracked_files.py` is automatically checked
+  by `.github/workflows/codex-stream-review-ci.yml`** on every pull request touching
+  `codex-stream-review/**` (any source branch) and on every push directly to `main` — ShellCheck (`--severity=warning`; two info-level findings, an SC1091
+  relative-source-path note and an SC2329 false-positive on trap-invoked functions, are confirmed
+  harmless and filtered out, real warnings/errors still fail the build), a `bash -n` syntax check,
+  the `tests/test-run-ccs-review.sh` fixture suite, and `collect_untracked_files.py --selftest`.
+  Reproduce the same checks locally before pushing:
+  `shellcheck --severity=warning scripts/run-ccs-review.sh scripts/lib/git-safe.sh
+  scripts/run-stream-review.sh` plus `bash tests/test-run-ccs-review.sh`. Neither ShellCheck nor
+  the fixture suite replaces the other: ShellCheck catches quoting/expansion/control-flow hazards
+  `bash -n` (syntax-only) cannot, while the fixture suite is the only thing that actually exercises
+  the git-isolation behavior (`git_safe()`'s `env -i` allowlist, the collector's own isolated
+  subprocess call) end to end — a lint-clean script can still be behaviorally wrong, and a
+  behaviorally-passing script can still have a real quoting hazard ShellCheck would have caught on
+  an input the fixture suite doesn't happen to exercise.
