@@ -1,6 +1,6 @@
 ---
 name: stream-review
-description: Use when you want live progress visibility into a Codex review and cheap multi-round follow-up on the same reviewer thread (no diff re-send) — an experimental, separate alternative to /cc and codex-direct-review's ephemeral-process-per-round design. Not a replacement for /cc's equal-partnership adversarial-review loop, which stays exactly as it is.
+description: Use when you want live progress visibility into a Codex review and cheap multi-round follow-up on the same reviewer thread (no diff re-send) — an experimental, separate alternative to codex-direct-review:ccd and codex-direct-review's ephemeral-process-per-round design. Not a replacement for codex-direct-review:ccd's equal-partnership adversarial-review loop, which stays exactly as it is.
 ---
 
 # Stream Review (experimental)
@@ -13,18 +13,18 @@ Round 1 starts the thread with `codex exec --sandbox read-only`; every
 follow-up round resumes that same thread with `codex exec resume`, so Codex
 already has the diff and prior findings in its own context — a follow-up
 `--focus` should carry only the new question, never the diff again. This is
-the opposite tradeoff from `codex-direct-review`/`/cc`, which re-run
+the opposite tradeoff from `codex-direct-review`/`codex-direct-review:ccd`, which re-run
 everything fresh each round and never leave anything on disk; this plugin
 leaves a real thread + rollout file behind on purpose (that's what makes
 resume possible), which is why cleanup below is a real caller obligation,
 not a formality.
 
-This is **experimental and separate** from `/cc` and `codex-direct-review`.
-It does not replace either — `/cc`'s multi-round Claude+Codex adversarial
+This is **experimental and separate** from `codex-direct-review:ccd` and `codex-direct-review`.
+It does not replace either — `codex-direct-review:ccd`'s multi-round Claude+Codex adversarial
 consensus loop stays exactly as it is for cross-verification work. Reach for
 this plugin instead when you specifically want to watch a single reviewer's
 progress live or run a multi-round follow-up on one thread cheaply; reach
-for `/cc`/`codex-review` for everything else. Running several reviews at
+for `codex-direct-review:ccd`/`codex-review` for everything else. Running several reviews at
 once is just invoking the wrapper multiple times with different `--cwd`
 values — each gets its own independent thread and rollout file, no shared
 state between them.
@@ -131,7 +131,7 @@ diff/code content is still sitting on disk under `~/.codex/sessions/`.
 ### 4. Safety model — plain read-only, no approval flow
 
 Every fresh round runs with `--sandbox read-only`: Codex cannot write
-anywhere, inside or outside the repo under review — same boundary `/cc`
+anywhere, inside or outside the repo under review — same boundary `codex-direct-review:ccd`
 already uses. A resumed round passes no `--sandbox` flag at all (`codex exec
 resume` doesn't have one) and simply inherits whatever sandbox mode the
 thread started with.
@@ -142,4 +142,4 @@ and Claude decide per-action, but headless `codex exec`/`codex exec resume`
 has no approval-request mechanism to answer on the installed CLI version at
 all — this was investigated and confirmed dropped, not merely unbuilt yet.
 Don't tell a user this plugin can grant Codex supervised write access; it
-can only ever be fully read-only or fully blocked, exactly like `/cc`.
+can only ever be fully read-only or fully blocked, exactly like `codex-direct-review:ccd`.

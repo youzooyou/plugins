@@ -82,7 +82,7 @@ reuses the diff/prior-findings already in its own context instead of re-sending 
 doing until the whole call finishes, and every round re-sends the full diff and prior findings from
 scratch. This plugin trades that for a persisted, resumable thread — live progress visibility and
 cheaper multi-round follow-up — at the cost of leaving a real thread and rollout file on disk that
-the caller must explicitly clean up. It does not replace `/cc` or `codex-direct-review`, which stay
+the caller must explicitly clean up. It does not replace `codex-direct-review:ccd` or `codex-direct-review`, which stay
 exactly as they are.
 
 #### Install
@@ -98,14 +98,14 @@ exactly as they are.
   follow-up-only `--focus` (never the diff again); clean up with `--cleanup <threadId>` once the
   whole review is done, not after every round — see `skills/stream-review/SKILL.md` for the full
   contract.
-- Every fresh round runs `--sandbox read-only`, the same boundary `/cc`/`codex-direct-review` use —
+- Every fresh round runs `--sandbox read-only`, the same boundary `codex-direct-review:ccd`/`codex-direct-review` use —
   there is no approval-gated write capability in this plugin.
 - **`codex-stream-review:ccs`** — a full Claude+Codex adversarial cross-review loop built on top of this plugin's
-  resumable-thread dispatch: same consensus outcome as `/cc`, but on a single resumable thread,
+  resumable-thread dispatch: same consensus outcome as `codex-direct-review:ccd`, but on a single resumable thread,
   so follow-up rounds are cheap (no diff re-send after round 1) and, in a tmux-capable
   environment, a live progress pane opens automatically. It also owns its thread's entire
   lifecycle, cleaning it up on every terminal path instead of leaving that to the caller. A
-  sibling option to `/cc`, not a replacement — no parallel multi-reviewer mode or
+  sibling option to `codex-direct-review:ccd`, not a replacement — no parallel multi-reviewer mode or
   `--capture-evidence` in v1; see `skills/ccs/SKILL.md`.
 
 #### How it works
@@ -123,7 +123,7 @@ exactly as they are.
   `run-stream-review.sh` above: combines `run-codex-review.sh`'s diff-collection/coverage logic
   with the resumable-thread dispatch mechanism, since `run-stream-review.sh` itself has no
   diff-collection capability.
-- `skills/ccs/SKILL.md` — the `codex-stream-review:ccs` command: a single-reviewer, resumable-thread version of `/cc`'s
+- `skills/ccs/SKILL.md` — the `codex-stream-review:ccs` command: a single-reviewer, resumable-thread version of `codex-direct-review:ccd`'s
   adversarial consensus loop (max 20 rounds), with automatic thread cleanup and an auto-opening
   tmux pane.
 

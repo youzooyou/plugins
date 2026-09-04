@@ -1,6 +1,6 @@
 ---
 name: ccs
-description: Claude executes a task then runs a Claude+Codex adversarial cross-review loop (max 20 rounds) until fact-based consensus — the same outcome as /cc, but built on a single resumable Codex thread instead of a fresh process per round, so follow-up rounds are cheaper (no diff re-send after round 1) and, in a tmux-capable environment, a live progress pane opens automatically. /cc is unaffected and remains the other available option: reach for /cc for its further-proven ephemeral-process-per-round mechanism and parallel multi-reviewer mode; reach for /ccs for cheap multi-round follow-up and a live view into what Codex is doing.
+description: Claude executes a task then runs a Claude+Codex adversarial cross-review loop (max 20 rounds) until fact-based consensus — the same outcome as codex-direct-review:ccd, but built on a single resumable Codex thread instead of a fresh process per round, so follow-up rounds are cheaper (no diff re-send after round 1) and, in a tmux-capable environment, a live progress pane opens automatically. codex-direct-review:ccd is unaffected and remains the other available option: reach for codex-direct-review:ccd for its further-proven ephemeral-process-per-round mechanism and parallel multi-reviewer mode; reach for /ccs for cheap multi-round follow-up and a live view into what Codex is doing.
 ---
 
 # /ccs — Claude + Codex Cross-Review on a Resumable Thread
@@ -25,7 +25,7 @@ one-shot wrapper), it opens a live tmux pane on the round's rollout file when po
 **always cleans up its Codex thread on every terminal path** — never left to the user, unlike
 `stream-review`'s own caller-owns-cleanup contract.
 
-**`/cc` is unaffected by this skill.** It remains exactly as it is, still backed by
+**`codex-direct-review:ccd` is unaffected by this skill.** It remains exactly as it is, still backed by
 `codex-direct-review`. `/ccs` is a separate, additional option, not a replacement or migration
 path.
 
@@ -33,16 +33,16 @@ path.
 
 ## v1 scope — what this skill does NOT do
 
-- **No parallel multi-reviewer mode.** Always a single reviewer, one thread. `/cc`'s dimension-
+- **No parallel multi-reviewer mode.** Always a single reviewer, one thread. `codex-direct-review:ccd`'s dimension-
   split parallel mode is not ported — it composes awkwardly with one resumable thread (which
   dimension's thread would round 2 resume?). Every `GROUP="main"`-only construct below reflects
   this: there is no `GROUP` segment in any path or log field.
-- **No `--capture-evidence` / investigation-evidence extraction.** `/cc`'s opt-in raw-command-
+- **No `--capture-evidence` / investigation-evidence extraction.** `codex-direct-review:ccd`'s opt-in raw-command-
   extraction feature and its `investigation_evidence` JSONL field are not ported. `run-ccs-
   review.sh` does expose a lower-level `--capture-eventlog <path>` flag (best-effort raw event-
   log dump) — this skill does not use it; it is unused v1 surface, not a hidden replacement for
   `--capture-evidence`.
-- **No non-repo-artifact review.** `/cc`'s `CLEAN_REPO_DIR` throwaway-repo mechanism (for
+- **No non-repo-artifact review.** `codex-direct-review:ccd`'s `CLEAN_REPO_DIR` throwaway-repo mechanism (for
   reviewing pasted analysis/plan text with no real git diff) is not ported. `/ccs` v1 only
   reviews a real repo's diff (`--uncommitted` / `--base <ref>` / `--commit <sha>`). If Phase 0
   below finds nothing concrete to diff, or the material to review isn't a repo diff at all, tell
@@ -104,7 +104,7 @@ run-ccs-review.sh --cwd <dir> --resume <threadId> --focus <text> [--timeout <sec
   — never both a scope flag and `--resume` together (`bad_args`: "`--resume` cannot be combined
   with `--uncommitted`/`--base`/`--commit`"). A scope flag is only meaningful on a fresh round.
 - `--focus <text>` — **required**, every call (see "Hard rules" above).
-- `--timeout <secs>` — optional, positive integer, default `1800` (30 min, same default `/cc`'s
+- `--timeout <secs>` — optional, positive integer, default `1800` (30 min, same default `codex-direct-review:ccd`'s
   own wrapper uses). This skill does not pass it explicitly unless a round genuinely needs
   longer; the PID-liveness watcher's own wait bound (below) matches whatever value is actually
   used.
@@ -118,10 +118,10 @@ run-ccs-review.sh --cwd <dir> --resume <threadId> --focus <text> [--timeout <sec
 round**, absent for `--base`/`--commit` and absent for every `--resume` round (confirmed directly
 by reading the wrapper: `SOURCE_COVERAGE_JSON` is only ever populated inside the `--uncommitted`
 diff-collection branch, which a `--resume` call and a `--base`/`--commit` call both skip
-entirely). This mirrors `/cc`'s own established coverage convention exactly — see "Coverage is a
+entirely). This mirrors `codex-direct-review:ccd`'s own established coverage convention exactly — see "Coverage is a
 Round-1-only property" below for what this means for `/ccs`'s multi-round convergence check.
 `verdict` matches the shared review-verdict schema (`verdict`/`findings[]`/`summary`/
-`dimensions`) — same shape `/cc` already parses, do not re-derive it.
+`dimensions`) — same shape `codex-direct-review:ccd` already parses, do not re-derive it.
 
 **Failure:** `{"ok":false,"reason":"<reason>","threadId":"<uuid or absent>","detail":"..."}`.
 Every distinct `reason` this wrapper can emit, and whether `threadId` is present (capture it
@@ -178,20 +178,20 @@ step a human needs to remember. See "Phase 3 — Terminal path" below.
 
 ---
 
-## Sentinel-file safe-read idiom (adapted from `/cc`)
+## Sentinel-file safe-read idiom (adapted from `codex-direct-review:ccd`)
 
 `--focus`, `--cwd`, and the resolved plugin install path all get built into a shell command
 string from values Claude does not fully control character-by-character (pasted content, a
 resolved filesystem path). Interpolating any of them directly into a double-quoted argument is
 exploitable — a value containing an embedded `"` followed by shell metacharacters breaks out of
-the intended argument and executes as a second statement. `/cc`'s own SKILL.md ("Codex
+the intended argument and executes as a second statement. `codex-direct-review:ccd`'s own SKILL.md ("Codex
 invocation" section) proves this in detail and fixes it with a file-plus-sentinel idiom; apply
 the **exact same idiom** here, unchanged:
 
 - Resolve/compose the value, then write it to a `mktemp`-allocated file with a trailing literal
   `x` sentinel appended directly after it, no newline in between: `{ <producing-command>; printf
   'x'; } > "$FILE"` for a shell-resolved value (using `jq -j`, never `jq -r`, and `printf '%s'
-  "$PWD"`, never `$(pwd)`, for the same trailing-newline-loss reasons `/cc` documents), or the
+  "$PWD"`, never `$(pwd)`, for the same trailing-newline-loss reasons `codex-direct-review:ccd` documents), or the
   Write tool for Claude-composed text (`--focus`) — content on disk is exactly `<value>x`.
 - Read it back everywhere it's consumed as `VALUE="$(cat "$FILE")"; VALUE="${VALUE%x}"`, never a
   bare `$(cat "$FILE")` inlined directly into a command.
@@ -214,11 +214,11 @@ this step — write the concrete literal text into each actual command construct
 assume a shell variable survived.
 
 1. **Session id:** `SESSION_ID="$(date +%Y-%m-%dT%H%M%S)-$$"` — timestamp plus the invoking
-   shell's PID, exactly `/cc`'s own scheme (the PID suffix is required: a bare-second-resolution
+   shell's PID, exactly `codex-direct-review:ccd`'s own scheme (the PID suffix is required: a bare-second-resolution
    timestamp collides across two invocations started in the same second). Qualifies every
    temp-file path and the review-history log path for the rest of the run.
 
-2. **Resolve this plugin's own install path**, the same way `/cc` resolves
+2. **Resolve this plugin's own install path**, the same way `codex-direct-review:ccd` resolves
    `codex-direct-review`'s, keyed `codex-stream-review@youzooyou-plugins`:
    ```bash
    INSTALL_PATH_FILE=$(mktemp "/tmp/ccs-${SESSION_ID}-install-path.txt.XXXXXX")
@@ -248,7 +248,7 @@ assume a shell variable survived.
    ```
    Session-constant, resolved once, never re-resolved per round.
 
-4. **Determine the ARTIFACT** — same as `/cc`'s own Phase 0:
+4. **Determine the ARTIFACT** — same as `codex-direct-review:ccd`'s own Phase 0:
    - If `$ARGUMENTS` is non-empty: it is the TASK. Perform it end-to-end (Review → Plan →
      Research → Implement → Verify). The result is the ARTIFACT.
    - If empty: the ARTIFACT is the work just completed in **this** session. If none is
@@ -282,10 +282,10 @@ echo "ERR_FILE=$ERR_FILE"
 echo "FOCUS_FILE=$FOCUS_FILE"
 ```
 
-**Why `ERR_FILE` is separate from `OUT_FILE`, unlike `/cc`'s own watcher (which merges
+**Why `ERR_FILE` is separate from `OUT_FILE`, unlike `codex-direct-review:ccd`'s own watcher (which merges
 stdout+stderr into one file).** `run-ccs-review.sh` prints the early `THREAD_ID=<uuid>` signal
 on **stderr** the moment a thread starts (or immediately, on a resumed round) — well before the
-round's final JSON appears on stdout. `/cc`'s wrapper has no such signal to exploit, so it merges
+round's final JSON appears on stdout. `codex-direct-review:ccd`'s wrapper has no such signal to exploit, so it merges
 the two channels; `/ccs` needs the early signal for the tmux pane and for holding onto a
 threadId even if the round later fails, so the two streams are kept apart, exactly as
 `stream-review`'s own SKILL.md documents ("redirect stdout and stderr to SEPARATE files").
@@ -294,7 +294,7 @@ Then, using the Write tool (never a shell redirect — see the sentinel idiom ab
 round's `--focus` text plus a trailing `x` sentinel into `FOCUS_FILE`:
 - **Round 1:** Why (the actual problem this task addresses) / Scope (what to specifically verify
   given what this diff touches) — there is no History yet. Fold in the same `⚠️ SCOPE
-  CONSTRAINT` block `/cc` always includes (do not open `node_modules/`/`.pnpm/`/vendor
+  CONSTRAINT` block `codex-direct-review:ccd` always includes (do not open `node_modules/`/`.pnpm/`/vendor
   directories; limit reads to source dirs and the diff itself) — this is caller-supplied text,
   `run-ccs-review.sh`'s own prompt template does not add it for you.
 - **Round 2+:** History (fixes applied and findings rejected last round, built from the review
@@ -334,7 +334,7 @@ paraphrasing it.
 
 ### Step 2 — liveness watcher (secondary channel, defense in depth)
 
-Identical to `/cc`'s own PID-plus-start-time watcher, reusing the same `PID_FILE`, dispatched as
+Identical to `codex-direct-review:ccd`'s own PID-plus-start-time watcher, reusing the same `PID_FILE`, dispatched as
 an independent `Monitor` call right after step 1:
 
 ```bash
@@ -353,7 +353,7 @@ echo "Round <R>: process exited"
 ```
 
 Checks PID **plus** recorded start time (mitigates PID reuse after the process exits) — a
-defense-in-depth secondary signal, not the primary completion mechanism. See `/cc`'s own
+defense-in-depth secondary signal, not the primary completion mechanism. See `codex-direct-review:ccd`'s own
 "Liveness watcher" section for the full reasoning; nothing about it changes here beyond dropping
 the `GROUP` segment.
 
@@ -459,7 +459,7 @@ round's correctness.
 depending on the provider/model configuration — don't rely on those appearing.
 
 If `TMUX` is unset, or `split-window`/`send-keys` fail for any reason, proceed without a pane —
-narrate progress through ordinary English text updates only, exactly as `/cc` already does with
+narrate progress through ordinary English text updates only, exactly as `codex-direct-review:ccd` already does with
 no pane at all.
 
 ---
@@ -492,7 +492,7 @@ For each round, after Phase 1 delivers a result:
 Since only a fresh `--uncommitted` round ever reports `coverage.source` (see the interface
 reference above), and only round 1 is ever a fresh round in `/ccs` (round 2+ is always
 `--resume`), the coverage-completeness gate below is a property of **round 1's own log line**,
-not "the latest round's," unlike `/cc` (where every round is independently scope-flagged).
+not "the latest round's," unlike `codex-direct-review:ccd` (where every round is independently scope-flagged).
 Record round 1's `coverage_source` once and carry that determination forward through the rest of
 the loop — it is never re-collected on a resumed round.
 
@@ -547,19 +547,19 @@ the loop — it is never re-collected on a resumed round.
 
 ## Review history log (JSONL)
 
-Same purpose and mechanism as `/cc`'s own log — Claude is the sole writer/reader, Codex never
-sees it — at a plugin-appropriate path instead of `/cc`'s command-local one:
+Same purpose and mechanism as `codex-direct-review:ccd`'s own log — Claude is the sole writer/reader, Codex never
+sees it — at a plugin-appropriate path instead of `codex-direct-review:ccd`'s command-local one:
 
 **Location:** `~/.claude/plugins/data/codex-stream-review/ccs-logs/<repo-slug>/<session-id>.jsonl`
 - `<repo-slug>`: the target repo's directory basename, lowercased, non-alnum → `-`.
 - `<session-id>`: the literal `SESSION_ID` from Phase 0.
 - Create owner-only, once per session: `umask 077 && mkdir -p ~/.claude/plugins/data/codex-stream-review/ccs-logs/<repo-slug>`
-  — same reasoning `/cc` documents (this log retains full `target.focus` text indefinitely; the
+  — same reasoning `codex-direct-review:ccd` documents (this log retains full `target.focus` text indefinitely; the
   ambient `umask` on this machine would otherwise leave it group/world-readable). Best-effort
   also retighten any pre-existing directory once per session:
   `chmod -R go-rwx ~/.claude/plugins/data/codex-stream-review/ccs-logs/<repo-slug> 2>/dev/null || true`.
 
-**Line schema (one JSON object per round)** — exactly `/cc`'s own schema shape (`target`,
+**Line schema (one JSON object per round)** — exactly `codex-direct-review:ccd`'s own schema shape (`target`,
 `codex_review`, `coverage_source`, `claude_verification`, `round_outcome`), minus
 `investigation_evidence` and `groups` (v1 has neither capture-evidence nor parallel mode — see
 "v1 scope"). No new field is added; `target.scope` simply gains one more legal value (`"resume"`)
@@ -588,7 +588,7 @@ to describe what `/ccs` rounds 2+ actually do:
 - `coverage_source`: written only for a round-1 `--uncommitted` scope (per "Coverage is a
   Round-1-only property" above); omitted entirely for round-1 `--base`/`--commit` and for every
   `--resume` round — the wrapper never reports it for those, so no field is invented.
-- `finding_id`/`linked_finding_id`/`claude_verification[].action`: identical meaning to `/cc`'s
+- `finding_id`/`linked_finding_id`/`claude_verification[].action`: identical meaning to `codex-direct-review:ccd`'s
   own schema — stable `f<n>` IDs incrementing across all rounds, `linked_finding_id` traces a
   disputed finding's multi-round thread, actions are `accept` / `reject_with_rationale` /
   `request_rereview` / `parked`.
@@ -602,7 +602,7 @@ query the log rather than relying on memory:
 ```bash
 jq -c 'select(.round < 3)' ~/.claude/plugins/data/codex-stream-review/ccs-logs/<repo-slug>/<session-id>.jsonl
 ```
-(substitute the actual current round number by hand, same reason `/cc` does — no live `$R` shell
+(substitute the actual current round number by hand, same reason `codex-direct-review:ccd` does — no live `$R` shell
 variable survives into a separately-dispatched call).
 
 **Failure isolation:** a log-write failure never aborts or degrades the round — note it once and
@@ -611,7 +611,7 @@ continue.
 **Retention: kept indefinitely, no automatic cleanup — this is a completely separate policy from
 the automatic Codex-thread cleanup below.** "Automatic cleanup" throughout this skill refers only
 to deleting the ephemeral Codex thread and its rollout file under `~/.codex/sessions/` — never to
-this JSONL audit log, which persists exactly like `/cc`'s own, for the same durable-record reason.
+this JSONL audit log, which persists exactly like `codex-direct-review:ccd`'s own, for the same durable-record reason.
 
 ---
 
@@ -651,14 +651,14 @@ caller-owns-cleanup contract (see "Mode 2 — cleanup" above).
    ```
    Best-effort — a failure here is never worth surfacing to the user.
 
-4. **Clean up session-level temp files**, same fast path `/cc` uses:
+4. **Clean up session-level temp files**, same fast path `codex-direct-review:ccd` uses:
    ```bash
    rm -f "<literal REPO_ROOT_FILE>" "<literal INSTALL_PATH_FILE>"
    ```
 
 ### Final report (Korean — the only Korean output)
 
-Same structure `/cc` uses:
+Same structure `codex-direct-review:ccd` uses:
 - **작업/대상 요약** — what was done / what the artifact is.
 - **최종 결과물** — what changed (files/behavior).
 - **리뷰 방식** — 단일 리뷰어 (v1은 병렬 모드 없음), 총 라운드 수, 사용한 스레드 ID.
@@ -670,7 +670,7 @@ Same structure `/cc` uses:
   해결되었는지.
 - **스레드 정리 결과** — 최종 스레드의 `--cleanup`이 성공했는지, 그리고 `LEAKED_THREAD_IDS`에 담긴
   스레드(라운드 1이 실패 후 재시도되며 남긴 것)가 있었다면 그것들도 각각 정리에 성공했는지 — 실패한
-  threadId가 있다면 어떤 것이 왜 정리되지 않았는지 빠짐없이 언급 (ccs 고유 항목 — `/cc`에는 없는, 매
+  threadId가 있다면 어떤 것이 왜 정리되지 않았는지 빠짐없이 언급 (ccs 고유 항목 — `codex-direct-review:ccd`에는 없는, 매
   실행 종료 시 자동 정리되는 스레드의 존재를 반영).
 - **검증됨 / 미검증 / 남은 리스크·가정** — 정직하게, 작성만 하고 실행/검증하지 않은 것을 "완료"로
   포장하지 않는다.
