@@ -14,14 +14,8 @@
       "category": "productivity"
     },
     {
-      "name": "codex-direct-review",
-      "description": "Run a Codex CLI review as a fresh, one-shot process (generic codex exec with a hand-built prompt) — no shared broker, no silent failures.",
-      "source": "./codex-direct-review",
-      "category": "productivity"
-    },
-    {
       "name": "codex-stream-review",
-      "description": "Experimental: stream live Codex review progress via a persisted thread's rollout file, with multi-round follow-up via codex exec resume — no diff re-send. Separate from codex-direct-review.",
+      "description": "Claude+Codex adversarial cross-review on a resumable Codex thread — multi-round follow-up via codex exec resume, no diff re-send after round 1.",
       "source": "./codex-stream-review",
       "category": "productivity"
     }

@@ -1,9 +1,0 @@
-{
-  "name": "codex-direct-review",
-  "version": "1.5.0",
-  "description": "Run a Codex CLI review as a fresh, one-shot process (generic codex exec with a hand-built prompt) instead of a shared long-lived app-server session. Bundles a standalone /codex-review command.",
-  "author": {
-    "name": "youzooyou",
-    "url": "https://github.com/youzooyou"
-  }
-}
