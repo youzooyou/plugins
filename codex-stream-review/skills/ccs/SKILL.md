@@ -6,10 +6,9 @@ description: Claude executes a task then runs a Claude+Codex adversarial cross-r
 # /ccs — Claude + Codex Cross-Review on a Resumable Thread
 
 **Usage:** `codex-stream-review:ccs <task description>` — this skill is not invocable as a bare
-`/ccs` slash command; it is invoked plugin-qualified, like every other plugin-supplied skill (see
-"Invocation form — CONFIRMED" in `docs/2026-09-03-ccs-design.md`'s Open Items). Leave the task
-description empty to review the work just done in this session. There is no `--capture-evidence`
-prefix in v1 (see "v1 scope" below) — any other free text is the TASK.
+`/ccs` slash command; it is invoked plugin-qualified, like every other plugin-supplied skill. Leave
+the task description empty to review the work just done in this session. There is no
+`--capture-evidence` prefix in v1 (see "v1 scope" below) — any other free text is the TASK.
 
 Execute the given task, then reach fact-based consensus with Codex — on a resumable Codex thread
 per reviewer for the whole run (one thread for a single-reviewer round, one independent thread per
@@ -169,33 +168,12 @@ An `ok:false` round is a **failed round, never a clean sign-off** — see Guards
 
 ### Resume-safety by failure reason (empirically tested, not assumed)
 
-Whether a failed round's thread is safe to `--resume` afterward is not the same question as
-whether `threadId` is present in the failure JSON — a present `threadId` only means a thread once
-existed, not that resuming it will work or leave anything coherent. This was tested directly
-rather than guessed: a live thread was killed hard (`SIGKILL` on the whole process tree) mid-flight
-to simulate the `nonzero_exit` reason, then `--resume`d. Result: `ok:true`, a fully coherent,
-accurate review (correctly identified an intentionally-introduced `+`→`-` bug, cited the real
-`git diff`, ran an actual assertion as verification) — no corruption, no lost context, no
-confusion about which round this was. Separately, this exact reason (`nonzero_exit`) was also
-observed 4 times in real production use this same day, caused by a transient Azure backend
-capacity error ("high demand ... exceeds the maximum usage size allowed during peak load") — each
-`--resume` retry on the same thread failed again with the identical `nonzero_exit`/same backend
-message, never anything incoherent or corrupted, consistent with the crash-simulation result:
-resuming is safe to ATTEMPT in both cases, it just cannot fix a still-ongoing backend outage.
-
-**This table classifies a reason ONLY for the occurrences where a `threadId` was actually
-captured.** `bad_args`/`git_error`/`incomplete_collection`/`no_thread_started` never carry one at
-all (per the reason table above); `interrupted`/`timeout` normally do, but the reason table's own
-`threadId` column already notes `interrupted` specifically as "Yes, if a thread had already
-started" — an occurrence of either with no captured `threadId` in THIS SPECIFIC failure response
-has nothing of its own to `--resume`. **This does NOT by itself mean the group has no thread at
-all** — whether a fresh retry is correct, or the group's own already-established thread (if one
-exists) should instead be retried via `--resume` again, depends on whether `GROUP_THREADS` already
-has an entry for that group at the moment of this failure, not on which reason fired or which
-round is current — see Guards below for the exact rule and why round number alone is not a
-reliable proxy for this (a no-`threadId` failure can occur either on a group's true first attempt,
-where nothing exists yet, or later — including mid-retry within round 1 itself — after that same
-group already obtained a real thread earlier).
+A live crash-simulation test (killing a thread hard mid-flight, then `--resume`ing it) plus 4 real
+production `nonzero_exit` occurrences confirmed that resuming a failed round's thread is safe to
+attempt and never corrupts state — it just cannot fix a still-ongoing backend outage. The table
+below classifies a `reason` only for occurrences where a `threadId` was actually captured; see
+Guards below (the "No `threadId` was ever captured..." bullet) for how to tell whether a group
+still has a thread to resume when a specific failure carries none.
 
 | `reason` | Resume-safe? (when a `threadId` was actually captured for this occurrence) | Basis |
 |---|---|---|
@@ -250,9 +228,8 @@ step a human needs to remember. See "Phase 3 — Terminal path" below.
 string from values Claude does not fully control character-by-character (pasted content, a
 resolved filesystem path). Interpolating any of them directly into a double-quoted argument is
 exploitable — a value containing an embedded `"` followed by shell metacharacters breaks out of
-the intended argument and executes as a second statement. `codex-direct-review:ccd`'s own SKILL.md ("Codex
-invocation" section) proves this in detail and fixes it with a file-plus-sentinel idiom; apply
-the **exact same idiom** here, unchanged:
+the intended argument and executes as a second statement. The fix is a file-plus-sentinel idiom
+(shared with `codex-direct-review:ccd`); apply the **exact same idiom** here, unchanged:
 
 - Resolve/compose the value, then write it to a `mktemp`-allocated file with a trailing literal
   `x` sentinel appended directly after it, no newline in between: `{ <producing-command>; printf
@@ -343,10 +320,8 @@ assume a shell variable survived.
      or any later protection ever runs.
    - **If the material to review isn't a repo diff at all, but there IS real content to review
      (a pasted plan, generated text, analysis text that actually exists — just with no git diff to
-     point to): this is a genuine non-repo-artifact review** — ported verbatim from
-     `codex-direct-review:ccd`'s own `CLEAN_REPO_DIR` mechanism (see "Always give Codex the actual
-     material to review" in `codex-direct-review:ccd`'s SKILL.md for the full reasoning; summarized
-     here).
+     point to): this is a genuine non-repo-artifact review** — ported from `codex-direct-review:ccd`'s
+     own `CLEAN_REPO_DIR` mechanism (full operational detail below).
    - **If there is still nothing concrete at all** — no task, no identifiable prior-session work,
      no uncommitted changes, AND no other real content to paste as a non-repo artifact either —
      **do NOT create `CLEAN_REPO_DIR` and do NOT dispatch a round with nothing to review.** Clean
@@ -376,38 +351,18 @@ assume a shell variable survived.
      echo "CLEAN_REPO_DIR=$CLEAN_REPO_DIR"
      echo "FAKE_GIT_HOME=$FAKE_GIT_HOME"
      ```
-     **This ALLOWLIST — not a denylist — is not optional, and its history matters: three
-     consecutive rounds of denylist patching each found another bypass, converging on exactly the
-     lesson this project already learned once before.** `git`'s repository/worktree discovery
-     honors several environment variables OVER `-C`/`cd` — confirmed:
-     `GIT_DIR=<real-repo>/.git GIT_WORK_TREE=<real-repo> git -C /tmp ls-files` lists the real
-     repository's files. Round 1's fix (unset 4 hand-picked variables) was bypassed via git's
-     command-scope config injection (`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=init.templateDir
-     GIT_CONFIG_VALUE_0=/tmp`, confirmed reaching `command` scope). Round 2's fix — querying git's
-     own authoritative variable list dynamically via `git rev-parse --local-env-vars`, instead of
-     hand-picking a fixed set, then unsetting every name it returns — was itself bypassed two more ways,
-     confirmed live: (a) the bootstrap `git rev-parse --local-env-vars` call can itself be broken
-     by an inherited `GIT_CONFIG_GLOBAL` pointing at an invalid file (`fatal: bad config line`),
-     which makes the command substitution return EMPTY — silently skipping every variable the loop
-     was supposed to unset, a chicken-and-egg failure a denylist can't defend against; (b) `HOME`
-     is not part of `--local-env-vars` at all, so an inherited `HOME` still points `git init` at a
-     real `$HOME/.gitconfig` capable of setting `init.templateDir` itself. A denylist — even one
-     built from git's own authoritative list — cannot converge on "every variable, including ones
-     that can break the very discovery mechanism used to build the list." The actual fix, already
-     implemented and proven in this exact codebase for this exact problem
-     (`codex-direct-review/eval/run_recall_eval.sh`, its own "Isolation snapshot" section): switch
-     to an ALLOWLIST. `env -i` clears the ENTIRE environment unconditionally — nothing survives
-     that isn't on the explicit list that follows it — so nothing not explicitly named can affect
-     this `git init` call, known-dangerous-today or discovered-dangerous-tomorrow alike. Only three
-     things are let through: `PATH` (to find the `git` binary at all), a freshly-`mktemp -d`
-     dedicated `FAKE_GIT_HOME` (so `$HOME/.gitconfig` is always empty/nonexistent — no real config
-     is ever read, and no attacker-controlled `HOME` can inject one either), and
-     `GIT_CONFIG_NOSYSTEM=1` (so `/etc/gitconfig` is never read regardless of any
-     `GIT_CONFIG_SYSTEM` trickery, matching `git-config(1)`'s own documented purpose for that
-     variable). This is not a bigger denylist — it is the inverse control structure, and it is what
-     actually converges: this exact `env -i "PATH=$PATH" "HOME=$FAKE_GIT_HOME"
-     "GIT_CONFIG_NOSYSTEM=1"` prefix is copied verbatim from `run_recall_eval.sh`'s own
-     already-battle-tested mutating-git-call pattern, not reinvented here.
+     **This is an ALLOWLIST, not a denylist — deliberately: a denylist enumeration approach was
+     tried here first and repeatedly bypassed.** `git`'s own repository/worktree discovery honors
+     several environment variables OVER `-C`/`cd` (confirmed directly), and each successive
+     hand-picked-then-dynamically-queried unset list was defeated by another variable or by a
+     bootstrap failure in the query itself — a denylist cannot converge on "every variable,
+     including ones that can break the very discovery mechanism used to build the list." `env -i`
+     sidesteps this entirely by clearing the ENTIRE environment unconditionally and re-admitting
+     only `PATH` (to find the `git` binary at all), a dedicated `FAKE_GIT_HOME` (so no real or
+     attacker-controlled `HOME` can supply a `.gitconfig`), and `GIT_CONFIG_NOSYSTEM=1` (so
+     `/etc/gitconfig` is never read) — the identical, already-battle-tested pattern this codebase
+     already uses in `codex-direct-review/eval/run_recall_eval.sh`'s own "Isolation snapshot"
+     section, copied verbatim here rather than reinvented.
 
      `FAKE_GIT_HOME` is session-scoped exactly like `CLEAN_REPO_DIR` — allocated once, lazily, the
      first time this session needs it, remembered as an exact literal for the rest of the run, and
@@ -417,34 +372,18 @@ assume a shell variable survived.
      different concerns, and collapsing them risks `git init` writing `.gitconfig`-adjacent state
      into the same directory whose content is supposed to be exactly what `CLEAN_REPO_DIR` isolates.
 
-     **Residual gap, stated plainly — this allowlist protects `git init` only, not the wrapper's
-     OWN later git calls, and an `env -i` allowlist alone would not fully close that other call
-     site even if applied there.** Every round's actual review dispatch (Phase 1 Step 1 below)
-     invokes `run-ccs-review.sh`, which internally runs its own `git diff`/`git status` collection
-     (for a fresh `--uncommitted` round) via a plain `cd "$CWD"` — never through this `env -i`
-     allowlist, since wrapping the ENTIRE wrapper invocation in `env -i` risks stripping
-     environment variables `codex exec` itself needs (API credentials, its own config-file
-     location, etc.) that this skill has no reliable way to enumerate as a safe allowlist without
-     risking breaking every review. The best available mitigation at the SKILL.md layer for THAT
-     call site is the dynamic-list denylist described below (Phase 1 Step 1) — real protection
-     against the specific bypasses found so far, but, by the same chicken-and-egg and HOME-coverage
-     limitations just demonstrated, not an equivalent, complete guarantee. **Even a hypothetical
-     internal `env -i` allowlist inside the wrapper would not be sufficient by itself, confirmed
-     directly:** `env -i` controls the ENVIRONMENT, but git also reads the TARGET REPOSITORY's own
-     local `.git/config` regardless of environment — a repo-local (or, in `CLEAN_REPO_DIR`'s case,
-     nonexistent, but relevant for the NORMAL `$REPO_ROOT` case) `core.fsmonitor` setting still
-     spawns its configured command during a plain `git diff`, confirmed live: `git -c
-     core.fsmonitor=/usr/bin/true diff --no-ext-diff --no-textconv ...` spawns `/usr/bin/true` as a
-     child process despite `--no-ext-diff --no-textconv` already being the wrapper's own existing
-     protection against external-diff/textconv hooks — the same class of config-driven execution
-     risk, just a different config key those two flags don't cover. **Fully closing this requires
-     modifying `run-ccs-review.sh` itself on two fronts together, not `env -i` alone**: its own
-     internal `env -i` allowlist around its git subprocess calls (leaving `codex exec`'s
-     environment untouched), AND explicit `-c core.fsmonitor=` (or an equivalent disabling
-     override) passed directly on those same git command lines — the identical pattern the wrapper
-     already uses for `--no-ext-diff --no-textconv`, just extended to cover this additional
-     execution-sensitive config key. Out of scope for this SKILL.md-only fix, flagged here for a
-     follow-up change to the wrapper script.
+     **Two separate isolation mechanisms exist for two separate call sites — keep them distinct.**
+     The allowlist above protects Claude's own pre-flight `git init` call for `CLEAN_REPO_DIR`.
+     Every round's actual review dispatch (Phase 1 Step 1 below) invokes `run-ccs-review.sh`, a
+     different call site with its own, separate isolation: the wrapper sources
+     `scripts/lib/git-safe.sh` and routes all of its internal git calls (diff/show/rev-parse/
+     hash-object) through its `git_safe()` helper — a pre-resolved, absolute `git` binary run under
+     `env -i` with a fixed `PATH`, an isolated `HOME`, `GIT_CONFIG_NOSYSTEM=1`, `-C "$CWD"` (never a
+     bare `cd`), and `-c core.fsmonitor=` to close the repo-local-config execution gap an
+     environment-only allowlist can't reach on its own. See `scripts/lib/git-safe.sh` for the full
+     mechanism and rationale — the two-front gap this paragraph used to describe (no wrapper-side
+     isolation, plus an uncovered `core.fsmonitor` execution path) is closed; nothing further is
+     needed at the SKILL.md layer for this call site.
 
      That's otherwise the whole setup — no seed file, no `git add`, no `git commit`. `CLEAN_REPO_DIR` is
      left exactly as `git init -q` leaves it: an unborn-HEAD repository with zero commits and
@@ -629,16 +568,14 @@ that is the only thing a group's `--focus` can actually vary:**
 - Wanting several review angles back within the same wall-clock window (concurrent dispatch, not
   sequential rounds)
 
-Do NOT reach for parallel mode believing it reduces what any one reviewer has to read, or that
-"review content is voluminous" or "one agent may exhaust context" are, by themselves, reasons a
-SPLIT helps — every group still gets the full diff, so a single reviewer's context exhaustion on
-that diff will recur in every parallel group just the same.
+Do not reach for parallel mode to cope with diff size or context exhaustion — every group still
+reads the identical full diff (see above), so a single reviewer's exhaustion on it recurs in every
+parallel group just the same.
 
 **How to split:** group BY REVIEW DIMENSION/CONCERN — one group's `--focus` emphasizes
-correctness, another's emphasizes security, a third's emphasizes performance/reuse, a fourth's
-emphasizes path correctness or workflow consistency for a doc/skill review, etc. There is no
-file-count partition to make: every group calls `run-ccs-review.sh` with the SAME scope flag
-(`--uncommitted`/`--base`/`--commit`), differing only in `--focus` text.
+correctness, another's security, another's performance/reuse, another's path correctness or
+workflow consistency for a doc/skill review, etc. (every group still calls `run-ccs-review.sh` with
+the identical scope flag, differing only in `--focus` text — see above).
 
 **This decision is made once, before round 1, and holds for the whole run.** Convergence in this
 skill is round-level and all-groups-together (see "Convergence = 100% CLEAN" below): every group
@@ -990,12 +927,10 @@ an orphaned blank pane behind:
 GROUP="<literal from step 0 — e.g. main or g1>"
 THIS_IS_FIRST_PANE_THIS_ROUND="<true for the first group whose pane is opened this round, else false>"
 GROUP_COUNT="<the number of groups dispatched this round — 1 for single-reviewer, N for parallel>"
-# This is its own separately-dispatched call — INSTALL_PATH/THREAD_ID do not carry over from an
-# earlier Bash call (see Phase 0's opening note) and must be rehydrated here by hand. THREAD_ID is
-# a UUID Codex itself generated (not attacker-influenced, per the safe-charset guard note above),
-# so it is fine as a direct literal — but INSTALL_PATH is externally resolved (`jq` output Claude
-# does not fully control character-by-character, same as everywhere else in this file) and MUST go
-# through the sentinel-file safe-read idiom, never a hand-typed `VAR="<value>"` literal:
+# Separately-dispatched call -- rehydrate INSTALL_PATH/THREAD_ID by hand (see Phase 0's opening
+# note). THREAD_ID is a Codex-generated UUID (safe as a direct literal, per the safe-charset guard
+# above); INSTALL_PATH is externally resolved `jq` output and MUST go through the sentinel-file
+# safe-read idiom, never a hand-typed `VAR="<value>"` literal:
 INSTALL_PATH_FILE="<literal INSTALL_PATH_FILE path resolved once in Phase 0>"
 INSTALL_PATH="$(cat "$INSTALL_PATH_FILE")"; INSTALL_PATH="${INSTALL_PATH%x}"
 THREAD_ID="<this group's own literal THREAD_ID, already captured into GROUP_THREADS by Step 3
@@ -1011,15 +946,11 @@ case "$INSTALL_PATH$THREAD_ID" in
       if [ "$THIS_IS_FIRST_PANE_THIS_ROUND" = "true" ]; then
         PANE_ID=$(tmux split-window -h -P -F '#{pane_id}' 2>/dev/null)
         # Remember this printed PANE_ID as the literal fact "FIRST_PANE_ID" for the rest of the
-        # round (added to PANE_IDS below, same as every other group's own pane id) — it does NOT
-        # survive as a shell variable into a later group's own separately-dispatched call, so every
-        # later branch below rehydrates it from that remembered literal, never from "$FIRST_PANE_ID"
-        # as an inherited shell variable.
+        # round (added to PANE_IDS below) -- every later branch rehydrates it from that literal,
+        # never from a live "$FIRST_PANE_ID" shell variable.
       else
-        # FIRST_PANE_ID is not a live shell variable here either, for the same reason INSTALL_PATH/
-        # THREAD_ID above are rehydrated by hand: this is its own separately-dispatched call, and
-        # the first group's pane id was captured in a DIFFERENT call. Substitute that group's own
-        # remembered literal pane id directly:
+        # FIRST_PANE_ID is rehydrated the same way -- substitute that group's own remembered
+        # literal pane id directly:
         FIRST_PANE_ID="<the literal PANE_ID printed by the first group's own split above, already
         remembered by Claude in PANE_IDS>"
         PANE_ID=$(tmux split-window -h -t "$FIRST_PANE_ID" -P -F '#{pane_id}' 2>/dev/null)
@@ -1034,10 +965,9 @@ this as a separate, final step — never inline inside the per-group loop, since
 group's own outcome first:
 
 ```bash
-# CREATED_PANE_COUNT is not a live shell variable either — like GROUP/GROUP_COUNT above, it is a
-# literal Claude computes by hand from PANE_IDS (the per-group set of opened pane ids Claude has
-# been tracking, one entry per group whose split above actually returned a non-empty PANE_ID) and
-# writes in as a concrete number before running this check. Only retile when this was actually a
+# CREATED_PANE_COUNT is likewise a literal Claude computes by hand from PANE_IDS (the per-group set
+# of opened pane ids, one entry per group whose split above actually returned a non-empty PANE_ID).
+# Only retile when this was actually a
 # parallel round (GROUP_COUNT > 1) AND more than one pane was actually created (a per-group
 # unsafe-charset skip, or TMUX being unset partway through, can leave fewer real panes than
 # GROUP_COUNT would suggest) — never for a single-reviewer round (nothing to tile), and never off
@@ -1476,9 +1406,7 @@ caller-owns-cleanup contract (see "Mode 2 — cleanup" above).
 1. **Clean up every group's final Codex thread**, for every group slug that ever obtained a real
    `THREAD_ID` this run (i.e. every entry in `GROUP_THREADS` — one entry for the common
    `GROUP="main"` single-reviewer case, N entries for a parallel run). Phase 3 is its own
-   separately-dispatched call — `INSTALL_PATH` does not carry over from Phase 0's own call any more
-   than it does anywhere else in this file, so rehydrate it here first, exactly like every other
-   consumption site:
+   separately-dispatched call — rehydrate `INSTALL_PATH` here first (see Phase 0's opening note):
    ```bash
    INSTALL_PATH_FILE="<literal INSTALL_PATH_FILE path resolved once in Phase 0>"
    INSTALL_PATH="$(cat "$INSTALL_PATH_FILE")"; INSTALL_PATH="${INSTALL_PATH%x}"
@@ -1499,8 +1427,7 @@ caller-owns-cleanup contract (see "Mode 2 — cleanup" above).
    entry when some group's round 1 itself both fails post-`thread.started` AND gets retried), but
    when it isn't, skipping this step is exactly how a thread ends up permanently orphaned despite
    this skill's own cleanup guarantee. This step may run in its own separately-dispatched call,
-   distinct from step 1's — never assume `INSTALL_PATH` survived from a different tool call;
-   rehydrate it here too, every time, the same sentinel-file idiom as step 1:
+   distinct from step 1's — rehydrate `INSTALL_PATH` here too, the same sentinel-file idiom as step 1:
    ```bash
    INSTALL_PATH_FILE="<literal INSTALL_PATH_FILE path resolved once in Phase 0>"
    INSTALL_PATH="$(cat "$INSTALL_PATH_FILE")"; INSTALL_PATH="${INSTALL_PATH%x}"
