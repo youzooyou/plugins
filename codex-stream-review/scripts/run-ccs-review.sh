@@ -6,6 +6,13 @@ SCHEMA="$SCRIPT_DIR/../schemas/review-verdict.schema.json"
 DEFAULT_TIMEOUT_SECS=1800
 THREAD_WAIT_SECS=10
 
+# Provides git_safe() (and resolves GIT_BIN) -- every git invocation that
+# reads a reviewed repo's diff/show content below goes through it, never a
+# direct `git`/`cd "$CWD" && git` call. See scripts/lib/git-safe.sh for the
+# full rationale.
+# shellcheck source=lib/git-safe.sh
+source "$SCRIPT_DIR/lib/git-safe.sh"
+
 # register_temp_file PATH -> appends PATH to the cleanup registry
 # (TEMP_FILE_REGISTRY) so on_signal/cleanup_temp_files can remove it later,
 # without a hand-maintained list of "${VAR:-}" cleanup calls. A file APPEND
@@ -407,6 +414,12 @@ cleanup_temp_files() {
     done < "$TEMP_FILE_REGISTRY"
     rm -f "$TEMP_FILE_REGISTRY"
   fi
+  # SAFE_GIT_HOME is a directory (git_safe()'s isolated HOME), never
+  # registered in TEMP_FILE_REGISTRY above (that registry is `rm -f`'d
+  # entry by entry, which doesn't remove a directory) -- only created (and
+  # therefore only needs removing) on the fresh-round git-diff-collection
+  # path, never on --resume/--cleanup, hence the existence guard.
+  [ -n "${SAFE_GIT_HOME:-}" ] && rm -rf "$SAFE_GIT_HOME"
 }
 TEMP_FILE_REGISTRY="$(mktemp)"
 trap cleanup_temp_files EXIT
@@ -438,6 +451,11 @@ esac
 # would otherwise pollute DIFF_TEXT with non-diff text sent to Codex.
 mktemp_registered GIT_STDERR_FILE
 
+# git_safe()'s isolated HOME -- created lazily here (only the fresh-round
+# git-diff-collection path needs it, never --resume/--cleanup) and removed
+# by cleanup_temp_files() above.
+SAFE_GIT_HOME="$(mktemp -d)"
+
 case "$SCOPE" in
   uncommitted)
     # --no-ext-diff --no-textconv: don't honor a repo-configured diff/
@@ -448,9 +466,7 @@ case "$SCOPE" in
     # A brand-new repo has an "unborn" HEAD -- `git diff ... HEAD` fails
     # outright even though staged content may exist. `git rev-parse
     # --verify -q HEAD` distinguishes that case from "not a git repo at
-    # all" (which still falls through to git_error below). The probe runs
-    # inside `( )` so its `cd` can never leak into this script's own shell
-    # and break the second `cd "$CWD"` further down.
+    # all" (which still falls through to git_error below).
     #
     # Diffed against "HEAD" normally, or for an unborn branch against
     # git's own EMPTY TREE object (`git hash-object -t tree /dev/null`,
@@ -459,10 +475,10 @@ case "$SCOPE" in
     # index+worktree state, exactly like `git diff HEAD` does normally.
     # If the hash-object call itself fails, DIFF_BASE_REF is left empty and
     # the diff call below fails naturally, propagating as git_error.
-    if (cd "$CWD" 2>/dev/null && git rev-parse --verify -q HEAD >/dev/null 2>&1); then
+    if git_safe rev-parse --verify -q HEAD >/dev/null 2>&1; then
       DIFF_BASE_REF="HEAD"
     else
-      DIFF_BASE_REF="$(cd "$CWD" 2>/dev/null && git hash-object -t tree /dev/null 2>/dev/null)"
+      DIFF_BASE_REF="$(git_safe hash-object -t tree /dev/null 2>/dev/null)"
     fi
     # A tracked file that changed but is binary produces git's fixed
     # "Binary files a/X and b/Y differ" line instead of real content, which
@@ -474,7 +490,7 @@ case "$SCOPE" in
     # can't); combined with --patch in ONE call so both come from the same
     # atomic read of the worktree, avoiding a TOCTOU between two separate
     # git invocations.
-    COMBINED_OUTPUT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv --patch --numstat "$DIFF_BASE_REF" 2>"$GIT_STDERR_FILE")"
+    COMBINED_OUTPUT="$(git_safe diff --no-ext-diff --no-textconv --patch --numstat "$DIFF_BASE_REF" 2>"$GIT_STDERR_FILE")"
     GIT_STATUS=$?
     NUMSTAT_OUTPUT="${COMBINED_OUTPUT%%$'\n\n'*}"
     DIFF_TEXT="${COMBINED_OUTPUT#*$'\n\n'}"
@@ -563,7 +579,7 @@ case "$SCOPE" in
     fi
     ;;
   base)
-    DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv "${SCOPE_VALUE}...HEAD" 2>"$GIT_STDERR_FILE")"
+    DIFF_TEXT="$(git_safe diff --no-ext-diff --no-textconv "${SCOPE_VALUE}...HEAD" 2>"$GIT_STDERR_FILE")"
     GIT_STATUS=$?
     ;;
   commit)
@@ -571,11 +587,11 @@ case "$SCOPE" in
     # that non-empty text would skip the empty-diff shortcut below and let
     # Codex review commit trivia instead. Detect a merge (2+ parents) and
     # diff explicitly against its first parent instead.
-    PARENT_COUNT="$(cd "$CWD" 2>/dev/null && git show -s --format=%P --no-ext-diff --no-textconv "$SCOPE_VALUE" 2>/dev/null | wc -w | tr -d ' ')"
+    PARENT_COUNT="$(git_safe show -s --format=%P --no-ext-diff --no-textconv "$SCOPE_VALUE" 2>/dev/null | wc -w | tr -d ' ')"
     if [ -n "$PARENT_COUNT" ] && [ "$PARENT_COUNT" -ge 2 ]; then
-      DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git diff --no-ext-diff --no-textconv "${SCOPE_VALUE}^1" "$SCOPE_VALUE" 2>"$GIT_STDERR_FILE")"
+      DIFF_TEXT="$(git_safe diff --no-ext-diff --no-textconv "${SCOPE_VALUE}^1" "$SCOPE_VALUE" 2>"$GIT_STDERR_FILE")"
     else
-      DIFF_TEXT="$(cd "$CWD" 2>/dev/null && git show --no-ext-diff --no-textconv "$SCOPE_VALUE" 2>"$GIT_STDERR_FILE")"
+      DIFF_TEXT="$(git_safe show --no-ext-diff --no-textconv "$SCOPE_VALUE" 2>"$GIT_STDERR_FILE")"
     fi
     GIT_STATUS=$?
     ;;
