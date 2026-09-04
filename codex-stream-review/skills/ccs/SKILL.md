@@ -167,6 +167,51 @@ failed round):
 
 An `ok:false` round is a **failed round, never a clean sign-off** — see Guards below.
 
+### Resume-safety by failure reason (empirically tested, not assumed)
+
+Whether a failed round's thread is safe to `--resume` afterward is not the same question as
+whether `threadId` is present in the failure JSON — a present `threadId` only means a thread once
+existed, not that resuming it will work or leave anything coherent. This was tested directly
+rather than guessed: a live thread was killed hard (`SIGKILL` on the whole process tree) mid-flight
+to simulate the `nonzero_exit` reason, then `--resume`d. Result: `ok:true`, a fully coherent,
+accurate review (correctly identified an intentionally-introduced `+`→`-` bug, cited the real
+`git diff`, ran an actual assertion as verification) — no corruption, no lost context, no
+confusion about which round this was. Separately, this exact reason (`nonzero_exit`) was also
+observed 4 times in real production use this same day, caused by a transient Azure backend
+capacity error ("high demand ... exceeds the maximum usage size allowed during peak load") — each
+`--resume` retry on the same thread failed again with the identical `nonzero_exit`/same backend
+message, never anything incoherent or corrupted, consistent with the crash-simulation result:
+resuming is safe to ATTEMPT in both cases, it just cannot fix a still-ongoing backend outage.
+
+**This table classifies a reason ONLY for the occurrences where a `threadId` was actually
+captured.** `bad_args`/`git_error`/`incomplete_collection`/`no_thread_started` never carry one at
+all (per the reason table above); `interrupted`/`timeout` normally do, but the reason table's own
+`threadId` column already notes `interrupted` specifically as "Yes, if a thread had already
+started" — an occurrence of either with no captured `threadId` in THIS SPECIFIC failure response
+has nothing of its own to `--resume`. **This does NOT by itself mean the group has no thread at
+all** — whether a fresh retry is correct, or the group's own already-established thread (if one
+exists) should instead be retried via `--resume` again, depends on whether `GROUP_THREADS` already
+has an entry for that group at the moment of this failure, not on which reason fired or which
+round is current — see Guards below for the exact rule and why round number alone is not a
+reliable proxy for this (a no-`threadId` failure can occur either on a group's true first attempt,
+where nothing exists yet, or later — including mid-retry within round 1 itself — after that same
+group already obtained a real thread earlier).
+
+| `reason` | Resume-safe? (when a `threadId` was actually captured for this occurrence) | Basis |
+|---|---|---|
+| `bad_args`, `git_error`, `incomplete_collection`, `no_thread_started` | N/A — never carries a `threadId` at all, nothing to resume | Table above: `threadId` never present |
+| `resume_thread_not_found`, `rollout_not_found` | **No** — the thread/rollout itself is confirmed or likely gone; resuming the same id will fail the same way again | The failure IS the absence of the very artifact `--resume` needs |
+| `interrupted`, `timeout`, `nonzero_exit`, `missing_task_complete`, `no_final_answer`, `invalid_json`, `schema_mismatch` | **Yes** — the underlying Codex thread's own conversational state survives; only THIS wrapper invocation failed to extract a valid final answer from it | `nonzero_exit` empirically confirmed live (crash simulation + 4 real production occurrences, see above); the other six reasons in this row share the same property (a thread that genuinely started and has an intact rollout, or exited zero but the wrapper couldn't parse a valid final answer from it) and are inferred safe by the identical reasoning, not separately live-tested one by one |
+
+**What this changes for retry logic (see Guards below):** a failure in the "Yes" row is worth a
+bounded `--resume` retry with a short backoff BEFORE falling back to a fresh restart (round 1) or
+declaring that group `⚠️ COULD NOT VERIFY` (any round) — resuming costs nothing extra in
+correctness risk, and recovers automatically once a transient condition (a backend blip, a
+one-off process hiccup) has passed, without losing the thread's already-established context. A
+failure in the "No" row gets no such retry — attempting `--resume` on a thread reason already
+known to be terminal for that specific thread only wastes a `--timeout`-length wait for a result
+already known in advance.
+
 ### Mode 2 — cleanup
 
 ```
@@ -1182,35 +1227,102 @@ meaning.
   combined set of every group's own open disagreements shows no movement across the last two
   rounds (checking each group's own `claude_verification[].action` entries in that round's
   `groups[]` log entry), stop early and report NOT CONVERGED the same way.
-- **Empty / failed review ≠ CLEAN.** `ok:false` for a group → retry **that group once**, reusing
-  the exact same dispatch shape as the round that failed for it:
+- **Empty / failed review ≠ CLEAN.** `ok:false` for a group → retry that group before accepting
+  failure, reusing the exact dispatch shape appropriate to whether a thread actually exists for
+  it — the shape of that retry depends on the failure reason (below), it is not always the same
+  single fresh retry the wrapper's own reason table alone might suggest:
   - **Per-group retry (parallel mode) — the same rule applies per group, not just to a
     single-reviewer round.** If ANY dispatched group in a parallel round returns `"ok":false`, the
     ROUND overall is not eligible for `✅ CLEAN` — worst-case-wins, the same principle used for the
-    `coverage_source`/`codex_review` parallel merges above. Retry JUST that failed group once — the
-    other groups' real, already-collected results are kept, not thrown away and re-dispatched. If
-    that group still fails after its one retry, the round-level status is
+    `coverage_source`/`codex_review` parallel merges above. Retry JUST that failed group — the
+    other groups' real, already-collected results are kept, not thrown away and re-dispatched.
+  - **No `threadId` was ever captured for THIS failure response** (`bad_args`, `git_error`,
+    `incomplete_collection`, `no_thread_started`, or `interrupted`/`timeout` on the rare occasion
+    either fires before a thread ever started — see the reason table's `threadId` column, which
+    is per-OCCURRENCE, not a blanket guarantee for every reason in the "resume-safe" row below).
+    **A missing `threadId` in the failure response is not the same claim as "no thread exists for
+    this group" — check `GROUP_THREADS` directly, never infer this from the round number.** The
+    two only coincide for a group's very first-ever dispatch attempt; they do NOT coincide for a
+    no-`threadId` failure encountered *during* one of the bounded resume-retries below (still round
+    1, but by definition already past a first attempt that DID obtain a real `threadId`), nor for
+    any round-2+ attempt (which always starts from an existing `GROUP_THREADS` entry). Handle by
+    whether `GROUP_THREADS` already has an entry for this group, checked at the moment of this
+    specific failure — not by which round counter value happens to be current:
+    - **This group has NO entry in `GROUP_THREADS` yet** (its true first-ever attempt — only
+      possible on round 1, before that round's own first dispatch has ever returned a `threadId`):
+      nothing exists to resume — retry the same scope flag fresh, exactly once. If it fails again,
+      stop — report **⚠️ COULD NOT VERIFY**.
+    - **This group ALREADY has an entry in `GROUP_THREADS`** (a real, persistent thread from an
+      earlier successful dispatch — whether that was this same round's own original attempt,
+      before a subsequent resume-retry hit a no-`threadId` failure, or an earlier round entirely):
+      a `--resume` call CAN still fail with no `threadId` in its own failure JSON (e.g. `bad_args`
+      from a malformed `--focus`, caught during argument validation *before* the wrapper ever
+      touches the resumed thread — confirmed directly from the wrapper's own argument-parsing
+      order). That existing thread is untouched, not abandoned, by this kind of failure — retry
+      the exact same `--resume "<this group's existing threadId from GROUP_THREADS>"` call again
+      (correcting whatever caused the bad response, e.g. a genuinely non-empty `--focus` this
+      time), never a "fresh" scope flag (there is none to use once a group has ever been resumed)
+      and never anything added to `LEAKED_THREAD_IDS` (nothing was actually abandoned). If the
+      retry also fails, stop — report **⚠️ COULD NOT VERIFY**.
+  - **A `threadId` WAS captured, and the reason is resume-safe** (`interrupted`, `timeout`,
+    `nonzero_exit`, `missing_task_complete`, `no_final_answer`, `invalid_json`, `schema_mismatch`
+    — see "Resume-safety by failure reason" above): prefer a bounded `--resume` retry over
+    abandoning the thread. Wait 5s, then — using the SAME sentinel-file `--focus` idiom every other
+    dispatch in this file already uses, never a value interpolated directly:
+    ```
+    FOCUS_FILE="<a fresh mktemp'd path, written via the Write tool exactly like Phase 1 Step 0 --
+    content is the SAME ⚠️ SCOPE CONSTRAINT block every round's --focus already requires, plus a
+    short note: retrying after a <reason> failure -- please provide your review, plus the trailing
+    x sentinel>"
+    FOCUS_TEXT="$(cat "$FOCUS_FILE")"; FOCUS_TEXT="${FOCUS_TEXT%x}"
+    "$INSTALL_PATH/scripts/run-ccs-review.sh" --cwd "$REPO_ROOT_OR_CLEAN_REPO_DIR" \
+      --resume "<that threadId>" --timeout 300 \
+      --focus "$FOCUS_TEXT"
+    ```
+    **`--timeout 300` (5 min) is required on both retry attempts, never the wrapper's 1800s
+    default** — without an explicit shorter timeout, a genuinely stuck retry can silently consume
+    the full default window per attempt, turning a "bounded, short backoff" retry into a
+    worst-case multi-hour stall across the original call plus two full-length retries; 300s is
+    ample for a normal review turn and still fails fast on a truly stuck one. **The retry focus
+    text still needs the full `⚠️ SCOPE CONSTRAINT` block**, same as every other round's `--focus`
+    (see "Hard rules" and the `## Rules` section) — losing that requirement just because this is a
+    retry, not a "real" round, would be inconsistent with the rest of this file; only the diff
+    itself is never re-sent, matching every other resumed call. If this also fails with a
+    resume-safe reason, wait 15s and retry once more (2 resume attempts total, each with its own
+    5-minute cap) before giving up on that thread. **This applies to a failed round 1 as much as
+    to round 2+** — the empirical finding this section is based on specifically tested a ROUND-1
+    failure (the crash-simulation thread had only ever seen its first prompt) and confirmed the
+    original diff-bearing prompt is already present in the thread's own rollout, so a resume-retry
+    needs no diff re-sent even here.
+    - If both resume-retries are exhausted and this was **round 1**: fall back to one fresh retry
+      of the original scope flag, for that group, abandoning the now-unrecoverable thread.
+      **Append that abandoned `(GROUP, threadId)` pair to `LEAKED_THREAD_IDS`** — Claude remembers
+      this set for the rest of the run, the same way `GROUP_THREADS`/`SESSION_ID` are remembered —
+      so Phase 3's terminal path (below) can clean it up alongside the run's final threads; it is
+      never cleaned up here, only recorded. Only that ONE failed group's thread leaks — every
+      other group's real, already-live thread is untouched. If this fresh retry also fails, stop —
+      report **⚠️ COULD NOT VERIFY** for that group.
+    - If both resume-retries are exhausted and this was **round 2+**: there is no fresh scope left
+      to fall back to on an already-resumed group — stop directly, report
+      **⚠️ COULD NOT VERIFY** for that group. No new threadId was ever created by either
+      resume-retry, so nothing is added to `LEAKED_THREAD_IDS` on this path.
+  - **A `threadId` WAS captured, but the reason is NOT resume-safe** (`resume_thread_not_found`,
+    `rollout_not_found` — the thread/rollout itself is confirmed or likely gone; a `--resume`
+    attempt would just fail the same way again, wasting up to a full timeout for a result already
+    known in advance): skip the resume-retry step entirely.
+    - **Round 1:** retry the original scope flag fresh, exactly once, for that group — append the
+      now-confirmed-dead `(GROUP, threadId)` to `LEAKED_THREAD_IDS` (its rollout is already gone or
+      unreachable, but the thread record itself may still need explicit `--cleanup` at the
+      terminal path). If the fresh retry also fails, stop — report **⚠️ COULD NOT VERIFY**.
+    - **Round 2+:** there is no fresh scope to fall back to — stop directly, report
+      **⚠️ COULD NOT VERIFY** for that group.
+  - Whenever a group ends in **⚠️ COULD NOT VERIFY**, the round-level status is
     **⚠️ COULD NOT VERIFY**, regardless of how clean every other group's own findings turned out to
     be — never fold this into `⚠️ NOT CONVERGED`/`⚠️ PARTIAL COVERAGE` instead (those cover a
     genuine Claude/Codex disagreement or an unresolved coverage gap, not a group that never
-    produced a real verdict).
-  - A failed **round 1** (fresh) retries the same scope flag fresh, for that group. Several
-    failure reasons (`interrupted`, `timeout`, `nonzero_exit`, `missing_task_complete`,
-    `rollout_not_found`, `no_final_answer`, `invalid_json`, `schema_mismatch` — see the reason
-    table's `threadId` column) fire *after* a thread already started, so a group's failed attempt
-    can leak a real, still-live thread even though the retry dispatches fresh and gets a
-    **different** `threadId`. **Append any such leaked `(GROUP, threadId)` pair to
-    `LEAKED_THREAD_IDS`** — Claude remembers this set for the rest of the run, the same way
-    `GROUP_THREADS`/`SESSION_ID` are remembered — so Phase 3's terminal path (below) can clean it
-    up alongside the run's final threads; it is never cleaned up here, only recorded. Only that
-    ONE failed group's thread leaks — every other group's real, already-live thread is untouched.
-  - A failed **round 2+** (resume) retries the exact same `--resume <that group's own threadId>
-    --focus <same text>` call for that group — its thread persists across a failed round, so
-    resume is still valid and no diff needs re-sending, and no new threadId is ever created for
-    that group (nothing to add to `LEAKED_THREAD_IDS`).
-  - If the retry still fails for that group, stop and report **⚠️ COULD NOT VERIFY** — never
-    declare CLEAN off a missing review from any group. Still run the terminal-path cleanup
-    (below) using whatever `threadId`s are known for every group, even from a failed response.
+    produced a real verdict). Never declare CLEAN off a missing review from any group. Still run
+    the terminal-path cleanup (below) using whatever `threadId`s are known for every group, even
+    from a failed response.
 - **Partial or unknown source coverage ≠ CLEAN, and is not the same failure as NOT
   CONVERGED/COULD NOT VERIFY.** If round 1's `coverage_source.status` (the N-group merged value
   for a parallel round — see "Coverage is a Round-1-only property" above) is unresolved `"partial"`
@@ -1465,3 +1577,17 @@ Same structure `codex-direct-review:ccd` uses:
   its own persistent, resumable thread, unlike `ccd`'s ephemeral-process-per-round-per-group
   model. Reach for `codex-direct-review:ccd` instead when its further-proven ephemeral-process-per-round mechanism
   is specifically what's wanted, not for parallel coverage alone.
+- **Before committing a change to `scripts/run-ccs-review.sh`, `scripts/lib/git-safe.sh`, or
+  `scripts/collect_untracked_files.py`, run `shellcheck` (the two `.sh` files) and the repo's own
+  `tests/test-run-ccs-review.sh` fixture suite.** This project has no CI pipeline defined for this
+  plugin — these checks are manual, not automatic, so they only catch anything if actually run:
+  `shellcheck scripts/run-ccs-review.sh scripts/lib/git-safe.sh` (pin a specific installed
+  version with `shellcheck --version` in the commit/PR description when reporting a clean run, so
+  a later regression against a newer ShellCheck release is distinguishable from a real
+  reintroduced bug) plus `bash tests/test-run-ccs-review.sh`. Neither replaces the other:
+  ShellCheck catches quoting/expansion/control-flow hazards `bash -n` (syntax-only) cannot, while
+  the fixture suite is the only thing that actually exercises the git-isolation behavior
+  (`git_safe()`'s `env -i` allowlist, the collector's own isolated subprocess call) end to end —
+  a lint-clean script can still be behaviorally wrong, and a behaviorally-passing script can still
+  have a real quoting hazard ShellCheck would have caught on an input the fixture suite doesn't
+  happen to exercise.
