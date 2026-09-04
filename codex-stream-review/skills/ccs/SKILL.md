@@ -276,10 +276,26 @@ assume a shell variable survived.
    - If `$ARGUMENTS` is non-empty: it is the TASK. Perform it end-to-end (Review → Plan →
      Research → Implement → Verify). The result is the ARTIFACT.
    - If empty: the ARTIFACT is the work just completed in **this** session. If none is
-     identifiable, fall back to current uncommitted changes in `$REPO_ROOT` (`git status
-     --short --untracked-files=all` plus `git diff --no-ext-diff --no-textconv` against the
-     unborn-HEAD-safe base — `git rev-parse --verify -q HEAD` then either `HEAD` or `git
-     hash-object -t tree /dev/null` — never `git add -N`, which mutates the index).
+     identifiable, fall back to current uncommitted changes in `$REPO_ROOT` — anchored and
+     sanitized exactly like every other git call in this file (see Phase 1's "Determine review
+     mode" below for the full reasoning; this is the earliest git-touching step in the whole run,
+     so it needs the identical protection, not a lighter version of it, applied here first):
+     ```bash
+     REPO_ROOT_FILE="<literal REPO_ROOT_FILE path resolved in Phase 0 step 3 above>"
+     REPO_ROOT="$(cat "$REPO_ROOT_FILE")"; REPO_ROOT="${REPO_ROOT%x}"
+     for _v in $(git rev-parse --local-env-vars 2>/dev/null || printf '%s\n' GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_OBJECT_DIRECTORY GIT_DIR GIT_WORK_TREE GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_INDEX_FILE GIT_NO_REPLACE_OBJECTS GIT_REPLACE_REF_BASE GIT_PREFIX GIT_SHALLOW_FILE GIT_COMMON_DIR) GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_TEMPLATE_DIR; do
+       unset "$_v"
+     done
+     git -C "$REPO_ROOT" status --short --untracked-files=all
+     if git -C "$REPO_ROOT" rev-parse --verify -q HEAD >/dev/null 2>&1; then DIFF_BASE="HEAD"; else DIFF_BASE="$(git -C "$REPO_ROOT" hash-object -t tree /dev/null)"; fi
+     git -C "$REPO_ROOT" diff --no-ext-diff --no-textconv "$DIFF_BASE"
+     ```
+     Never `git add -N`, which mutates the index. Confirmed the anchor/sanitize step is genuinely
+     needed even this early: `env GIT_DIR="<real-repo>/.git" GIT_WORK_TREE="<real-repo>" bash -c
+     'cd /tmp; git status --short'` reports the REAL repository's changes despite running from an
+     unrelated directory — an unsanitized artifact-detection step could therefore review, or
+     silently conclude there is nothing to review in, the wrong repository entirely, before Phase 1
+     or any later protection ever runs.
    - **If the material to review isn't a repo diff at all, but there IS real content to review
      (a pasted plan, generated text, analysis text that actually exists — just with no git diff to
      point to): this is a genuine non-repo-artifact review** — ported verbatim from
@@ -308,11 +324,84 @@ assume a shell variable survived.
      review, create a throwaway clean git repo once and reuse it for every round of that same
      session — never recreate it per round:
      ```bash
+     FAKE_GIT_HOME=$(mktemp -d "/tmp/ccs-${SESSION_ID}-fake-git-home.XXXXXX")
      CLEAN_REPO_DIR=$(mktemp -d "/tmp/ccs-${SESSION_ID}-artifact-repo.XXXXXX")
-     git -C "$CLEAN_REPO_DIR" init -q
+     env -i "PATH=$PATH" "HOME=$FAKE_GIT_HOME" "GIT_CONFIG_NOSYSTEM=1" \
+       git -C "$CLEAN_REPO_DIR" init -q
      echo "CLEAN_REPO_DIR=$CLEAN_REPO_DIR"
+     echo "FAKE_GIT_HOME=$FAKE_GIT_HOME"
      ```
-     That's the whole setup — no seed file, no `git add`, no `git commit`. `CLEAN_REPO_DIR` is
+     **This ALLOWLIST — not a denylist — is not optional, and its history matters: three
+     consecutive rounds of denylist patching each found another bypass, converging on exactly the
+     lesson this project already learned once before.** `git`'s repository/worktree discovery
+     honors several environment variables OVER `-C`/`cd` — confirmed:
+     `GIT_DIR=<real-repo>/.git GIT_WORK_TREE=<real-repo> git -C /tmp ls-files` lists the real
+     repository's files. Round 1's fix (unset 4 hand-picked variables) was bypassed via git's
+     command-scope config injection (`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=init.templateDir
+     GIT_CONFIG_VALUE_0=/tmp`, confirmed reaching `command` scope). Round 2's fix — querying git's
+     own authoritative variable list dynamically via `git rev-parse --local-env-vars`, instead of
+     hand-picking a fixed set, then unsetting every name it returns — was itself bypassed two more ways,
+     confirmed live: (a) the bootstrap `git rev-parse --local-env-vars` call can itself be broken
+     by an inherited `GIT_CONFIG_GLOBAL` pointing at an invalid file (`fatal: bad config line`),
+     which makes the command substitution return EMPTY — silently skipping every variable the loop
+     was supposed to unset, a chicken-and-egg failure a denylist can't defend against; (b) `HOME`
+     is not part of `--local-env-vars` at all, so an inherited `HOME` still points `git init` at a
+     real `$HOME/.gitconfig` capable of setting `init.templateDir` itself. A denylist — even one
+     built from git's own authoritative list — cannot converge on "every variable, including ones
+     that can break the very discovery mechanism used to build the list." The actual fix, already
+     implemented and proven in this exact codebase for this exact problem
+     (`codex-direct-review/eval/run_recall_eval.sh`, its own "Isolation snapshot" section): switch
+     to an ALLOWLIST. `env -i` clears the ENTIRE environment unconditionally — nothing survives
+     that isn't on the explicit list that follows it — so nothing not explicitly named can affect
+     this `git init` call, known-dangerous-today or discovered-dangerous-tomorrow alike. Only three
+     things are let through: `PATH` (to find the `git` binary at all), a freshly-`mktemp -d`
+     dedicated `FAKE_GIT_HOME` (so `$HOME/.gitconfig` is always empty/nonexistent — no real config
+     is ever read, and no attacker-controlled `HOME` can inject one either), and
+     `GIT_CONFIG_NOSYSTEM=1` (so `/etc/gitconfig` is never read regardless of any
+     `GIT_CONFIG_SYSTEM` trickery, matching `git-config(1)`'s own documented purpose for that
+     variable). This is not a bigger denylist — it is the inverse control structure, and it is what
+     actually converges: this exact `env -i "PATH=$PATH" "HOME=$FAKE_GIT_HOME"
+     "GIT_CONFIG_NOSYSTEM=1"` prefix is copied verbatim from `run_recall_eval.sh`'s own
+     already-battle-tested mutating-git-call pattern, not reinvented here.
+
+     `FAKE_GIT_HOME` is session-scoped exactly like `CLEAN_REPO_DIR` — allocated once, lazily, the
+     first time this session needs it, remembered as an exact literal for the rest of the run, and
+     cleaned up in Phase 3 alongside `CLEAN_REPO_DIR` (`rm -rf`, not just `CLEAN_REPO_DIR`'s own
+     cleanup — see Phase 3 below). It must be a genuinely SEPARATE directory from `CLEAN_REPO_DIR`
+     itself (never reuse one for the other) — `HOME` and the git worktree being initialized are
+     different concerns, and collapsing them risks `git init` writing `.gitconfig`-adjacent state
+     into the same directory whose content is supposed to be exactly what `CLEAN_REPO_DIR` isolates.
+
+     **Residual gap, stated plainly — this allowlist protects `git init` only, not the wrapper's
+     OWN later git calls, and an `env -i` allowlist alone would not fully close that other call
+     site even if applied there.** Every round's actual review dispatch (Phase 1 Step 1 below)
+     invokes `run-ccs-review.sh`, which internally runs its own `git diff`/`git status` collection
+     (for a fresh `--uncommitted` round) via a plain `cd "$CWD"` — never through this `env -i`
+     allowlist, since wrapping the ENTIRE wrapper invocation in `env -i` risks stripping
+     environment variables `codex exec` itself needs (API credentials, its own config-file
+     location, etc.) that this skill has no reliable way to enumerate as a safe allowlist without
+     risking breaking every review. The best available mitigation at the SKILL.md layer for THAT
+     call site is the dynamic-list denylist described below (Phase 1 Step 1) — real protection
+     against the specific bypasses found so far, but, by the same chicken-and-egg and HOME-coverage
+     limitations just demonstrated, not an equivalent, complete guarantee. **Even a hypothetical
+     internal `env -i` allowlist inside the wrapper would not be sufficient by itself, confirmed
+     directly:** `env -i` controls the ENVIRONMENT, but git also reads the TARGET REPOSITORY's own
+     local `.git/config` regardless of environment — a repo-local (or, in `CLEAN_REPO_DIR`'s case,
+     nonexistent, but relevant for the NORMAL `$REPO_ROOT` case) `core.fsmonitor` setting still
+     spawns its configured command during a plain `git diff`, confirmed live: `git -c
+     core.fsmonitor=/usr/bin/true diff --no-ext-diff --no-textconv ...` spawns `/usr/bin/true` as a
+     child process despite `--no-ext-diff --no-textconv` already being the wrapper's own existing
+     protection against external-diff/textconv hooks — the same class of config-driven execution
+     risk, just a different config key those two flags don't cover. **Fully closing this requires
+     modifying `run-ccs-review.sh` itself on two fronts together, not `env -i` alone**: its own
+     internal `env -i` allowlist around its git subprocess calls (leaving `codex exec`'s
+     environment untouched), AND explicit `-c core.fsmonitor=` (or an equivalent disabling
+     override) passed directly on those same git command lines — the identical pattern the wrapper
+     already uses for `--no-ext-diff --no-textconv`, just extended to cover this additional
+     execution-sensitive config key. Out of scope for this SKILL.md-only fix, flagged here for a
+     follow-up change to the wrapper script.
+
+     That's otherwise the whole setup — no seed file, no `git add`, no `git commit`. `CLEAN_REPO_DIR` is
      left exactly as `git init -q` leaves it: an unborn-HEAD repository with zero commits and
      nothing ever staged. No seed commit is needed to make `--uncommitted` resolve to an empty
      diff there — an earlier revision of this fix (in `codex-direct-review:ccd`) seeded a placeholder commit,
@@ -377,9 +466,47 @@ against a freshly-`git init`'d, zero-file `CLEAN_REPO_DIR`.
 heuristic is identical since neither wrapper has a file-filter flag):
 
 ```bash
-if git rev-parse --verify -q HEAD >/dev/null 2>&1; then DIFF_BASE="HEAD"; else DIFF_BASE="$(git hash-object -t tree /dev/null)"; fi
-{ git diff --name-only "$DIFF_BASE"; git ls-files --others --exclude-standard; } | sort -u | wc -l
+REPO_ROOT_FILE="<literal REPO_ROOT_FILE path resolved once in Phase 0>"
+REPO_ROOT="$(cat "$REPO_ROOT_FILE")"; REPO_ROOT="${REPO_ROOT%x}"
+for _v in $(git rev-parse --local-env-vars 2>/dev/null || printf '%s\n' GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_OBJECT_DIRECTORY GIT_DIR GIT_WORK_TREE GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_INDEX_FILE GIT_NO_REPLACE_OBJECTS GIT_REPLACE_REF_BASE GIT_PREFIX GIT_SHALLOW_FILE GIT_COMMON_DIR) GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_TEMPLATE_DIR; do
+  unset "$_v"
+done
+if git -C "$REPO_ROOT" rev-parse --verify -q HEAD >/dev/null 2>&1; then DIFF_BASE="HEAD"; else DIFF_BASE="$(git -C "$REPO_ROOT" hash-object -t tree /dev/null)"; fi
+{ git -C "$REPO_ROOT" diff --name-only "$DIFF_BASE"; git -C "$REPO_ROOT" ls-files --others --exclude-standard; } | sort -u | wc -l
 ```
+
+**Always anchor with `git -C "$REPO_ROOT"` AND sanitize the git environment first — `-C` alone is
+not a repository-isolation boundary, confirmed directly (see Phase 0 step 4's own reproduction of
+the identical class of bypass).** This sizing step is its own separately-dispatched call — the
+ambient directory it happens to run in is not guaranteed to be `$REPO_ROOT` (Phase 0 may have
+resolved a different target root than wherever this call's shell starts), and inherited
+`GIT_DIR`/`GIT_WORK_TREE` (or any other variable `git rev-parse --local-env-vars` enumerates)
+override `-C` regardless — so both the explicit `-C "$REPO_ROOT"` AND the sanitization loop are
+required together, never `-C` alone. **The `|| printf '%s\n' ...` fallback inside the SAME command
+substitution is itself load-bearing, not decorative — and its exact shape matters, not just its
+presence.** The bootstrap `git rev-parse --local-env-vars` call can be broken by an inherited
+`GIT_CONFIG_GLOBAL` pointing at an invalid file (confirmed: exits with `fatal: bad config
+line...`), which would otherwise make the command substitution return empty and silently skip
+sanitizing anything at all — the literal fallback list (captured from an actual healthy run of the
+same command) is what still gets unset when the dynamic query itself is the thing being attacked.
+**The fallback must stay INSIDE the same command substitution as the primary query — never
+resolved into a separate named variable first and iterated over afterward as a plain variable
+reference.** An earlier revision of this fix did exactly that two-step split, and it broke
+silently under `zsh` specifically: this project's own harness executes shell tool calls via
+`/bin/zsh` (not bash, despite being called a "Bash" tool — confirmed directly, `ps -p $$ -o comm=`
+inside a tool call prints `zsh`), and zsh does NOT word-split a bare unquoted variable reference by
+default the way bash does — iterating a multi-word value stored in a plain variable treats the
+whole thing as ONE token in zsh, not many — even though zsh DOES word-split a direct, unquoted
+command substitution the same way bash does (confirmed both behaviors directly, side by side, in
+the same shell). Keeping the whole query-plus-fallback expression inside one command substitution
+sidesteps the difference entirely, since the iteration then only ever sees a genuine command
+substitution, never an intermediate plain variable — this is why every sanitization loop in this
+file uses that exact shape and none stores
+the list into a named variable first. The actual round-1 dispatch immediately below
+rehydrates and passes `--cwd "$REPO_ROOT"` explicitly, so sizing must resolve the identical root or
+it can silently size a different repository than the one actually reviewed, picking the wrong
+single-vs-parallel mode for the real target — and, in the worst case, disclose a different
+repository's file list to whatever narrates this round's sizing decision.
 
 This counts both tracked-modified files (`git diff --name-only "$DIFF_BASE"`) and untracked files
 (`git ls-files --others --exclude-standard`), deduplicated — a `git diff --name-only HEAD | wc -l`-
@@ -401,17 +528,25 @@ commit's own patch otherwise (`git show "$sha"`, equivalent to a one-parent diff
 are never part of either scope, so the `git ls-files --others` half never applies to them. Size
 each scope with the matching command:
 ```bash
+REPO_ROOT_FILE="<literal REPO_ROOT_FILE path resolved once in Phase 0>"
+REPO_ROOT="$(cat "$REPO_ROOT_FILE")"; REPO_ROOT="${REPO_ROOT%x}"
+for _v in $(git rev-parse --local-env-vars 2>/dev/null || printf '%s\n' GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_OBJECT_DIRECTORY GIT_DIR GIT_WORK_TREE GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_INDEX_FILE GIT_NO_REPLACE_OBJECTS GIT_REPLACE_REF_BASE GIT_PREFIX GIT_SHALLOW_FILE GIT_COMMON_DIR) GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_TEMPLATE_DIR; do
+  unset "$_v"
+done
+
 # --base <ref>:
-git diff --no-ext-diff --no-textconv --name-only "<ref>...HEAD" | wc -l
+git -C "$REPO_ROOT" diff --no-ext-diff --no-textconv --name-only "<ref>...HEAD" | wc -l
 
 # --commit <sha>: mirror the wrapper's own merge-vs-non-merge branch, never just one or the other
-PARENT_COUNT="$(git show -s --format=%P --no-ext-diff --no-textconv "<sha>" 2>/dev/null | wc -w | tr -d ' ')"
+PARENT_COUNT="$(git -C "$REPO_ROOT" show -s --format=%P --no-ext-diff --no-textconv "<sha>" 2>/dev/null | wc -w | tr -d ' ')"
 if [ "$PARENT_COUNT" -ge 2 ]; then
-  git diff --no-ext-diff --no-textconv --name-only "<sha>^1" "<sha>" | wc -l
+  git -C "$REPO_ROOT" diff --no-ext-diff --no-textconv --name-only "<sha>^1" "<sha>" | wc -l
 else
-  git show --no-ext-diff --no-textconv --name-only --format= "<sha>" | wc -l
+  git -C "$REPO_ROOT" show --no-ext-diff --no-textconv --name-only --format= "<sha>" | wc -l
 fi
 ```
+Same `-C "$REPO_ROOT"` anchoring AND sanitization loop as the `--uncommitted` sizing command above, for the identical
+reason — never a bare `git` call in these either.
 Sizing must reflect whatever scope was actually selected, using the wrapper's own exact collection
 logic for that scope — never silently default to counting the uncommitted working-tree diff (or
 any other approximation) for a review that was never scoped to it.
@@ -562,6 +697,13 @@ INSTALL_PATH_FILE="<literal from Phase 0>"; REPO_ROOT_FILE="<literal from Phase 
 INSTALL_PATH="$(cat "$INSTALL_PATH_FILE")"; INSTALL_PATH="${INSTALL_PATH%x}"
 REPO_ROOT="$(cat "$REPO_ROOT_FILE")"; REPO_ROOT="${REPO_ROOT%x}"
 FOCUS_TEXT="$(cat "$FOCUS_FILE")"; FOCUS_TEXT="${FOCUS_TEXT%x}"
+# Same git-environment sanitization as the sizing step above (see "Determine review mode" and
+# Phase 0 step 4 for the full reasoning) — the wrapper's own internal `git diff`/`git status`
+# calls (fresh scopes only; a --resume round collects nothing) run after a plain `cd "$CWD"`,
+# never `-C`, so they inherit whatever this dispatching shell hands them:
+for _v in $(git rev-parse --local-env-vars 2>/dev/null || printf '%s\n' GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_OBJECT_DIRECTORY GIT_DIR GIT_WORK_TREE GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_INDEX_FILE GIT_NO_REPLACE_OBJECTS GIT_REPLACE_REF_BASE GIT_PREFIX GIT_SHALLOW_FILE GIT_COMMON_DIR) GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_TEMPLATE_DIR; do
+  unset "$_v"
+done
 
 # Round 1 (fresh — pick the one matching scope flag actually decided in Phase 0; identical scope
 # flag for every group this round, since every group reviews the SAME diff, see "Determine review
@@ -591,6 +733,19 @@ same turn — one Bash `run_in_background: true` invocation per group, exactly `
 parallel-dispatch pattern ("Run each group's call at the same time → wait for all → synthesize").
 The single-reviewer case is simply N=1 of this same loop, not a separate branch.
 
+**Residual gap shared with the `CLEAN_REPO_DIR` case (see Phase 0 step 4's own fuller writeup) —
+applies here too, not only to artifact reviews.** The `unset`-based sanitization just above
+protects against redirected repository/worktree discovery and command-scope config injection, but
+it does not disable ambient default global/system git config: a legitimately-configured
+`core.fsmonitor` hook (a real, common developer setting, not just an attacker scenario) still
+executes when the wrapper's own `git diff --no-ext-diff --no-textconv` collection runs — confirmed
+live. Fully closing this for a NORMAL `$REPO_ROOT` review is a real tension, not a simple copy of
+`CLEAN_REPO_DIR`'s `env -i` allowlist fix: a normal review's `git diff` is expected to reflect the
+user's actual configured repository behavior, so a `GIT_CONFIG_NOSYSTEM=1`/fake-`HOME` allowlist
+appropriate for an isolated throwaway repo is not obviously the right default for the user's real
+one. Flagged here as an open question for a future `run-ccs-review.sh` change, not resolved by
+this SKILL.md-only fix.
+
 **`GROUP_THREADS` — the ordered set of `(GROUP, THREAD_ID)` pairs.** Established once, right after
 round 1's dispatched groups each independently signal their own `THREAD_ID` via Step 3 below (run
 once per group). Remembered by Claude as a literal fact for the rest of the run, the same way a
@@ -605,7 +760,23 @@ latest round's log line re-derives the mapping if memory is ever in doubt, for e
 **Non-repo artifact round?** Substitute the exact literal `CLEAN_REPO_DIR` path (see Phase 0 step
 4) for `$REPO_ROOT` in the `--cwd` argument above instead — never `$REPO_ROOT` for a genuine
 non-repo-artifact review — and always keep `--uncommitted` (never `--base`/`--commit`, since
-`CLEAN_REPO_DIR` has no commits to diff against). **This substitution applies to EVERY round of a
+`CLEAN_REPO_DIR` has no commits to diff against). **Also run the git-environment sanitization
+loop defined in Step 1's dispatch section above, immediately before that section's own "Round 1
+(fresh ...)" comment.** Reuse that one fenced code block by reference only — never retype it, never
+abbreviate it, and never reproduce any piece of its actual shell syntax as a separate backtick-
+quoted span anywhere in this file, including here. Multiple earlier revisions of this exact
+instruction each tried to show a shortened or reflowed copy directly in prose, and each one turned
+out broken in its own way once actually executed (a line break landing mid-command; an abbreviated
+placeholder that parses as valid shell but silently does nothing) — this is a real,
+repeatedly-reintroduced bug, not a hypothetical one, and the only fix that has actually held is
+naming the one canonical block instead of ever showing a second rendering of it. **In this same
+dispatch call, every round, before invoking the wrapper** — this is a separately-dispatched call and an
+unset environment variable does not carry over between calls any more than a literal value does;
+skipping it here would silently reopen the exact bypass Phase 0 step 4 already fixed at creation
+time, on every round after the first — the wrapper's own internal `git diff`/`git status` calls
+(run after a plain `cd "$CWD"`, never `-C`) inherit whatever environment this dispatching shell
+hands them, so sanitizing here is what actually protects them, not a change to the wrapper itself.
+**This substitution applies to EVERY round of a
 non-repo-artifact session, round 2+ included — never revert to `$REPO_ROOT` on a resume.** The
 wrapper still `cd`s into whatever `--cwd` names immediately before running `codex exec resume`,
 even though diff collection itself is skipped on resume — passing `$REPO_ROOT` on a resumed
@@ -1240,9 +1411,13 @@ caller-owns-cleanup contract (see "Mode 2 — cleanup" above).
 4. **Clean up session-level temp files**, same fast path `codex-direct-review:ccd` uses:
    ```bash
    rm -f "<literal REPO_ROOT_FILE>" "<literal INSTALL_PATH_FILE>"
-   # only if this session ever actually allocated one (most sessions never do — see Phase 0 step 4):
+   # only if this session ever actually allocated them (most sessions never do — see Phase 0 step 4):
    rm -rf "<the exact literal CLEAN_REPO_DIR path, if one was allocated this session>"
+   rm -rf "<the exact literal FAKE_GIT_HOME path, if one was allocated this session>"
    ```
+   `FAKE_GIT_HOME` is allocated in the same lazy, one-time-per-session way as `CLEAN_REPO_DIR` (see
+   Phase 0 step 4) and cleaned up alongside it here — never left behind once `CLEAN_REPO_DIR` no
+   longer needs it.
 
 ### Final report (Korean — the only Korean output)
 
