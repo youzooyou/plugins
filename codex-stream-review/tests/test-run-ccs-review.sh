@@ -2,15 +2,37 @@
 # Regression fixtures for run-ccs-review.sh -- covers exactly the bug
 # classes that have already shipped once in this plugin's own history
 # (a bypassable --focus gate, a bad --resume contract) plus the
-# git-environment/config isolation gap fixed alongside this suite. No
-# `codex exec` call is ever made: every case here fails or short-circuits
-# before the wrapper would dispatch to Codex, so this suite costs no API
-# calls and runs in well under a second.
+# git-environment/config isolation gap fixed alongside this suite, PLUS
+# (see the "post-dispatch reason fixtures" section near the bottom) the 7
+# `reason` values that can only occur AFTER a `codex exec` subprocess has
+# actually started (interrupted, timeout, nonzero_exit,
+# missing_task_complete, no_final_answer, invalid_json, schema_mismatch).
+# The first set of fixtures fails or short-circuits before the wrapper
+# would ever dispatch to Codex; the post-dispatch set substitutes
+# tests/fixtures/fake-codex for the real `codex` binary (via a PATH
+# override) so the wrapper genuinely spawns and observes a subprocess
+# without ever reaching a real Codex backend. This PATH override is
+# installed here, at the very top of the file, before ANY fixture below
+# runs -- including the pre-existing --cleanup fixtures further down,
+# which call the wrapper's own `--cleanup` mode and therefore
+# `codex delete --force` (scripts/run-ccs-review.sh:232) via a bare
+# `codex` lookup. An earlier revision of this file left that PATH
+# override installed only inside the post-dispatch section, so those
+# --cleanup fixtures resolved whatever real `codex` binary happened to be
+# on $PATH -- on a machine with an authenticated Codex CLI, that silently
+# made a real network call every time this suite ran, contradicting this
+# very comment's own "no API calls" claim. Installing the override this
+# early, for the whole file, closes that gap: no line below can ever
+# reach a real `codex` binary.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WRAPPER="$SCRIPT_DIR/../scripts/run-ccs-review.sh"
 LIB_GIT_SAFE="$SCRIPT_DIR/../scripts/lib/git-safe.sh"
+FAKE_CODEX="$SCRIPT_DIR/fixtures/fake-codex"
+FAKE_BIN_DIR="$(mktemp -d)"
+ln -s "$FAKE_CODEX" "$FAKE_BIN_DIR/codex" || { echo "SETUP FAILED: linking fake codex" >&2; exit 1; }
+PATH="$FAKE_BIN_DIR:$PATH"
 
 FAILURES=0
 pass() { echo "PASS: $1"; }
@@ -138,6 +160,367 @@ must git -C "$TMP_REPO" config --unset core.fsmonitor
 rm -f "$COLLECT_FSMON_MARKER" "$COLLECT_COVERAGE_OUT"
 
 rm -rf "$TMP_REPO" "$DECOY_REPO" "$SAFE_GIT_HOME"
+
+# --- post-dispatch reason fixtures (fake codex, no real API calls) ---
+# tests/fixtures/fake-codex stands in for the real `codex` binary -- wired
+# into $PATH once, for the whole file, at the top -- so run-ccs-review.sh
+# genuinely spawns and observes a subprocess, exercising the 7 `reason`
+# values that can only be produced after that subprocess has actually
+# started. Only $FAKE_HOME (the isolated $HOME/.codex/sessions root) is
+# specific to this section.
+
+FAKE_HOME="$(mktemp -d)"
+
+PD_REPO="$(mktemp -d)"
+must git -C "$PD_REPO" init -q
+must git -C "$PD_REPO" -c user.email=test@example.com -c user.name=test commit --allow-empty -q -m init
+echo "line" > "$PD_REPO/f.txt" || { echo "SETUP FAILED: writing PD_REPO/f.txt" >&2; exit 1; }
+
+# pd_new_tid -> a fresh unique id for a --resume fixture's pre-seeded
+# rollout file. Doesn't need to look like a real Codex thread id (nothing
+# here parses its shape), just be unique and filename-safe.
+pd_new_tid() {
+  python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || echo "pd-$$-${RANDOM}"
+}
+
+# pd_seed_resume_rollout THREAD_ID -> pre-creates an empty rollout file for
+# THREAD_ID under $FAKE_HOME so --resume's own resolve_rollout() lookup
+# succeeds before dispatch even happens. A real `codex exec resume`
+# continuation always has a pre-existing rollout to append to; every
+# --resume fixture below needs one too, or it would fail with
+# resume_thread_not_found before ever reaching the post-dispatch behavior
+# this section exists to test. tests/fixtures/fake-codex resolves and
+# appends to this SAME file (it duplicates the wrapper's own
+# resolve_rollout() lookup) rather than creating a second one.
+pd_seed_resume_rollout() {
+  local tid="$1" day_dir
+  day_dir="$FAKE_HOME/.codex/sessions/$(date +%Y/%m/%d)"
+  mkdir -p "$day_dir"
+  : > "$day_dir/rollout-fake-${tid}.jsonl"
+}
+
+# pd_run fresh [ARGS...]              -- fresh dispatch against $PD_REPO
+# pd_run resume THREAD_ID [ARGS...]   -- resume dispatch against THREAD_ID
+# Scenario env vars (FAKE_CODEX_SCENARIO/_EXIT_CODE/_SLEEP_SECS/
+# _FINAL_ANSWER/_MARKER_FILE) are read from whatever the caller already
+# exported -- each call site below sets them inline right before calling
+# this, rather than threading them through as parameters.
+pd_run() {
+  local mode="$1"; shift
+  if [ "$mode" = "resume" ]; then
+    local tid="$1"; shift
+    # --cwd is required on every invocation, even --resume (the wrapper's
+    # own arg validation checks CWD unconditionally, and the dispatch
+    # subshell always does `cd "$CWD"` before running codex).
+    PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --resume "$tid" --focus x "$@" 2>&1
+  else
+    PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --uncommitted --focus x "$@" 2>&1
+  fi
+}
+
+# pd_reason OUTPUT -> the wrapper's own JSON is always the LAST line of
+# combined stdout+stderr (the wrapper's occasional "THREAD_ID=..." debug
+# line, when present, is always printed to stderr before it).
+pd_reason() { printf '%s' "$1" | tail -1 | jq -r '.reason // empty' 2>/dev/null; }
+pd_threadid() { printf '%s' "$1" | tail -1 | jq -r '.threadId // empty' 2>/dev/null; }
+
+pd_assert_reason() {
+  local out="$1" expected="$2" label="$3" got
+  got="$(pd_reason "$out")"
+  if [ "$got" = "$expected" ]; then
+    pass "$label: reason=$expected"
+  else
+    fail "$label: expected reason=$expected, got reason=$got (full: $out)"
+  fi
+}
+pd_assert_threadid_present() {
+  local out="$1" label="$2" got
+  got="$(pd_threadid "$out")"
+  if [ -n "$got" ]; then
+    pass "$label: threadId present ($got)"
+  else
+    fail "$label: expected a threadId, got none (full: $out)"
+  fi
+}
+
+PD_VALID_VERDICT='{"verdict":"CLEAN","findings":[],"summary":null,"dimensions":{"correctness":{"status":"not_applicable","evidence":"e"},"security":{"status":"not_applicable","evidence":"e"},"performance":{"status":"not_applicable","evidence":"e"},"reuse":{"status":"not_applicable","evidence":"e"},"contracts":{"status":"not_applicable","evidence":"e"},"resources_concurrency":{"status":"not_applicable","evidence":"e"},"intent":{"status":"not_applicable","evidence":"e"}}}'
+
+# --- sanity: the fake codex itself, on a scenario meant to succeed,
+# actually produces ok:true (fresh and resume) -- every case below relies
+# on this fixture behaving correctly, so it gets its own direct check.
+export FAKE_CODEX_SCENARIO=normal
+OUT="$(pd_run fresh)"
+if [ "$(printf '%s' "$OUT" | tail -1 | jq -r '.ok')" = "true" ]; then
+  pass "sanity: fresh normal-success dispatch returns ok:true"
+else
+  fail "sanity: fresh normal-success dispatch should return ok:true, got: $OUT"
+fi
+
+TID="$(pd_new_tid)"
+pd_seed_resume_rollout "$TID"
+OUT="$(pd_run resume "$TID")"
+if [ "$(printf '%s' "$OUT" | tail -1 | jq -r '.ok')" = "true" ]; then
+  pass "sanity: resume normal-success dispatch returns ok:true"
+else
+  fail "sanity: resume normal-success dispatch should return ok:true, got: $OUT"
+fi
+unset FAKE_CODEX_SCENARIO
+
+# --- interrupted: the WRAPPER's own signal trap, not anything fake-codex
+# does -- fake-codex just hangs (FAKE_CODEX_SCENARIO=hang) so there's a
+# real window to send SIGTERM to the wrapper's own process into.
+pd_test_interrupted() {
+  # Only 3 call shapes are actually used below (fresh, resume, fresh +
+  # capture-eventlog) -- handled as separate branches rather than an
+  # optional-args array, since this project's bash 3.2 floor raises
+  # "unbound variable" under `set -u` when expanding "${ARR[@]}" on an
+  # array that was ever assigned empty (see run-ccs-review.sh's own note
+  # on TRACKED_BINARY_PATHS for the identical constraint).
+  local mode="$1" tid="${2:-}" capture_path="${3:-}"
+  local label="$mode"
+  local marker outfile wrapper_pid
+  marker="$(mktemp -u)"
+  outfile="$(mktemp)"
+  export FAKE_CODEX_SCENARIO=hang FAKE_CODEX_SLEEP_SECS=30 FAKE_CODEX_MARKER_FILE="$marker"
+  # Deliberately NOT routed through pd_run here: backgrounding a shell
+  # FUNCTION call (`pd_run ... &`) forks an extra supervisor process for
+  # the job, so $! captures THAT process, never the actual $WRAPPER
+  # process running on_signal's trap -- a SIGTERM sent to $! would then
+  # kill the supervisor while the real wrapper (reparented to init) keeps
+  # running unsignaled. Invoking "$WRAPPER" directly as the backgrounded
+  # command keeps $! pointing at the real process.
+  if [ "$mode" = "resume" ]; then
+    PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --resume "$tid" --focus x \
+      > "$outfile" 2>&1 &
+  elif [ -n "$capture_path" ]; then
+    PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --uncommitted --focus x \
+      --capture-eventlog "$capture_path" > "$outfile" 2>&1 &
+  else
+    PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --uncommitted --focus x \
+      > "$outfile" 2>&1 &
+  fi
+  wrapper_pid=$!
+  # Wait for fake-codex to genuinely start (marker file) -- if it never
+  # does, fail loudly instead of silently falling through to a SIGTERM
+  # that would then race an already-broken dispatch and produce a
+  # confusing, unrelated assertion failure below.
+  local waited=0
+  while [ ! -e "$marker" ] && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  if [ ! -e "$marker" ]; then
+    fail "interrupted ($label): fake-codex never started (marker not seen within 5s)"
+    kill -TERM "$wrapper_pid" 2>/dev/null
+    wait "$wrapper_pid" 2>/dev/null
+    rm -f "$marker" "$outfile"
+    unset FAKE_CODEX_SCENARIO FAKE_CODEX_SLEEP_SECS FAKE_CODEX_MARKER_FILE
+    return
+  fi
+  # Then wait for the WRAPPER's own "THREAD_ID=..." line in $outfile
+  # (scripts/run-ccs-review.sh echoes this to stderr, captured here,
+  # immediately once it assigns $THREAD_ID -- for a fresh dispatch, only
+  # after its own thread.started poll succeeds; for --resume, almost
+  # immediately, since THREAD_ID is just the echoed --resume argument).
+  # Polling this exact signal, rather than a fixed sleep after the
+  # marker, is what actually closes the race: the marker fires as
+  # fake-codex's very FIRST action, before it even emits thread.started,
+  # so a fixed delay after it is a guess, not a guarantee, that the
+  # wrapper has caught up.
+  waited=0
+  while ! grep -q '^THREAD_ID=' "$outfile" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  kill -TERM "$wrapper_pid" 2>/dev/null
+  wait "$wrapper_pid" 2>/dev/null
+  OUT="$(cat "$outfile")"
+  pd_assert_reason "$OUT" "interrupted" "interrupted ($label)"
+  pd_assert_threadid_present "$OUT" "interrupted ($label)"
+  rm -f "$marker" "$outfile"
+  unset FAKE_CODEX_SCENARIO FAKE_CODEX_SLEEP_SECS FAKE_CODEX_MARKER_FILE
+}
+pd_test_interrupted fresh
+TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+pd_test_interrupted resume "$TID"
+
+# on_signal() exits before ever reaching the --capture-eventlog copy step
+# that the normal (non-signal) code path uses -- so a signal-interrupted
+# round never populates the requested capture path. Worth locking in
+# explicitly rather than leaving it an unverified assumption.
+CAPTURE_PATH="$(mktemp -u)"
+pd_test_interrupted fresh "" "$CAPTURE_PATH"
+if [ ! -e "$CAPTURE_PATH" ]; then
+  pass "interrupted: --capture-eventlog is NOT populated (on_signal skips the copy step)"
+else
+  fail "interrupted: expected no eventlog capture, but $CAPTURE_PATH was created"
+  rm -f "$CAPTURE_PATH"
+fi
+
+# --- timeout: the wrapper's own --timeout deadline, not a fake-codex exit.
+export FAKE_CODEX_SCENARIO=hang FAKE_CODEX_SLEEP_SECS=5
+OUT="$(pd_run fresh --timeout 1)"
+pd_assert_reason "$OUT" "timeout" "timeout (fresh)"
+pd_assert_threadid_present "$OUT" "timeout (fresh)"
+
+TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+OUT="$(pd_run resume "$TID" --timeout 1)"
+pd_assert_reason "$OUT" "timeout" "timeout (resume)"
+pd_assert_threadid_present "$OUT" "timeout (resume)"
+unset FAKE_CODEX_SCENARIO FAKE_CODEX_SLEEP_SECS
+
+# --- nonzero_exit: codex exec/exec resume itself exits nonzero.
+for CODE in 1 3; do
+  export FAKE_CODEX_SCENARIO=exit_nonzero FAKE_CODEX_EXIT_CODE="$CODE"
+  OUT="$(pd_run fresh)"
+  pd_assert_reason "$OUT" "nonzero_exit" "nonzero_exit (fresh, exit=$CODE)"
+  pd_assert_threadid_present "$OUT" "nonzero_exit (fresh, exit=$CODE)"
+
+  TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+  OUT="$(pd_run resume "$TID")"
+  pd_assert_reason "$OUT" "nonzero_exit" "nonzero_exit (resume, exit=$CODE)"
+  pd_assert_threadid_present "$OUT" "nonzero_exit (resume, exit=$CODE)"
+done
+
+# --capture-eventlog must contain fake-codex's own raw stdout for a
+# non-signal failure path (unlike interrupted above).
+CAPTURE_PATH="$(mktemp -u)"
+export FAKE_CODEX_SCENARIO=exit_nonzero FAKE_CODEX_EXIT_CODE=1
+OUT="$(pd_run fresh --capture-eventlog "$CAPTURE_PATH")"
+pd_assert_reason "$OUT" "nonzero_exit" "nonzero_exit (fresh, --capture-eventlog)"
+if [ -f "$CAPTURE_PATH" ] && grep -q '"type":"thread.started"' "$CAPTURE_PATH"; then
+  pass "nonzero_exit: --capture-eventlog captured fake-codex's raw stdout"
+else
+  fail "nonzero_exit: --capture-eventlog should contain thread.started, file: $([ -f "$CAPTURE_PATH" ] && cat "$CAPTURE_PATH" || echo MISSING)"
+fi
+rm -f "$CAPTURE_PATH"
+unset FAKE_CODEX_SCENARIO FAKE_CODEX_EXIT_CODE
+
+# --- missing_task_complete: process exits 0, task_complete never appears.
+export FAKE_CODEX_SCENARIO=no_task_complete
+OUT="$(pd_run fresh)"
+pd_assert_reason "$OUT" "missing_task_complete" "missing_task_complete (fresh)"
+pd_assert_threadid_present "$OUT" "missing_task_complete (fresh)"
+
+TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+OUT="$(pd_run resume "$TID")"
+pd_assert_reason "$OUT" "missing_task_complete" "missing_task_complete (resume)"
+pd_assert_threadid_present "$OUT" "missing_task_complete (resume)"
+unset FAKE_CODEX_SCENARIO
+
+# --- no_final_answer: task_complete appears, but no final_answer message.
+export FAKE_CODEX_SCENARIO=no_final_answer
+OUT="$(pd_run fresh)"
+pd_assert_reason "$OUT" "no_final_answer" "no_final_answer (fresh)"
+pd_assert_threadid_present "$OUT" "no_final_answer (fresh)"
+
+TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+OUT="$(pd_run resume "$TID")"
+pd_assert_reason "$OUT" "no_final_answer" "no_final_answer (resume)"
+pd_assert_threadid_present "$OUT" "no_final_answer (resume)"
+unset FAKE_CODEX_SCENARIO
+
+# --- invalid_json: final_answer text exists but isn't valid JSON at all.
+PD_INVALID_JSON_VARIANTS=(
+  "not json at all"
+  "{not even close to json"
+  "<<<garbled response>>>"
+)
+i=0
+for VARIANT in "${PD_INVALID_JSON_VARIANTS[@]}"; do
+  i=$((i + 1))
+  export FAKE_CODEX_SCENARIO=invalid_json FAKE_CODEX_FINAL_ANSWER="$VARIANT"
+  OUT="$(pd_run fresh)"
+  pd_assert_reason "$OUT" "invalid_json" "invalid_json (fresh, variant $i)"
+  pd_assert_threadid_present "$OUT" "invalid_json (fresh, variant $i)"
+
+  TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+  OUT="$(pd_run resume "$TID")"
+  pd_assert_reason "$OUT" "invalid_json" "invalid_json (resume, variant $i)"
+  pd_assert_threadid_present "$OUT" "invalid_json (resume, variant $i)"
+done
+
+CAPTURE_PATH="$(mktemp -u)"
+export FAKE_CODEX_SCENARIO=invalid_json FAKE_CODEX_FINAL_ANSWER="${PD_INVALID_JSON_VARIANTS[0]}"
+OUT="$(pd_run fresh --capture-eventlog "$CAPTURE_PATH")"
+pd_assert_reason "$OUT" "invalid_json" "invalid_json (fresh, --capture-eventlog)"
+if [ -f "$CAPTURE_PATH" ] && grep -q '"type":"thread.started"' "$CAPTURE_PATH"; then
+  pass "invalid_json: --capture-eventlog captured fake-codex's raw stdout"
+else
+  fail "invalid_json: --capture-eventlog should contain thread.started, file: $([ -f "$CAPTURE_PATH" ] && cat "$CAPTURE_PATH" || echo MISSING)"
+fi
+rm -f "$CAPTURE_PATH"
+unset FAKE_CODEX_SCENARIO FAKE_CODEX_FINAL_ANSWER
+
+# --- schema_mismatch: valid JSON, but fails the wrapper's own semantic
+# cross-field rules (search run-ccs-review.sh for where invalid_json and
+# schema_mismatch are emitted -- each variant below violates exactly one
+# rule from that jq check).
+pd_variant() {
+  # pd_variant NAME JQ_FILTER -> starts from PD_VALID_VERDICT and applies
+  # one jq mutation, so each variant only names the ONE rule it breaks
+  # instead of restating the whole JSON blob per case.
+  printf '%s' "$PD_VALID_VERDICT" | jq -c "$1"
+}
+
+PD_SCHEMA_MISMATCH_NAMES=(
+  "CLEAN-with-nonempty-findings"
+  "ISSUES-with-empty-findings"
+  "missing-dimension-key"
+  "blank-dimension-evidence"
+  "finding-blank-verification"
+  "extra-top-level-key"
+  "finding-line-zero"
+  "invalid-severity-value"
+  "invalid-verdict-value"
+  "finding-missing-required-key"
+)
+PD_SCHEMA_MISMATCH_JSON=(
+  "$(pd_variant '.findings += [{"file":"a.txt","line":1,"severity":"low","summary":"s","evidence":"e","verification":"v"}]')"
+  "$(pd_variant '.verdict = "ISSUES"')"
+  "$(pd_variant 'del(.dimensions.intent)')"
+  "$(pd_variant '.dimensions.correctness.evidence = "   "')"
+  "$(pd_variant '.verdict = "ISSUES" | .findings = [{"file":"a.txt","line":1,"severity":"low","summary":"s","evidence":"e","verification":"   "}]')"
+  "$(pd_variant '. + {"extra_field": true}')"
+  "$(pd_variant '.verdict = "ISSUES" | .findings = [{"file":"a.txt","line":0,"severity":"low","summary":"s","evidence":"e","verification":"v"}]')"
+  "$(pd_variant '.verdict = "ISSUES" | .findings = [{"file":"a.txt","line":1,"severity":"critical","summary":"s","evidence":"e","verification":"v"}]')"
+  # Also sets findings to a valid nonempty array: the wrapper's
+  # CLEAN/ISSUES-vs-findings cross-field clause branches on `.verdict ==
+  # "CLEAN"`, so changing verdict alone to a non-CLEAN, non-ISSUES value
+  # would ALSO flip that clause to its non-CLEAN branch (needs
+  # findings.length > 0) while findings is still the empty baseline --
+  # failing two independent clauses at once instead of isolating the
+  # allowed-verdict-values check this variant is named for.
+  "$(pd_variant '.verdict = "PASS" | .findings = [{"file":"a.txt","line":1,"severity":"low","summary":"s","evidence":"e","verification":"v"}]')"
+  "$(pd_variant '.verdict = "ISSUES" | .findings = [{"line":1,"severity":"low","summary":"s","evidence":"e","verification":"v"}]')"
+)
+for i in "${!PD_SCHEMA_MISMATCH_NAMES[@]}"; do
+  NAME="${PD_SCHEMA_MISMATCH_NAMES[$i]}"
+  JSON="${PD_SCHEMA_MISMATCH_JSON[$i]}"
+  export FAKE_CODEX_SCENARIO=schema_mismatch FAKE_CODEX_FINAL_ANSWER="$JSON"
+  OUT="$(pd_run fresh)"
+  pd_assert_reason "$OUT" "schema_mismatch" "schema_mismatch (fresh, $NAME)"
+  pd_assert_threadid_present "$OUT" "schema_mismatch (fresh, $NAME)"
+done
+
+# A couple of the same variants, also exercised over --resume.
+for NAME_IDX in 0 1; do
+  NAME="${PD_SCHEMA_MISMATCH_NAMES[$NAME_IDX]}"
+  JSON="${PD_SCHEMA_MISMATCH_JSON[$NAME_IDX]}"
+  TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+  export FAKE_CODEX_SCENARIO=schema_mismatch FAKE_CODEX_FINAL_ANSWER="$JSON"
+  OUT="$(pd_run resume "$TID")"
+  pd_assert_reason "$OUT" "schema_mismatch" "schema_mismatch (resume, $NAME)"
+  pd_assert_threadid_present "$OUT" "schema_mismatch (resume, $NAME)"
+done
+
+CAPTURE_PATH="$(mktemp -u)"
+export FAKE_CODEX_SCENARIO=schema_mismatch FAKE_CODEX_FINAL_ANSWER="${PD_SCHEMA_MISMATCH_JSON[0]}"
+OUT="$(pd_run fresh --capture-eventlog "$CAPTURE_PATH")"
+pd_assert_reason "$OUT" "schema_mismatch" "schema_mismatch (fresh, --capture-eventlog)"
+if [ -f "$CAPTURE_PATH" ] && grep -q '"type":"thread.started"' "$CAPTURE_PATH"; then
+  pass "schema_mismatch: --capture-eventlog captured fake-codex's raw stdout"
+else
+  fail "schema_mismatch: --capture-eventlog should contain thread.started, file: $([ -f "$CAPTURE_PATH" ] && cat "$CAPTURE_PATH" || echo MISSING)"
+fi
+rm -f "$CAPTURE_PATH"
+unset FAKE_CODEX_SCENARIO FAKE_CODEX_FINAL_ANSWER
+
+rm -rf "$FAKE_HOME" "$FAKE_BIN_DIR" "$PD_REPO"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
