@@ -57,9 +57,9 @@ you automatically (see below).
 
 - **`codex-stream-review:ccs`** — a full Claude+Codex adversarial cross-review loop (max 20
   rounds) on a resumable thread per reviewer, so follow-up rounds are cheap (no diff re-send after
-  round 1) and, in a tmux-capable environment, a live progress pane opens automatically per
-  reviewer. It owns its threads' entire lifecycle, cleaning them up on every terminal path
-  automatically. Supports both single-reviewer and parallel multi-reviewer (N concurrent,
+  round 1), with live progress narrated in chat as each round runs. It owns its threads' entire
+  lifecycle, cleaning them up on every terminal path automatically. Supports both single-reviewer
+  and parallel multi-reviewer (N concurrent,
   dimension-focused reviewers, each on its own resumable thread) modes, non-repo-artifact reviews
   (a design doc, a plan, pasted analysis text) via a throwaway isolated repo, and opt-in
   investigation-evidence capture (`--capture-evidence`) — see `skills/ccs/SKILL.md`.
@@ -74,19 +74,19 @@ you automatically (see below).
 
 - `scripts/run-stream-review.sh` — dispatches `codex exec`/`codex exec resume --json`, captures the
   thread ID from the process's own stdout stream and immediately echoes it to stderr as
-  `THREAD_ID=<uuid>` (the signal a caller uses for live tailing), then internally polls that
-  thread's rollout file under `~/.codex/sessions/` for its own `task_complete` event and extracts
-  the final answer directly from that file once the round is done. `--cleanup <threadId>` is a
-  separate mode that deletes the thread via `codex delete --force`. Used directly by the raw
-  `stream-review` skill above.
+  `THREAD_ID=<uuid>` (the signal a caller uses for live tailing), then detects round completion by
+  watching that same captured stdout stream for its own `turn.completed` event and reads the final
+  answer directly from the file `codex exec`'s own `-o/--output-last-message` flag wrote it to.
+  `--cleanup <threadId>` is a separate mode that deletes the thread via `codex delete --force`. Used
+  directly by the raw `stream-review` skill above.
 - `skills/stream-review/SKILL.md` — how to start, continue, and clean up a review, and the current
   safety-model status.
 - `scripts/run-ccs-review.sh` — a separate wrapper `/ccs` dispatches through instead of
   `run-stream-review.sh` above: adds diff-collection/coverage logic on top of the resumable-thread
   dispatch mechanism, since `run-stream-review.sh` itself has no diff-collection capability.
 - `skills/ccs/SKILL.md` — the `codex-stream-review:ccs` command: a resumable-thread Claude+Codex
-  adversarial consensus loop (max 20 rounds), with automatic thread cleanup and an auto-opening
-  tmux pane — single-reviewer or parallel multi-reviewer (each group on its own persistent
+  adversarial consensus loop (max 20 rounds), with automatic thread cleanup and live progress
+  narrated in chat — single-reviewer or parallel multi-reviewer (each group on its own persistent
   resumable thread), non-repo-artifact reviews via a throwaway isolated repo, and opt-in
   investigation-evidence capture.
 

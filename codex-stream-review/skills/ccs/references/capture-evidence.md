@@ -36,8 +36,10 @@ trusting the claim at face value.
    with its own event log, whether or not the underlying Codex thread is being resumed). **This
    applies to EVERY `run-ccs-review.sh` dispatch this file ever constructs, with no exception —
    Phase 1 Step 1's own fresh/resume examples, AND every retry variant in Guards below** (the
-   no-threadId-yet fresh retry, the resume-safe bounded retry, the resume-retries-exhausted
-   fallback fresh retry, and the non-resume-safe immediate fresh retry): each is its own separate
+   no-threadId-yet fresh retry, the resume-safe bounded retry, and the resume-retries-exhausted
+   fallback fresh retry — there is no longer a separate "non-resume-safe immediate fresh retry"
+   variant; see the Guards section's own note that only these two `threadId`-presence branches
+   remain): each is its own separate
    process invocation and gets its own freshly-`mktemp`'d `EVENTLOG_FILE` the same way, never the
    original round's already-consumed one, when capture is ON — see the Guards section's
    resume-safe retry bullet for the one case (a genuine resume-retry succeeding) where more than
@@ -74,21 +76,22 @@ trusting the claim at face value.
      input, it is present whether the failure landed microseconds after that echo (nothing
      launched yet) or well after `codex exec resume` actually ran, so presence alone never confirms
      a launch. This asymmetry doesn't change any actual extraction decision here, so `threadId` is
-     still never checked: `bad_args` and `resume_thread_not_found` are already skipped by `reason`
-     name alone (the former is always ID-less by the above, the latter is always ID-present but by
-     definition always pre-launch — see its own row in the reason table). `interrupted` is skipped
+     still never checked: `bad_args` is already skipped by `reason` name alone (always ID-less by
+     the above, and always pre-launch — argument validation happens before any dispatch is
+     attempted). `interrupted` is skipped
      as the conservative choice either way it occurs — an ID-less occurrence is a confirmed
      non-launch, and an ID-present occurrence is unresolvably ambiguous, so treating both alike
      avoids a `threadId`-shaped special case for this one reason: reporting a fabricated
      zero-command object for an investigation that may never have happened is worse than the
      (typically rare, narrow-window) case of omitting a real-but-brief one. Every other reason —
      `ok:true`,
-     `timeout`, `nonzero_exit`, `missing_task_complete`, `rollout_not_found`, `no_final_answer`,
+     `timeout`, `nonzero_exit`, `missing_task_complete`, `no_final_answer`,
      `invalid_json`, `schema_mismatch` — can ONLY occur after `codex exec resume` genuinely
-     launched (`rollout_not_found` specifically is a POST-launch rollout re-resolution failure,
-     not the resume-only PRE-flight `resume_thread_not_found` check above — the two are separate
-     reasons at separate points, never conflate them); extraction is meaningful and always runs
-     for these.
+     launched: there is no pre-launch preflight check on `--resume` at all anymore (the
+     `resume_thread_not_found` check that used to sit here, and the separate post-launch
+     `rollout_not_found` failure, are both gone — a dead/unknown `--resume` threadId now simply
+     surfaces via whatever the actual dispatch attempt produces); extraction is meaningful and
+     always runs for these.
    Either skip path means this group's contribution to `investigation_evidence` is simply absent
    (see step 3's merge behavior for what that means in parallel mode) — never a zero-command
    placeholder standing in for "nothing actually happened":

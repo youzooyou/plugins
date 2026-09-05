@@ -5,8 +5,10 @@
 # git-environment/config isolation gap fixed alongside this suite, PLUS
 # (see the "post-dispatch reason fixtures" section near the bottom) the 7
 # `reason` values that can only occur AFTER a `codex exec` subprocess has
-# actually started (interrupted, timeout, nonzero_exit,
-# missing_task_complete, no_final_answer, invalid_json, schema_mismatch).
+# actually started (no_thread_started, timeout, nonzero_exit,
+# missing_task_complete, no_final_answer, invalid_json, schema_mismatch --
+# NOT `interrupted`, which can fire at any point in the wrapper's own
+# execution, including before a subprocess is ever launched).
 # The first set of fixtures fails or short-circuits before the wrapper
 # would ever dispatch to Codex; the post-dispatch set substitutes
 # tests/fixtures/fake-codex for the real `codex` binary (via a PATH
@@ -53,13 +55,6 @@ if printf '%s' "$OUT" | grep -q '"reason":"bad_args"'; then
   pass "--resume without --cwd is rejected"
 else
   fail "--resume without --cwd should be rejected with bad_args, got: $OUT"
-fi
-
-OUT="$("$WRAPPER" --cwd /tmp --resume definitely-not-a-real-thread-id --focus 'x' 2>&1)"
-if printf '%s' "$OUT" | grep -q '"reason":"resume_thread_not_found"'; then
-  pass "--resume on a nonexistent threadId returns resume_thread_not_found"
-else
-  fail "expected resume_thread_not_found, got: $OUT"
 fi
 
 OUT1="$("$WRAPPER" --cleanup definitely-not-a-real-thread-id 2>&1)"
@@ -166,8 +161,8 @@ rm -rf "$TMP_REPO" "$DECOY_REPO" "$SAFE_GIT_HOME"
 # into $PATH once, for the whole file, at the top -- so run-ccs-review.sh
 # genuinely spawns and observes a subprocess, exercising the 7 `reason`
 # values that can only be produced after that subprocess has actually
-# started. Only $FAKE_HOME (the isolated $HOME/.codex/sessions root) is
-# specific to this section.
+# started. Only $FAKE_HOME (an isolated $HOME, so this suite never touches
+# the real Codex CLI's own state) is specific to this section.
 
 FAKE_HOME="$(mktemp -d)"
 
@@ -176,27 +171,12 @@ must git -C "$PD_REPO" init -q
 must git -C "$PD_REPO" -c user.email=test@example.com -c user.name=test commit --allow-empty -q -m init
 echo "line" > "$PD_REPO/f.txt" || { echo "SETUP FAILED: writing PD_REPO/f.txt" >&2; exit 1; }
 
-# pd_new_tid -> a fresh unique id for a --resume fixture's pre-seeded
-# rollout file. Doesn't need to look like a real Codex thread id (nothing
-# here parses its shape), just be unique and filename-safe.
+# pd_new_tid -> a fresh unique id for a --resume fixture to pass as its
+# threadId. Doesn't need to look like a real Codex thread id, or correspond
+# to anything the wrapper or fake-codex actually look up (the wrapper no
+# longer preflight-checks --resume against anything) -- just unique text.
 pd_new_tid() {
   python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || echo "pd-$$-${RANDOM}"
-}
-
-# pd_seed_resume_rollout THREAD_ID -> pre-creates an empty rollout file for
-# THREAD_ID under $FAKE_HOME so --resume's own resolve_rollout() lookup
-# succeeds before dispatch even happens. A real `codex exec resume`
-# continuation always has a pre-existing rollout to append to; every
-# --resume fixture below needs one too, or it would fail with
-# resume_thread_not_found before ever reaching the post-dispatch behavior
-# this section exists to test. tests/fixtures/fake-codex resolves and
-# appends to this SAME file (it duplicates the wrapper's own
-# resolve_rollout() lookup) rather than creating a second one.
-pd_seed_resume_rollout() {
-  local tid="$1" day_dir
-  day_dir="$FAKE_HOME/.codex/sessions/$(date +%Y/%m/%d)"
-  mkdir -p "$day_dir"
-  : > "$day_dir/rollout-fake-${tid}.jsonl"
 }
 
 # pd_run fresh [ARGS...]              -- fresh dispatch against $PD_REPO
@@ -257,7 +237,6 @@ else
 fi
 
 TID="$(pd_new_tid)"
-pd_seed_resume_rollout "$TID"
 OUT="$(pd_run resume "$TID")"
 if [ "$(printf '%s' "$OUT" | tail -1 | jq -r '.ok')" = "true" ]; then
   pass "sanity: resume normal-success dispatch returns ok:true"
@@ -348,7 +327,7 @@ pd_test_interrupted() {
   unset FAKE_CODEX_SCENARIO FAKE_CODEX_SLEEP_SECS FAKE_CODEX_MARKER_FILE
 }
 pd_test_interrupted fresh
-TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+TID="$(pd_new_tid)"
 pd_test_interrupted resume "$TID"
 
 # --- interrupted coverage regression: a fresh dispatch interrupted AFTER
@@ -380,7 +359,7 @@ OUT="$(pd_run fresh --timeout 1)"
 pd_assert_reason "$OUT" "timeout" "timeout (fresh)"
 pd_assert_threadid_present "$OUT" "timeout (fresh)"
 
-TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+TID="$(pd_new_tid)"
 OUT="$(pd_run resume "$TID" --timeout 1)"
 pd_assert_reason "$OUT" "timeout" "timeout (resume)"
 pd_assert_threadid_present "$OUT" "timeout (resume)"
@@ -414,7 +393,7 @@ for CODE in 1 3; do
   pd_assert_reason "$OUT" "nonzero_exit" "nonzero_exit (fresh, exit=$CODE)"
   pd_assert_threadid_present "$OUT" "nonzero_exit (fresh, exit=$CODE)"
 
-  TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+  TID="$(pd_new_tid)"
   OUT="$(pd_run resume "$TID")"
   pd_assert_reason "$OUT" "nonzero_exit" "nonzero_exit (resume, exit=$CODE)"
   pd_assert_threadid_present "$OUT" "nonzero_exit (resume, exit=$CODE)"
@@ -440,19 +419,19 @@ OUT="$(pd_run fresh)"
 pd_assert_reason "$OUT" "missing_task_complete" "missing_task_complete (fresh)"
 pd_assert_threadid_present "$OUT" "missing_task_complete (fresh)"
 
-TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+TID="$(pd_new_tid)"
 OUT="$(pd_run resume "$TID")"
 pd_assert_reason "$OUT" "missing_task_complete" "missing_task_complete (resume)"
 pd_assert_threadid_present "$OUT" "missing_task_complete (resume)"
 unset FAKE_CODEX_SCENARIO
 
-# --- no_final_answer: task_complete appears, but no final_answer message.
+# --- no_final_answer: turn.completed appears, but -o never gets a final message.
 export FAKE_CODEX_SCENARIO=no_final_answer
 OUT="$(pd_run fresh)"
 pd_assert_reason "$OUT" "no_final_answer" "no_final_answer (fresh)"
 pd_assert_threadid_present "$OUT" "no_final_answer (fresh)"
 
-TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+TID="$(pd_new_tid)"
 OUT="$(pd_run resume "$TID")"
 pd_assert_reason "$OUT" "no_final_answer" "no_final_answer (resume)"
 pd_assert_threadid_present "$OUT" "no_final_answer (resume)"
@@ -472,7 +451,7 @@ for VARIANT in "${PD_INVALID_JSON_VARIANTS[@]}"; do
   pd_assert_reason "$OUT" "invalid_json" "invalid_json (fresh, variant $i)"
   pd_assert_threadid_present "$OUT" "invalid_json (fresh, variant $i)"
 
-  TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+  TID="$(pd_new_tid)"
   OUT="$(pd_run resume "$TID")"
   pd_assert_reason "$OUT" "invalid_json" "invalid_json (resume, variant $i)"
   pd_assert_threadid_present "$OUT" "invalid_json (resume, variant $i)"
@@ -545,7 +524,7 @@ done
 for NAME_IDX in 0 1; do
   NAME="${PD_SCHEMA_MISMATCH_NAMES[$NAME_IDX]}"
   JSON="${PD_SCHEMA_MISMATCH_JSON[$NAME_IDX]}"
-  TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+  TID="$(pd_new_tid)"
   export FAKE_CODEX_SCENARIO=schema_mismatch FAKE_CODEX_FINAL_ANSWER="$JSON"
   OUT="$(pd_run resume "$TID")"
   pd_assert_reason "$OUT" "schema_mismatch" "schema_mismatch (resume, $NAME)"
@@ -718,7 +697,7 @@ fi
 IE_CMD1R='grep -rn "foo $HOME" src/dir'
 IE_CMD2R='cat package.json'
 IE_CMD3R='npm test -- --watch=false'
-TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+TID="$(pd_new_tid)"
 CAPTURE_DIR="$(mktemp -d)"; CAPTURE_PATH="$CAPTURE_DIR/eventlog.jsonl"
 export FAKE_CODEX_SCENARIO=normal FAKE_CODEX_COMMANDS="$IE_CMD1R
 $IE_CMD2R

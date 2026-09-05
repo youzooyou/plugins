@@ -78,8 +78,8 @@ The wrapper prints exactly one line of JSON:
 
 - `{"ok":false,"reason":"...","threadId":"...","detail":"..."}` — the run
   itself failed (bad arguments, no thread ever started, timeout, nonzero
-  exit, missing task-complete event, an unresolvable rollout file, no final
-  answer found, or an invalid-JSON final answer). Report this as a failed
+  exit, missing `turn.completed` event, no final answer written, or an
+  invalid-JSON final answer). Report this as a failed
   run, never as a clean verdict. `threadId` may be present even on failure —
   hang onto it when it is, since a failed round can still have left a
   thread on disk that needs `--cleanup`.
@@ -102,10 +102,14 @@ and `--cleanup` possible.
 
 Put only the new question in `--focus` — the diff and every prior finding
 are already in the thread's own context, and re-sending them defeats the
-entire point of resuming instead of starting fresh. An unknown or
-already-cleaned-up `threadId` fails fast (`"reason":"resume_thread_not_found"`)
-before any Codex call is dispatched, so a mistaken `--resume` after cleanup
-is cheap to notice.
+entire point of resuming instead of starting fresh. There is no preflight
+check on `--resume`'s `threadId` before dispatch (this wrapper does not look
+up or validate it against anything of its own): an unknown or
+already-cleaned-up `threadId` is instead discovered by actually attempting
+the dispatch, and surfaces as whatever that real attempt produces —
+`"reason":"nonzero_exit"` (never `"reason":"no_thread_started"`, whose only
+branch requires a FRESH dispatch's empty threadId, structurally unreachable
+once a `--resume` call has already assigned it from the given threadId).
 
 ### 3. Clean up — the caller's job, not automatic
 
@@ -121,8 +125,8 @@ no more `--resume` calls coming for this thread — clean it up exactly once:
 
 Call this **only after the last round of a given review**, never after an
 intermediate one — cleaning up after round 1 and then trying to `--resume`
-for round 2 will fail with `resume_thread_not_found`, because the thread and
-its rollout file are already gone. If cleanup itself fails
+for round 2 will fail (`nonzero_exit`), because the thread and its rollout
+file are already gone. If cleanup itself fails
 (`{"ok":false,"reason":"cleanup_failed",...}`), surface that to the user
 rather than swallowing it — an undeleted thread means that review's full
 diff/code content is still sitting on disk under `~/.codex/sessions/`.
