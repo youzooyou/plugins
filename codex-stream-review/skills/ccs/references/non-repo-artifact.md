@@ -103,7 +103,8 @@
 ---
 
 **Non-repo artifact round?** Substitute the exact literal `CLEAN_REPO_DIR` path (see Phase 0 step
-4) for `$REPO_ROOT` in the `--cwd` argument above instead — never `$REPO_ROOT` for a genuine
+4) for `$REPO_ROOT` in the `--cwd` argument of `codex-stream-review/skills/ccs/SKILL.md`'s own
+Phase 1 Step 1 dispatch section instead — never `$REPO_ROOT` for a genuine
 non-repo-artifact review — and always keep `--uncommitted` (never `--base`/`--commit`, since
 `CLEAN_REPO_DIR` has no commits to diff against). **Also run the git-environment sanitization
 loop defined in `codex-stream-review/skills/ccs/SKILL.md`'s own Phase 1 Step 1 dispatch section,

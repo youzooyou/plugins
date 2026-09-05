@@ -101,7 +101,8 @@ and never exits the loop on its own separate cadence.
   illustrated; in the actual log line it is one sibling field alongside `session_id`/`round`/
   `target`/etc., exactly as in the full single-reviewer example above.)
   `thread_id` is the durable backstop for
-  `GROUP_THREADS` (see Phase 1 Step 1 above) — `jq '.groups[] | {group, thread_id}'` on the
+  `GROUP_THREADS` (see `codex-stream-review/skills/ccs/SKILL.md`'s own Phase 1 Step 1) —
+  `jq '.groups[] | {group, thread_id}'` on the
   latest round's log line re-derives the group→thread mapping if memory is ever in doubt.
   What the top-level `target.focus`/`codex_review` fields hold for a parallel round, so a consumer
   reading only the top-level fields still gets a reasonable, non-misleading summary: `target.focus`
@@ -122,8 +123,9 @@ and never exits the loop on its own separate cadence.
   this aggregate field says.
   **`investigation_evidence`, when capture-evidence is ON for this session, is still a single
   top-level sibling field on the round's line — never nested per-group inside `groups[]` itself.**
-  Each dispatched group produces its own `INVESTIGATION_EVIDENCE_JSON` (see "Investigation
-  evidence capture" above), but the round's single `investigation_evidence` field is always the
-  one, already-merged-across-groups value from that section's step 3 — the same merge-once
+  Each dispatched group produces its own `INVESTIGATION_EVIDENCE_JSON` (see
+  `codex-stream-review/skills/ccs/references/capture-evidence.md`'s "Investigation evidence
+  capture" section), but the round's single `investigation_evidence` field is always the
+  one, already-merged-across-groups value from that file's step 3 — the same merge-once
   pattern already used for `coverage_source` above, not a second, independently-invented merge
   rule.
