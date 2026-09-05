@@ -43,14 +43,24 @@ must() { "$@" || { echo "SETUP FAILED: $*" >&2; exit 1; }; }
 
 # --- wrapper contract regressions (arg parsing, no git/codex involved) ---
 
-OUT="$("$WRAPPER" --cwd /tmp --uncommitted --focus '' 2>&1)"
-if printf '%s' "$OUT" | grep -q '"reason":"bad_args"' && printf '%s' "$OUT" | grep -q 'require --focus'; then
-  pass "empty --focus is rejected"
+OUT="$(printf '' | "$WRAPPER" --cwd /tmp --uncommitted 2>&1)"
+if printf '%s' "$OUT" | grep -q '"reason":"bad_args"' && printf '%s' "$OUT" | grep -q 'non-empty focus text'; then
+  pass "empty focus (stdin) is rejected"
 else
-  fail "empty --focus should be rejected with bad_args, got: $OUT"
+  fail "empty focus (stdin) should be rejected with bad_args, got: $OUT"
 fi
 
-OUT="$("$WRAPPER" --resume some-thread-id --focus 'x' 2>&1)"
+# _focus_is_empty() strips ALL whitespace before judging emptiness -- a
+# focus value that is only spaces/tabs/newlines must be rejected exactly
+# like true EOF, never accepted as "there was something on stdin."
+OUT="$(printf ' \t\n  \n' | "$WRAPPER" --cwd /tmp --uncommitted 2>&1)"
+if printf '%s' "$OUT" | grep -q '"reason":"bad_args"' && printf '%s' "$OUT" | grep -q 'non-empty focus text'; then
+  pass "whitespace-only focus (stdin) is rejected"
+else
+  fail "whitespace-only focus (stdin) should be rejected with bad_args, got: $OUT"
+fi
+
+OUT="$(printf '%s' 'x' | "$WRAPPER" --resume some-thread-id 2>&1)"
 if printf '%s' "$OUT" | grep -q '"reason":"bad_args"'; then
   pass "--resume without --cwd is rejected"
 else
@@ -192,9 +202,9 @@ pd_run() {
     # --cwd is required on every invocation, even --resume (the wrapper's
     # own arg validation checks CWD unconditionally, and the dispatch
     # subshell always does `cd "$CWD"` before running codex).
-    PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --resume "$tid" --focus x "$@" 2>&1
+    printf '%s' x | PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --resume "$tid" "$@" 2>&1
   else
-    PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --uncommitted --focus x "$@" 2>&1
+    printf '%s' x | PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --uncommitted "$@" 2>&1
   fi
 }
 
@@ -272,14 +282,19 @@ pd_test_interrupted() {
   # kill the supervisor while the real wrapper (reparented to init) keeps
   # running unsignaled. Invoking "$WRAPPER" directly as the backgrounded
   # command keeps $! pointing at the real process.
+  # $! after backgrounding a pipeline is the PID of the pipeline's LAST
+  # command (the wrapper itself here, per bash's documented behavior) --
+  # piping focus text in via `printf | "$WRAPPER" ...` adds no extra
+  # supervisor process of the kind the comment above warns about, so
+  # wrapper_pid still points at the real $WRAPPER process.
   if [ "$mode" = "resume" ]; then
-    PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --resume "$tid" --focus x \
+    printf '%s' x | PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --resume "$tid" \
       > "$outfile" 2>&1 &
   elif [ -n "$capture_path" ]; then
-    PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --uncommitted --focus x \
+    printf '%s' x | PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --uncommitted \
       --capture-eventlog "$capture_path" > "$outfile" 2>&1 &
   else
-    PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --uncommitted --focus x \
+    printf '%s' x | PATH="$FAKE_BIN_DIR:$PATH" HOME="$FAKE_HOME" "$WRAPPER" --cwd "$PD_REPO" --uncommitted \
       > "$outfile" 2>&1 &
   fi
   wrapper_pid=$!

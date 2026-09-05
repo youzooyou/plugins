@@ -88,7 +88,7 @@
      exactly one group (`GROUP="main"`) against `CLEAN_REPO_DIR`.
 
      Dispatch every artifact-only round's wrapper call with `--cwd "<the exact literal
-     CLEAN_REPO_DIR path>" --uncommitted --focus "$FOCUS_TEXT"` in place of `--cwd "$REPO_ROOT"`
+     CLEAN_REPO_DIR path>" --uncommitted < "$FOCUS_FILE"` in place of `--cwd "$REPO_ROOT"`
      — see Phase 1 Step 1 below for exactly where this substitution applies. **A non-repo-
      artifact round always uses `--uncommitted` against `CLEAN_REPO_DIR`, never `--base`/
      `--commit`** — there is no commit in `CLEAN_REPO_DIR` to diff against, and round 2+ still

@@ -86,15 +86,16 @@ Claude and Codex are **equal peers**. Neither agent's findings are automatically
 Everything exchanged with Codex, all internal review/verification notes, and all progress
 narration are in **ENGLISH**. Only the **final report to the user (Phase 3) is Korean**.
 
-### `--focus` is required on every call, fresh or resumed
-`run-ccs-review.sh` rejects a call with empty/whitespace-only `--focus` with `bad_args`
-regardless of whether a scope flag or `--resume` was given — there is no "no diff and no focus"
-canned-CLEAN shortcut to fall back on in this wrapper. On a fresh round it frames the diff
-(Why/History/Scope, below); on a resumed round it carries only the new rebuttal/follow-up text
-— never the diff again, Codex already has it in the thread's own context.
+### Focus text (stdin) is required on every call, fresh or resumed
+`run-ccs-review.sh` reads the caller's focus/briefing text from its own stdin — not an argv
+`--focus` flag, which no longer exists — and rejects a call with empty/whitespace-only stdin
+content with `bad_args` regardless of whether a scope flag or `--resume` was given — there is no
+"no diff and no focus" canned-CLEAN shortcut to fall back on in this wrapper. On a fresh round it
+frames the diff (Why/History/Scope, below); on a resumed round it carries only the new
+rebuttal/follow-up text — never the diff again, Codex already has it in the thread's own context.
 
 ### `--cwd` is required on every call too, including `--resume`
-Unlike `--focus`, this is easy to miss: `run-ccs-review.sh` still requires `--cwd` on a resumed
+Unlike the focus text, this is easy to miss: `run-ccs-review.sh` still requires `--cwd` on a resumed
 call even though it never re-collects a diff — it uses `--cwd` only to `cd` into the repo before
 running `codex exec resume`. Never omit it on a resume dispatch.
 
@@ -105,23 +106,25 @@ running `codex exec resume`. Never omit it on a resume dispatch.
 The wrapper itself is unchanged by parallel mode — it has no group/dimension concept of its own
 and no file-filter flag. Parallel mode is purely a calling-convention on top of it: this skill
 simply invokes it N times concurrently within the same round, once per group, each with its own
-`--cwd`/scope-or-`--resume`/`--focus` and its own resulting thread (see Phase 1 below). Everything
-in this section applies identically to each of those N invocations.
+`--cwd`/scope-or-`--resume`/stdin focus text and its own resulting thread (see Phase 1 below).
+Everything in this section applies identically to each of those N invocations.
 
 Two mutually exclusive top-level modes:
 
 ### Mode 1 — a review round (fresh or resumed)
 
 ```
-run-ccs-review.sh --cwd <dir> {--uncommitted | --base <ref> | --commit <sha>} --focus <text> [--timeout <secs>]
-run-ccs-review.sh --cwd <dir> --resume <threadId> --focus <text> [--timeout <secs>]
+<focus text> | run-ccs-review.sh --cwd <dir> {--uncommitted | --base <ref> | --commit <sha>} [--timeout <secs>]
+<focus text> | run-ccs-review.sh --cwd <dir> --resume <threadId> [--timeout <secs>]
 ```
 
 - `--cwd <dir>` — **required**, every call.
 - Exactly one of `--uncommitted` / `--base <ref>` / `--commit <sha>` **or** `--resume <threadId>`
   — never both a scope flag and `--resume` together (`bad_args`: "`--resume` cannot be combined
   with `--uncommitted`/`--base`/`--commit`"). A scope flag is only meaningful on a fresh round.
-- `--focus <text>` — **required**, every call (see "Hard rules" above).
+- Focus text on **stdin** — **required**, every call (see "Hard rules" above). Not an argv flag —
+  `--focus` was removed; the wrapper reads its own stdin, in full, into a private temp file before
+  dispatching, and rejects the call with `bad_args` if that content is empty/whitespace-only.
 - `--timeout <secs>` — optional, positive integer, default `1800` (30 min). This skill does not
   pass it explicitly unless a round genuinely needs longer; the PID-liveness watcher's own wait
   bound (below) matches whatever value is actually used.
@@ -273,8 +276,8 @@ step a human needs to remember. See "Phase 3 — Terminal path" below.
 > **Discrepancy note:** this project's `task-2-brief.md` (the brief for the task that built this
 > wrapper) referenced an `--output-schema <path>` flag on it. The actual, current
 > `run-ccs-review.sh` has no such caller-facing flag — its argument parser only accepts `--cwd`, `--uncommitted`, `--base`,
-> `--commit`, `--focus`, `--resume`, `--timeout`, `--capture-eventlog`, and the separate
-> `--cleanup` mode. The JSON output schema (`schemas/review-verdict.schema.json`) is applied
+> `--commit`, `--resume`, `--timeout`, `--capture-eventlog`, and the separate
+> `--cleanup` mode (focus text arrives on stdin, not as an argv flag). The JSON output schema (`schemas/review-verdict.schema.json`) is applied
 > internally and unconditionally to every `codex exec` call the wrapper itself makes — it is not
 > a knob this skill or its caller ever sets. Trust the script: do not pass `--output-schema`.
 
@@ -298,9 +301,9 @@ skill.
 
 ## Sentinel-file safe-read idiom
 
-`--focus`, `--cwd`, and the resolved plugin install path all get built into a shell command
-string from values Claude does not fully control character-by-character (pasted content, a
-resolved filesystem path). Interpolating any of them directly into a double-quoted argument is
+`--cwd`, the resolved plugin install path, and other values Claude does not fully control
+character-by-character (pasted content, a resolved filesystem path) get built into a shell command
+string. Interpolating any of them directly into a double-quoted argument is
 exploitable — a value containing an embedded `"` followed by shell metacharacters breaks out of
 the intended argument and executes as a second statement. The fix is a file-plus-sentinel idiom —
 apply it consistently, everywhere in this file:
@@ -310,18 +313,26 @@ apply it consistently, everywhere in this file:
   'x'; } > "$FILE"` for a shell-resolved value (using `jq -j`, never `jq -r`, and `printf '%s'
   "$PWD"`, never `$(pwd)`, since `$(...)` unconditionally strips every trailing newline from its
   output — a bare `$(jq -r ...)`/`$(pwd)` could silently lose a real trailing newline that's part
-  of the actual value, e.g. a path that legitimately ends in one), or the
-  Write tool for Claude-composed text (`--focus`) — content on disk is exactly `<value>x`.
+  of the actual value, e.g. a path that legitimately ends in one).
 - Read it back everywhere it's consumed as `VALUE="$(cat "$FILE")"; VALUE="${VALUE%x}"`, never a
   bare `$(cat "$FILE")` inlined directly into a command.
 
-Apply this to exactly three values in this skill: the resolved plugin install path
-(`INSTALL_PATH_FILE`), the resolved repo root (`REPO_ROOT_FILE`), and each round's `--focus` text
-(`FOCUS_FILE`) — see Phase 0 and Phase 1 below for where each is allocated. `INSTALL_PATH_FILE`/
-`REPO_ROOT_FILE` are session-scoped (one each, for the whole run); `FOCUS_FILE` is scoped per
-`(round, GROUP)` — a parallel round allocates one `FOCUS_FILE` per dispatched group, each holding
-that group's own distinct `--focus` text (see Phase 1 Step 0 below). None of the three is ever
-hand-retyped as a `VAR="<value>"` literal anywhere in this skill.
+Apply this to exactly two values in this skill: the resolved plugin install path
+(`INSTALL_PATH_FILE`) and the resolved repo root (`REPO_ROOT_FILE`) — session-scoped, one each for
+the whole run — see Phase 0 below for where each is allocated. Neither is ever hand-retyped as a
+`VAR="<value>"` literal anywhere in this skill.
+
+**Each round's focus text (`FOCUS_FILE`) does NOT need this treatment, even though it's written
+with the same Write tool.** It is scoped per `(round, GROUP)` — a parallel round allocates one
+`FOCUS_FILE` per dispatched group, each holding that group's own distinct focus text (see Phase 1
+Step 0 below) — and for the actual dispatch, it is consumed by a direct stdin redirect
+(`< "$FOCUS_FILE"`) into `run-ccs-review.sh`, not a `$(cat "$FOCUS_FILE")` command substitution. A
+plain file redirect delivers the file's exact bytes with no trailing-newline-stripping risk — that
+risk is specific to `$(...)` command substitution, which the DISPATCH path never uses for
+`FOCUS_FILE`. (Phase 2's `FOCUS_LOG_TEXT` read below is a separate, later, best-effort use of this
+same file for the JSONL log only — see that section for why a plain, unstripped `$(cat ...)` is
+fine there specifically, even though it wouldn't be for the dispatch itself.) Write its exact
+intended content, with no sentinel appended.
 
 ---
 
@@ -662,7 +673,9 @@ pair (Step 0 above), so each group's early `THREAD_ID` signal and final JSON are
 every other group's, never just from each other within one group's own pair.
 
 Then, using the Write tool (never a shell redirect — see the sentinel idiom above), write this
-round's `--focus` text plus a trailing `x` sentinel into that group's own `FOCUS_FILE`:
+round's focus text — the exact intended content, no trailing sentinel needed (see the sentinel
+idiom section above for why `FOCUS_FILE` is the one exception) — into that group's own
+`FOCUS_FILE`:
 - **Round 1:** Why (the actual problem this task addresses) / Scope (what to specifically verify
   given what this diff touches) — there is no History yet. Fold in a `⚠️ SCOPE
   CONSTRAINT` block (do not open `node_modules/`/`.pnpm/`/vendor
@@ -704,7 +717,9 @@ PID_FILE="<this group's literal from step 0>"; OUT_FILE="<this group's literal f
 INSTALL_PATH_FILE="<literal from Phase 0>"; REPO_ROOT_FILE="<literal from Phase 0>"
 INSTALL_PATH="$(cat "$INSTALL_PATH_FILE")"; INSTALL_PATH="${INSTALL_PATH%x}"
 REPO_ROOT="$(cat "$REPO_ROOT_FILE")"; REPO_ROOT="${REPO_ROOT%x}"
-FOCUS_TEXT="$(cat "$FOCUS_FILE")"; FOCUS_TEXT="${FOCUS_TEXT%x}"
+# FOCUS_FILE itself (not a derived shell variable) is what gets redirected into the wrapper's own
+# stdin below -- see the sentinel idiom section above for why this one value needs no read-and-
+# strip step at all.
 # Same git-environment sanitization as the sizing step above (see "Determine review mode" and
 # Phase 0 step 4 for the full reasoning). This does NOT protect the wrapper's own internal
 # diff/show/rev-parse/hash-object calls -- those already run through git_safe() (see
@@ -735,14 +750,12 @@ done
 # in its place instead when that was the scope actually selected; never dispatch --uncommitted
 # here when a different scope was chosen:
 "$INSTALL_PATH/scripts/run-ccs-review.sh" --cwd "$REPO_ROOT" --uncommitted \
-  --focus "$FOCUS_TEXT" \
-  > "$OUT_FILE" 2>"$ERR_FILE" &
+  < "$FOCUS_FILE" > "$OUT_FILE" 2>"$ERR_FILE" &
 
 # Round 2+ (resume — same REPO_ROOT, same INSTALL_PATH; THREAD_ID is THIS GROUP's own captured id
 # from GROUP_THREADS, looked up by this group's slug — never another group's threadId):
 # "$INSTALL_PATH/scripts/run-ccs-review.sh" --cwd "$REPO_ROOT" --resume "<this group's literal THREAD_ID from GROUP_THREADS>" \
-#   --focus "$FOCUS_TEXT" \
-#   > "$OUT_FILE" 2>"$ERR_FILE" &
+#   < "$FOCUS_FILE" > "$OUT_FILE" 2>"$ERR_FILE" &
 
 CODEX_BG_PID=$!
 CODEX_START_TIME=$(ps -o lstart= -p "$CODEX_BG_PID" 2>/dev/null)
@@ -877,8 +890,15 @@ For each round, after Phase 1 delivers a result:
 6. **Narrate progress** — one English line: `Round R/20: Codex N findings → accepted A /
    rebutted B — <clean | continuing>` (aggregated across all groups this round, worst-case-wins,
    for a parallel round). **Construct this round's `groups[]` field** (parallel round only — see
-   "Review history log" below) from each dispatched group's own `--focus` text, `codex_review`
-   result, and `thread_id` kept from Phase 2 step 1 above (each group's JSON response carries its own
+   "Review history log" below) from each dispatched group's own focus text, `codex_review`
+   result, and `thread_id` kept from Phase 2 step 1 above. **For the `focus` value specifically,
+   read it directly from that group's own `FOCUS_FILE` at this point** —
+   `FOCUS_LOG_TEXT="$(cat "$FOCUS_FILE" 2>/dev/null)"` — no sentinel handling needed here (unlike
+   `INSTALL_PATH_FILE`/`REPO_ROOT_FILE`): this is a best-effort diagnostic/continuity value for a
+   natural-language field, not something requiring byte-exact fidelity, and losing a trailing
+   newline here is immaterial; `FOCUS_FILE` is still present at this point (the cleanup of this
+   round's `-focus.txt` temp files happens later in this same step, after the log line is
+   appended — see below). (each group's JSON response carries its own
    `threadId` whenever one exists — the reason table above shows exactly which failure reasons don't —
    the sole non-empty source `GROUP_THREADS` is established from; a failed group with no threadId in its
    response is instead represented and handled by the Guards flow below); a single-reviewer round has only one group's
@@ -1030,12 +1050,13 @@ meaning.
       earlier successful dispatch — whether that was this same round's own original attempt,
       before a subsequent resume-retry hit a no-`threadId` failure, or an earlier round entirely):
       a `--resume` call CAN still fail with no `threadId` in its own failure JSON (e.g. `bad_args`
-      from a malformed `--focus`, caught during argument validation *before* the wrapper ever
-      touches the resumed thread — confirmed directly from the wrapper's own argument-parsing
-      order). That existing thread is untouched, not abandoned, by this kind of failure — retry
+      from empty/whitespace-only focus text on stdin, caught right after the wrapper reads its own
+      stdin *before* it ever touches the resumed thread — confirmed directly from the wrapper's
+      own dispatch order). That existing thread is untouched, not abandoned, by this kind of
+      failure — retry
       the exact same `--resume "<this group's existing threadId from GROUP_THREADS>"` call again
-      (correcting whatever caused the bad response, e.g. a genuinely non-empty `--focus` this
-      time), never a "fresh" scope flag (there is none to use once a group has ever been resumed)
+      (correcting whatever caused the bad response, e.g. genuinely non-empty focus text on stdin
+      this time), never a "fresh" scope flag (there is none to use once a group has ever been resumed)
       and never anything added to `LEAKED_THREAD_IDS` (nothing was actually abandoned). If the
       retry also fails, stop — report **⚠️ COULD NOT VERIFY**.
   - **A `threadId` WAS captured, and the reason is resume-safe** (`interrupted`, `timeout`,
@@ -1065,14 +1086,14 @@ meaning.
     attempt — the eventual `ok:true` result coming from the `--resume` retry does not change that.
     (For a round-2+ resume-safe failure, there is nothing to capture here: that attempt was itself
     already a `--resume` call, so it never carried `coverage.source` in the first place.)
-    Wait 5s, then — using the SAME sentinel-file `--focus` idiom every other
-    dispatch in this file already uses, never a value interpolated directly:
+    Wait 5s, then — using the Write tool to write a fresh `FOCUS_FILE` exactly like Phase 1 Step 0
+    (no sentinel needed — see the sentinel idiom section above for why `FOCUS_FILE` is the one
+    exception), then redirecting it into the wrapper's own stdin, never a value interpolated
+    directly:
     ```
     FOCUS_FILE="<a fresh mktemp'd path, written via the Write tool exactly like Phase 1 Step 0 --
-    content is the SAME ⚠️ SCOPE CONSTRAINT block every round's --focus already requires, plus a
-    short note: retrying after a <reason> failure -- please provide your review, plus the trailing
-    x sentinel>"
-    FOCUS_TEXT="$(cat "$FOCUS_FILE")"; FOCUS_TEXT="${FOCUS_TEXT%x}"
+    content is the SAME ⚠️ SCOPE CONSTRAINT block every round's focus text already requires, plus a
+    short note: retrying after a <reason> failure -- please provide your review>"
     # If capture-evidence is ON for this session, literally include --capture-eventlog "<a
     # freshly-mktemp'd EVENTLOG_FILE, same template as Phase 1 Step 0 -- NOT the original round's
     # already-consumed one>" here too -- this retry is its own separate codex exec process with
@@ -1081,7 +1102,7 @@ meaning.
     # when capture is OFF, same rule as Step 1.
     "$INSTALL_PATH/scripts/run-ccs-review.sh" --cwd "$REPO_ROOT_OR_CLEAN_REPO_DIR" \
       --resume "<that threadId>" --timeout 300 \
-      --focus "$FOCUS_TEXT"
+      < "$FOCUS_FILE"
     ```
     **Multi-attempt evidence handling (general rule, only relevant with capture-evidence ON —
     applies identically to every retry variant in this Guards section, resume or fresh):** when
@@ -1179,7 +1200,7 @@ omitted entirely, and so is `investigation_evidence`, exactly as shown below:
   "round": 1,
   "ts": "2026-09-03T14:31:05+09:00",
   "thread_id": "<this round's own threadId>",
-  "target": {"repo": "<repo root>", "scope": "uncommitted", "focus": "<the --focus text sent this round>"},
+  "target": {"repo": "<repo root>", "scope": "uncommitted", "focus": "<the focus text sent this round>"},
   "codex_review": {"ok": true, "verdict": "ISSUES", "findings": [
     {"id": "f1", "file": "...", "line": 42, "severity": "high", "summary": "...", "evidence": "...", "linked_finding_id": null}
   ]},

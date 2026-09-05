@@ -78,7 +78,6 @@ if [ "${1:-}" = "--cleanup" ]; then
 fi
 
 CWD=""
-FOCUS=""
 RESUME_THREAD_ID=""
 SCHEMA=""
 
@@ -87,9 +86,6 @@ while [ $# -gt 0 ]; do
     --cwd)
       [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--cwd requires a value"}\n'; exit 1; }
       CWD="$2"; shift 2 ;;
-    --focus)
-      [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--focus requires a value"}\n'; exit 1; }
-      FOCUS="$2"; shift 2 ;;
     --resume)
       [ $# -ge 2 ] || { printf '{"ok":false,"reason":"bad_args","detail":"--resume requires a value"}\n'; exit 1; }
       case "$2" in
@@ -109,8 +105,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "$CWD" ] || [ -z "$FOCUS" ]; then
-  printf '{"ok":false,"reason":"bad_args","detail":"require --cwd and --focus"}\n'
+if [ -z "$CWD" ]; then
+  printf '{"ok":false,"reason":"bad_args","detail":"require --cwd"}\n'
   exit 1
 fi
 
@@ -118,6 +114,30 @@ TEMP_FILE_REGISTRY="$(mktemp)"
 trap cleanup_temp_files EXIT
 trap on_signal INT TERM
 set -m
+
+# Read this wrapper's OWN stdin, in full, into a private file -- this IS
+# the focus/prompt text (--focus no longer exists as an argv flag: a value
+# passed via argv sits in this process's own argv for its entire lifetime,
+# up to DEFAULT_TIMEOUT_SECS, visible to any other local user via
+# `ps -ef`/`/proc/<pid>/cmdline`; stdin has no such exposure). `cat >` here
+# is a plain byte-for-byte stream copy, never a `$(...)` command
+# substitution, so a real trailing newline in the caller's actual focus
+# text survives exactly.
+mktemp_registered FOCUS_RECEIVED_FILE
+cat > "$FOCUS_RECEIVED_FILE"
+
+# A plain `[ -s ... ]` (nonzero size) check would accept whitespace-only
+# stdin (e.g. a single space or newline) as "non-empty" -- strip all
+# whitespace from a copy before judging emptiness, matching
+# run-ccs-review.sh's own `_focus_is_empty()` semantics exactly. The
+# stripped copy is only ever used for this check; the real content sent to
+# `codex exec` still comes from $FOCUS_RECEIVED_FILE's own unmodified bytes.
+FOCUS_STRIPPED="$(cat "$FOCUS_RECEIVED_FILE")"
+FOCUS_STRIPPED="${FOCUS_STRIPPED//[[:space:]]/}"
+if [ -z "$FOCUS_STRIPPED" ]; then
+  printf '{"ok":false,"reason":"bad_args","detail":"require non-empty (non-whitespace-only) focus text on stdin"}\n'
+  exit 1
+fi
 
 # For --resume, the thread already exists -- nothing to pre-check: unlike
 # the removed rollout-file preflight, a genuinely dead/unknown threadId now
@@ -148,17 +168,19 @@ mktemp_registered LAST_MESSAGE_FILE
 # Round dispatch (Step 4, finalized flags -- do not add --sandbox or
 # model_reasoning_effort to resume: `codex exec resume --help` has no
 # --sandbox flag at all; the resumed turn inherits its thread's original
-# turn_context). `< /dev/null` on every invocation: codex exec otherwise
-# tries to read stdin for a `<stdin>` block and hangs forever waiting on EOF.
+# turn_context). No positional PROMPT argument on either form: per
+# `codex exec --help`, omitting it (or passing `-`) makes the CLI read its
+# instructions from stdin -- redirected here from $FOCUS_RECEIVED_FILE,
+# never passed as an argv value.
 (
   cd "$CWD" || exit 127
   if [ -n "$RESUME_THREAD_ID" ]; then
     codex exec resume "$RESUME_THREAD_ID" --json -o "$LAST_MESSAGE_FILE" \
-      ${SCHEMA:+--output-schema "$SCHEMA"} -- "$FOCUS" < /dev/null
+      ${SCHEMA:+--output-schema "$SCHEMA"} < "$FOCUS_RECEIVED_FILE"
   else
     codex exec --json --sandbox read-only -o "$LAST_MESSAGE_FILE" \
       -c model_reasoning_effort=xhigh ${SCHEMA:+--output-schema "$SCHEMA"} \
-      -- "$FOCUS" < /dev/null
+      < "$FOCUS_RECEIVED_FILE"
   fi
 ) > "$EVENTLOG" 2>&1 &
 CODEX_PID=$!
