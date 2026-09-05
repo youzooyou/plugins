@@ -9,7 +9,8 @@ description: Claude executes a task then runs a Claude+Codex adversarial cross-r
 `/ccs` slash command; it is invoked plugin-qualified, like every other plugin-supplied skill. Leave
 the task description empty to review the work just done in this session. Optional prefix:
 `codex-stream-review:ccs --capture-evidence <task description>` — opt-in investigation-evidence
-capture for every round of this session (see "Investigation evidence capture" below). Omit it and
+capture for every round of this session (see `references/capture-evidence.md`, read only when this
+flag is used). Omit it and
 `/ccs` behaves exactly as documented everywhere else in this file, with zero added fields anywhere.
 Any other free text is the TASK.
 
@@ -38,7 +39,8 @@ same mechanism, not a separate code path.
 
 ## Scope
 
-`--capture-evidence` is supported — see "Investigation evidence capture" below. No version-gating
+`--capture-evidence` is supported — see `references/capture-evidence.md` for its full mechanics,
+read only when this flag is used. No version-gating
 preflight is needed for it: `run-ccs-review.sh` has supported `--capture-eventlog <path>` since
 this wrapper's first release (confirmed directly — `grep -n capture-eventlog
 scripts/run-ccs-review.sh` finds it in the argument parser and the terminal-copy step both), so
@@ -117,8 +119,8 @@ run-ccs-review.sh --cwd <dir> --resume <threadId> --focus <text> [--timeout <sec
   pass it explicitly unless a round genuinely needs longer; the PID-liveness watcher's own wait
   bound (below) matches whatever value is actually used.
 - `--capture-eventlog <path>` — optional, best-effort raw event-log dump. Used by this skill only
-  when `--capture-evidence` was given for this session (see "Investigation evidence capture"
-  below) — omitted entirely otherwise.
+  when `--capture-evidence` was given for this session (see `references/capture-evidence.md`)
+  — omitted entirely otherwise.
 - A `--base`/`--commit` value starting with `-` is rejected (`bad_args`) as a git-option-
   injection guard; a `--resume` threadId starting with `-` is rejected the same way.
 
@@ -246,154 +248,17 @@ step a human needs to remember. See "Phase 3 — Terminal path" below.
 
 ## Investigation evidence capture (opt-in via `--capture-evidence`)
 
-**Off by default.** A normal `codex-stream-review:ccs <task description>` invocation (no
-`--capture-evidence` prefix) never touches anything in this section — no extra dispatch flag, no
-extra JSONL field, zero behavior change from everything else this file documents. Adapted to this
-skill's already-GROUP-aware temp-file conventions; no version-gating preflight is needed (see
-"Scope" above — `run-ccs-review.sh` has supported `--capture-eventlog` since its first release).
+**Off by default.** Full mechanics live in `references/capture-evidence.md`, read only when this
+session actually uses `--capture-evidence`.
 
-**What turns it on:** the one-time Phase 0 Step 0 decision above.
-
-**What it captures:** only the literal shell commands Codex actually ran during that round's
-investigation (e.g. `grep -rn foo src/`, `cat package.json`, `npm test`) — never their output,
-never file contents, never anything else from the raw event stream. This lets Claude's
-re-verification step (Phase 2, "Re-verify EACH finding against facts/evidence") cross-check a
-finding's self-reported "verification" narrative against what Codex actually ran, instead of
-trusting the claim at face value.
-
-**How it's captured, per (round, group) dispatch:**
-1. When capture is ON for this session, allocate a 5th temp file alongside
-   `PID_FILE`/`OUT_FILE`/`ERR_FILE`/`FOCUS_FILE` in Phase 1 Step 0, same template style, same
-   `GROUP` segment:
-   ```bash
-   EVENTLOG_FILE=$(mktemp "/tmp/ccs-${SESSION_ID}-round-<R>-${GROUP}-eventlog.jsonl.XXXXXX")
-   echo "EVENTLOG_FILE=$EVENTLOG_FILE"
-   ```
-   Then pass the exact literal resolved path as `--capture-eventlog "$EVENTLOG_FILE"` on THAT
-   group's Phase 1 Step 1 dispatch call — fresh or resumed, every round, not just round 1 (each
-   `run-ccs-review.sh` invocation is its own separate `codex exec`/`codex exec resume` process
-   with its own event log, whether or not the underlying Codex thread is being resumed). **This
-   applies to EVERY `run-ccs-review.sh` dispatch this file ever constructs, with no exception —
-   Phase 1 Step 1's own fresh/resume examples, AND every retry variant in Guards below** (the
-   no-threadId-yet fresh retry, the resume-safe bounded retry, the resume-retries-exhausted
-   fallback fresh retry, and the non-resume-safe immediate fresh retry): each is its own separate
-   process invocation and gets its own freshly-`mktemp`'d `EVENTLOG_FILE` the same way, never the
-   original round's already-consumed one, when capture is ON — see the Guards section's
-   resume-safe retry bullet for the one case (a genuine resume-retry succeeding) where more than
-   one eventlog for the same (round, group) needs an explicit rule for which one actually gets
-   extracted from.
-2. **Extract the command list and wrap it into the JSONL schema's required object shape, in ONE
-   `jq` call**, once that group's dispatch call has returned and its JSON stdout has been parsed.
-   The `investigation_evidence` field (see "Review history log" below) is an OBJECT —
-   `{"command_count": N, "commands": [...]}` — not a bare array. **First decide whether this
-   group's dispatch ever actually invoked `codex exec`/`codex exec resume` as a subprocess at
-   all — this is NOT the same question as whether `$EVENTLOG_FILE` is empty** (`mktemp`
-   pre-creates it as 0 bytes before the round even dispatches, so a genuinely-ran process that
-   issued zero commands and a process that never got that far look identical on disk). **`threadId`
-   presence means two DIFFERENT things depending on whether this was a fresh or a `--resume`
-   dispatch — never use one rule for both:**
-   - **Fresh dispatch:** `threadId` is only ever set once a real `thread.started` event actually
-     fires (confirmed from the wrapper's own fresh-dispatch code path) — its presence in the
-     result IS a reliable "a process genuinely started" signal here. Skip extraction only for
-     `bad_args`/`git_error`/`incomplete_collection`/`no_thread_started` (never carry a `threadId`
-     at all) or for `interrupted` specifically WITHOUT a `threadId` in the result (the signal
-     arrived before `thread.started` ever fired). Every other fresh-dispatch outcome — `ok:true`,
-     or `ok:false` with `threadId` present — means extraction is meaningful; run it, even if it
-     ends up reporting a real, honest zero.
-   - **`--resume` dispatch: `threadId` is asymmetric, and this skill still classifies by `reason`
-     alone rather than by `threadId` at all** — confirmed directly from the wrapper's own source:
-     `THREAD_ID` starts empty, is assigned exactly once — `THREAD_ID="$RESUME_THREAD_ID"` (the
-     caller's own input argument, echoed straight back), only after focus/scope validation has
-     already passed — and is never reassigned or cleared afterward on this path; `codex exec
-     resume` doesn't launch until later still. That makes an ABSENT `threadId` in a resume-dispatch
-     result a reliable negative: it can only happen before that one assignment, meaning this
-     invocation never reached the point of launching `codex exec resume` at all (a `bad_args`
-     failure — always before the signal trap is even installed — or a pre-assignment
-     `interrupted`). A PRESENT `threadId`, by contrast, is genuinely ambiguous — merely the echoed
-     input, it is present whether the failure landed microseconds after that echo (nothing
-     launched yet) or well after `codex exec resume` actually ran, so presence alone never confirms
-     a launch. This asymmetry doesn't change any actual extraction decision here, so `threadId` is
-     still never checked: `bad_args` and `resume_thread_not_found` are already skipped by `reason`
-     name alone (the former is always ID-less by the above, the latter is always ID-present but by
-     definition always pre-launch — see its own row in the reason table). `interrupted` is skipped
-     as the conservative choice either way it occurs — an ID-less occurrence is a confirmed
-     non-launch, and an ID-present occurrence is unresolvably ambiguous, so treating both alike
-     avoids a `threadId`-shaped special case for this one reason: reporting a fabricated
-     zero-command object for an investigation that may never have happened is worse than the
-     (typically rare, narrow-window) case of omitting a real-but-brief one. Every other reason —
-     `ok:true`,
-     `timeout`, `nonzero_exit`, `missing_task_complete`, `rollout_not_found`, `no_final_answer`,
-     `invalid_json`, `schema_mismatch` — can ONLY occur after `codex exec resume` genuinely
-     launched (`rollout_not_found` specifically is a POST-launch rollout re-resolution failure,
-     not the resume-only PRE-flight `resume_thread_not_found` check above — the two are separate
-     reasons at separate points, never conflate them); extraction is meaningful and always runs
-     for these.
-   Either skip path means this group's contribution to `investigation_evidence` is simply absent
-   (see step 3's merge behavior for what that means in parallel mode) — never a zero-command
-   placeholder standing in for "nothing actually happened":
-   ```bash
-   EVENTLOG_FILE="<this group's literal path from step 1 above, same round>"
-   if [ -s "$EVENTLOG_FILE" ]; then
-     INVESTIGATION_EVIDENCE_JSON=$(jq -Rn -c '
-       [inputs | fromjson? | select(.type == "item.completed" and .item.type == "command_execution") | .item.command]
-       | {command_count: length, commands: .}
-     ' "$EVENTLOG_FILE")
-   else
-     INVESTIGATION_EVIDENCE_JSON='{"command_count":0,"commands":[]}'
-   fi
-   ```
-   The ONLY bash-level capture here is the well-formed, complete JSON object as `jq`'s own stdout
-   via `$(...)` into `INVESTIGATION_EVIDENCE_JSON` — safe regardless of what characters the
-   captured commands contain, since the object is never disassembled into and reassembled from an
-   intermediate bash string; `jq` handles all JSON construction internally in one pass.
-   `fromjson?` swallows any unparseable line rather than erroring the whole extraction, so a
-   partial or malformed event log still yields whatever valid entries it contains. This group's own
-   `$INVESTIGATION_EVIDENCE_JSON` (when extraction ran at all) is the final value used at step 4
-   below for a single-reviewer round (see step 3 immediately below for the parallel-mode case).
-3. **Merge multiple groups' evidence into one object — parallel mode only.** The review history
-   log's schema has exactly ONE `investigation_evidence` object per ROUND, but a parallel round
-   dispatches more than one group, each producing its own separate `INVESTIGATION_EVIDENCE_JSON`
-   from step 2 — **or no value at all, for a group whose step 2 was skipped entirely** (its
-   dispatch never meaningfully started `codex exec`, per step 2's `ok`/`reason` check above). A
-   skipped group contributes NOTHING to the merge below — not a zero-value placeholder, simply
-   excluded from the list of values combined — same principle as step 2 itself, applied across
-   groups. **Common case — a single-reviewer round (`GROUP="main"`): nothing to merge**, use that
-   group's own value directly, unchanged, or omit `investigation_evidence` entirely from this
-   round's line if that one group's own step 2 was skipped. **Only when this round actually
-   dispatched more than one group AND at least one of them has a real value:** combine every
-   dispatched group's value into ONE merged object by summing `command_count` and concatenating
-   `commands` across groups, in one `jq` call:
-   ```bash
-   MERGED_INVESTIGATION_EVIDENCE_JSON=$(jq -sc '{command_count: (map(.command_count) | add), commands: (map(.commands) | add)}' <<< "$GROUP1_JSON
-   $GROUP2_JSON")
-   ```
-   (one heredoc line per group that actually produced a real value this round — a group whose
-   step 2 was skipped simply isn't one of the lines). If EVERY dispatched group's step 2 was
-   skipped this round, there is nothing to merge — omit `investigation_evidence` from that round's
-   line entirely, the same as the single-reviewer skip case above. Use the merged object — never
-   any single group's own value — as the one `investigation_evidence` field written into that
-   round's single JSONL line. A failure in this merge step follows the same best-effort discipline
-   as the rest of this section: note it once and omit `investigation_evidence` from that round's
-   line rather than blocking the round.
-4. **Delete the raw event-log copy right after extraction, best-effort:** `rm -f "$EVENTLOG_FILE"`
-   (per group, if parallel mode dispatched more than one). The intent is a strong privacy
-   contract — the raw event stream can echo back actual file contents Codex read during its
-   investigation, so only the extracted command strings are meant to persist, and only into the
-   existing review history log. A plain `rm -f` run after the fact has no atomicity or crash guard
-   around it: if this session is interrupted between the dispatch call finishing and this `rm -f`
-   executing, that round's raw event-log file is left behind — a real gap, bounded in practice by
-   the unconditional Phase 0 Step 0 sweep above (removed no later than the start of the next `/ccs`
-   invocation of any kind, at least 60 minutes later), not eliminated outright.
-
-**Where it's stored:** no new file, no new format. When capture is ON for this session, add the
-one optional `investigation_evidence` field to that round's existing JSONL line (see "Review
-history log" below), using the (possibly group-merged) `$INVESTIGATION_EVIDENCE_JSON` from above
-as that field's value. Same log, same append-only write, nothing new to create.
-
-**Failure isolation:** exactly the same best-effort discipline as the rest of this log — a `jq`
-failure in step 2/3's extraction/merge, a missing/empty event-log file, or a failed `rm` must
-never abort or degrade the review round. Note it once in that round's narration and continue with
-`investigation_evidence` simply omitted from that round's line.
+**Once Phase 0 Step 0 determines capture is ON for this session, your very next action — before
+doing anything else in this run — is to Read `codex-stream-review/skills/ccs/references/capture-evidence.md`
+in full.** That file's procedure is required at no fewer than four later points in this run (Phase
+1 Step 0's `EVENTLOG_FILE` allocation, Step 1's `--capture-eventlog` flag, Phase 2's extraction
+step, Guards' retry-time eventlog handling) — proceeding without having read it first will leave
+those points undocumented for this session. If capture is OFF for this session, never read this
+file and never touch anything it describes — zero behavior change from every other place in this
+skill.
 
 ---
 
@@ -871,7 +736,7 @@ echo "FOCUS_FILE=$FOCUS_FILE"
 ```
 
 **A 5th temp file, `EVENTLOG_FILE`, joins this same block only when capture-evidence is ON for
-this session** (Phase 0 Step 0's decision) — see "Investigation evidence capture" above for its
+this session** (Phase 0 Step 0's decision) — see `references/capture-evidence.md` for its
 exact template and how it's consumed; omitted entirely, every round, when capture is OFF.
 
 `GROUP` is baked into the `mktemp` *template* (not just the random suffix) — the
@@ -965,7 +830,7 @@ for _v in $(git rev-parse --local-env-vars 2>/dev/null || printf '%s\n' GIT_ALTE
 done
 
 # Capture-evidence is a Phase 0 Step 0 decision Claude already knows, not a live variable (see
-# that section and "Investigation evidence capture" above) -- if ON for this session, literally
+# that section and references/capture-evidence.md) -- if ON for this session, literally
 # include --capture-eventlog "<this group's literal EVENTLOG_FILE from Step 0>" as concrete text
 # in this same dispatch call (both the fresh and the resume form below); if OFF, literally omit
 # the flag entirely. Never write this as a variable-gated bash branch for a later call to
@@ -1152,7 +1017,7 @@ For each round, after Phase 1 delivers a result:
    result, and `thread_id` kept from Step 1/3 above; a single-reviewer round has only one group's
    result to carry forward, which becomes the round's own `target.focus`/`codex_review` directly,
    unchanged, with `groups[]` omitted entirely. **If capture-evidence is ON for this session**,
-   also run "Investigation evidence capture" steps 2-4 now, per dispatched group (extract via
+   also run `references/capture-evidence.md`'s steps 2-4 now, per dispatched group (extract via
    `jq`, merge across groups if this was a parallel round, delete the raw eventlog) — the
    resulting `investigation_evidence` object is one more field on this same round's line. Then
    append this round's line to the review history log (below), best-effort. Clean up this round's
@@ -1288,7 +1153,7 @@ meaning.
       possible on round 1, before that round's own first dispatch has ever returned a `threadId`):
       nothing exists to resume — retry the same scope flag fresh, exactly once (include
       `--capture-eventlog` with its own fresh `EVENTLOG_FILE` when capture is ON, same as every
-      dispatch — see "Investigation evidence capture" above). **If this is round 1 and the reason
+      dispatch — see `references/capture-evidence.md`). **If this is round 1 and the reason
       is `no_thread_started`, capture coverage from the failing attempt BEFORE dispatching that
       retry** — see the "Round 1 only — capture coverage from the failing attempt BEFORE
       retrying" note below; it applies here identically, even though `no_thread_started` never
@@ -1344,8 +1209,8 @@ meaning.
     # If capture-evidence is ON for this session, literally include --capture-eventlog "<a
     # freshly-mktemp'd EVENTLOG_FILE, same template as Phase 1 Step 0 -- NOT the original round's
     # already-consumed one>" here too -- this retry is its own separate codex exec process with
-    # its own event log, exactly like every other dispatch call in this file (see "Investigation
-    # evidence capture" above, including its multi-attempt handling note); omit the flag entirely
+    # its own event log, exactly like every other dispatch call in this file (see
+    # references/capture-evidence.md, including its multi-attempt handling note); omit the flag entirely
     # when capture is OFF, same rule as Step 1.
     "$INSTALL_PATH/scripts/run-ccs-review.sh" --cwd "$REPO_ROOT_OR_CLEAN_REPO_DIR" \
       --resume "<that threadId>" --timeout 300 \
@@ -1360,7 +1225,7 @@ meaning.
     EARLIER attempt's `EVENTLOG_FILE` too, without extracting from it, once the round concludes —
     a disclosed, deliberate simplification: any commands Codex ran during an earlier failed
     attempt before it failed are not merged into that round's evidence, only the final attempt's
-    are. This keeps the merge model in "Investigation evidence capture" above to exactly one value
+    are. This keeps the merge model in `references/capture-evidence.md` to exactly one value
     per (round, group) rather than needing a second, attempt-level merge layer on top of the
     existing group-level one — and still closes the privacy contract (every allocated eventlog
     this session ever creates is deleted, extracted from or not), just narrows what gets reported
@@ -1383,7 +1248,7 @@ meaning.
     - If both resume-retries are exhausted and this was **round 1**: fall back to one fresh retry
       of the original scope flag, for that group, abandoning the now-unrecoverable thread (this
       fresh retry gets its own new `--capture-eventlog`/`EVENTLOG_FILE` too, when capture is ON,
-      same as every dispatch — see "Investigation evidence capture" above).
+      same as every dispatch — see `references/capture-evidence.md`).
       **Append that abandoned `(GROUP, threadId)` pair to `LEAKED_THREAD_IDS`** — Claude remembers
       this set for the rest of the run, the same way `GROUP_THREADS`/`SESSION_ID` are remembered —
       so Phase 3's terminal path (below) can clean it up alongside the run's final threads; it is
@@ -1399,8 +1264,8 @@ meaning.
     attempt would just fail the same way again, wasting up to a full timeout for a result already
     known in advance): skip the resume-retry step entirely.
     - **Round 1:** retry the original scope flag fresh, exactly once, for that group (its own new
-      `--capture-eventlog`/`EVENTLOG_FILE` too, when capture is ON — see "Investigation evidence
-      capture" above) — append the now-confirmed-dead `(GROUP, threadId)` to `LEAKED_THREAD_IDS`
+      `--capture-eventlog`/`EVENTLOG_FILE` too, when capture is ON — see
+      `references/capture-evidence.md`) — append the now-confirmed-dead `(GROUP, threadId)` to `LEAKED_THREAD_IDS`
       (its rollout is already gone or unreachable, but the thread record itself may still need
       explicit `--cleanup` at the terminal path). If the fresh retry also fails, stop — report
       **⚠️ COULD NOT VERIFY**.
@@ -1440,8 +1305,8 @@ Claude is the sole writer/reader of this log — Codex never sees it.
 
 **Line schema (one JSON object per round)** — `target`,
 `codex_review`, `coverage_source`, `claude_verification`, `round_outcome`, and
-`investigation_evidence` when capture-evidence is ON for this session (see "Investigation
-evidence capture" above), plus `groups`, for a parallel round only, with one
+`investigation_evidence` when capture-evidence is ON for this session (see
+`references/capture-evidence.md`), plus `groups`, for a parallel round only, with one
 `ccs`-specific addition (`thread_id`). `target.scope` also gains
 one more legal value (`"resume"`) to describe what `/ccs` rounds 2+ actually do. **The common
 case — a single-reviewer round (`GROUP="main"`), capture-evidence OFF — is completely unchanged
@@ -1466,17 +1331,10 @@ omitted entirely, and so is `investigation_evidence`, exactly as shown below:
 }
 ```
 
-**With capture-evidence ON**, that same line gains one more sibling field, `investigation_evidence`
-— the `{"command_count": N, "commands": [...]}` object "Investigation evidence capture" above
-produces (group-merged first, for a parallel round):
-```json
-{"investigation_evidence": {"command_count": 3, "commands": ["grep -rn foo src/", "cat package.json", "npm test"]}}
-```
-(shown here as its own standalone object containing only the field being illustrated; in the
-actual log line it is one sibling field alongside `session_id`/`round`/`target`/etc., exactly as
-in the full example above.) Omitted entirely — never an empty `{"command_count":0,"commands":[]}`
-placeholder — when capture-evidence is OFF for this session, so a plain `jq 'has
-("investigation_evidence")'` on any line reliably tells whether that session had capture on.
+**With capture-evidence ON**, that same line gains one more sibling field,
+`investigation_evidence` — see `references/capture-evidence.md`'s JSONL field section (you already
+read this file per this session's capture-evidence decision above) for its exact shape and
+omission rule.
 
 - `thread_id`: the single-reviewer round's own `THREAD_ID` (`GROUP="main"`'s entry in
   `GROUP_THREADS`) — the exact same durable-backstop purpose the parallel case's `groups[].thread_id`
