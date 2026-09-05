@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Fake `codex` CLI -- a full drop-in for every way tests/test-run-ccs-review.sh
+# lets run-ccs-review.sh invoke a real `codex` binary, so that suite never
+# reaches the real Codex backend: no API calls, no network, regardless of
+# which wrapper code path (exec, exec resume, or delete --force) a given
+# fixture exercises.
+#
+# Invoked exactly the way run-ccs-review.sh invokes the real `codex`:
+#   codex exec --json --sandbox read-only -c model_reasoning_effort=xhigh \
+#     [--output-schema PATH] < PROMPT_FILE
+#   codex exec resume <threadId> --json [--output-schema PATH] < PROMPT_FILE
+#   codex delete --force -- <threadId>
+# All of that is accepted and ignored -- behavior here is selected purely
+# via env vars (FAKE_CODEX_*), since the wrapper controls our argv, not the
+# caller of this fixture. Stdin (the prompt) is never read; it's a plain
+# file redirect, not a pipe, so leaving it unread cannot block.
+#
+# Env vars:
+#   FAKE_CODEX_SCENARIO   normal | exit_nonzero | no_task_complete |
+#                         no_final_answer | invalid_json | schema_mismatch |
+#                         hang   (default: normal)
+#   FAKE_CODEX_EXIT_CODE  exit code for exit_nonzero (default: 1)
+#   FAKE_CODEX_SLEEP_SECS sleep duration: hang's stall, or a short settle
+#                         delay before exit for the rollout-writing
+#                         scenarios (default depends on scenario)
+#   FAKE_CODEX_FINAL_ANSWER  raw text written as the rollout's final_answer
+#                         content, for normal/invalid_json/schema_mismatch
+#                         (default: a schema-conformant CLEAN verdict)
+#   FAKE_CODEX_MARKER_FILE  if set, touched immediately on start so a test
+#                         can detect "dispatch genuinely began" (needed for
+#                         --resume, which has no thread.started event to
+#                         poll for)
+set -u
+
+# `codex delete --force -- <threadId>` (run-ccs-review.sh's --cleanup mode)
+# is a completely separate subcommand from `exec`/`exec resume` -- handled
+# here, first, so this fixture is a full drop-in for every way the wrapper
+# ever invokes `codex`, not just its exec paths. Always fails (nonzero
+# exit): every caller of --cleanup in this test suite passes a
+# deliberately nonexistent threadId, so "delete failed" is the realistic,
+# correct simulated outcome, not a special case invented for this fixture.
+if [ "${1:-}" = "delete" ]; then
+  echo "fake-codex: no such thread" >&2
+  exit 1
+fi
+
+[ -n "${FAKE_CODEX_MARKER_FILE:-}" ] && : > "$FAKE_CODEX_MARKER_FILE"
+
+MODE=fresh
+RESUME_ID=""
+if [ "${2:-}" = "resume" ]; then
+  MODE=resume
+  RESUME_ID="${3:-}"
+fi
+
+SCENARIO="${FAKE_CODEX_SCENARIO:-normal}"
+
+# find_rollout <threadId> -- deliberately duplicates run-ccs-review.sh's
+# own resolve_rollout() rather than sourcing it: this fixture must behave
+# as a standalone drop-in binary, exactly like the real `codex` it
+# replaces, never assuming access to the wrapper's internals.
+find_rollout() {
+  local tid="$1" f
+  f="$(find "$HOME/.codex/sessions/$(date +%Y/%m/%d 2>/dev/null)" -maxdepth 1 -name "rollout-*-${tid}.jsonl" 2>/dev/null | head -1)"
+  if [ -n "$f" ]; then
+    printf '%s' "$f"
+    return 0
+  fi
+  find "$HOME/.codex/sessions" -name "rollout-*-${tid}.jsonl" 2>/dev/null | head -1
+}
+
+if [ "$MODE" = "resume" ]; then
+  THREAD_ID="$RESUME_ID"
+  ROLLOUT="$(find_rollout "$THREAD_ID")"
+  # No thread.started to emit (the wrapper never polls for one on
+  # --resume), but printing something distinctive still lets a
+  # --capture-eventlog test confirm the eventlog holds this process's raw
+  # output.
+  echo "FAKE_CODEX_RESUME_MODE thread_id=$THREAD_ID"
+else
+  THREAD_ID="$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null)"
+  [ -n "$THREAD_ID" ] || THREAD_ID="fake-$$-${RANDOM}"
+  jq -nc --arg tid "$THREAD_ID" '{type: "thread.started", thread_id: $tid}'
+  DAY_DIR="$HOME/.codex/sessions/$(date +%Y/%m/%d)"
+  mkdir -p "$DAY_DIR"
+  ROLLOUT="$DAY_DIR/rollout-fake-${THREAD_ID}.jsonl"
+  : > "$ROLLOUT"
+fi
+
+if [ -z "$ROLLOUT" ]; then
+  echo "fake-codex: could not resolve a rollout file for threadId $THREAD_ID" >&2
+  exit 1
+fi
+
+write_task_complete() {
+  printf '%s\n' '{"type":"event_msg","payload":{"type":"task_complete"}}' >> "$ROLLOUT"
+}
+write_final_answer() {
+  jq -nc --arg text "$1" \
+    '{type: "response_item", payload: {type: "message", phase: "final_answer", content: [{type: "output_text", text: $text}]}}' \
+    >> "$ROLLOUT"
+}
+
+# settle_before_exit -- a delay before exiting, required (not cosmetic)
+# ONLY for a FRESH dispatch: the wrapper's post-dispatch while loop
+# resolves $ROLLOUT and counts task_complete events INSIDE its loop body,
+# which only runs while `kill -0 "$CODEX_PID"` still succeeds. If this
+# process has already exited by the time the wrapper's fresh-dispatch
+# thread.started poll (up to a few hundred ms, in ~0.5s steps) finishes
+# and that loop gets its first check, the loop body never runs even once
+# and the already-written task_complete line is never counted. A real
+# `codex exec` naturally takes much longer than that, so this just models
+# realistic timing with a safe margin over that poll interval. A --resume
+# dispatch has no such requirement (its $ROLLOUT is already resolved
+# before dispatch, so the wrapper's post-loop recheck picks up
+# task_complete regardless of loop-body timing) -- skipped there to keep
+# resume-mode fixtures fast.
+settle_before_exit() {
+  local default=0
+  [ "$MODE" = "fresh" ] && default=1.5
+  sleep "${FAKE_CODEX_SLEEP_SECS:-$default}"
+}
+
+DEFAULT_VERDICT='{"verdict":"CLEAN","findings":[],"summary":null,"dimensions":{"correctness":{"status":"not_applicable","evidence":"e"},"security":{"status":"not_applicable","evidence":"e"},"performance":{"status":"not_applicable","evidence":"e"},"reuse":{"status":"not_applicable","evidence":"e"},"contracts":{"status":"not_applicable","evidence":"e"},"resources_concurrency":{"status":"not_applicable","evidence":"e"},"intent":{"status":"not_applicable","evidence":"e"}}}'
+FINAL_ANSWER="${FAKE_CODEX_FINAL_ANSWER:-$DEFAULT_VERDICT}"
+
+case "$SCENARIO" in
+  hang)
+    # Used for `timeout` (the wrapper's own --timeout deadline fires while
+    # this is still sleeping) and `interrupted` (the test sends SIGTERM to
+    # the WRAPPER, not to us, while we're still running).
+    sleep "${FAKE_CODEX_SLEEP_SECS:-30}"
+    exit 0
+    ;;
+  exit_nonzero)
+    exit "${FAKE_CODEX_EXIT_CODE:-1}"
+    ;;
+  no_task_complete)
+    # Exit clean without ever writing task_complete.
+    exit 0
+    ;;
+  no_final_answer)
+    write_task_complete
+    settle_before_exit
+    exit 0
+    ;;
+  invalid_json|schema_mismatch|normal)
+    write_task_complete
+    write_final_answer "$FINAL_ANSWER"
+    settle_before_exit
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
