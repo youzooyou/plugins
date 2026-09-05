@@ -66,6 +66,13 @@ Claude and Codex are **equal peers**. Neither agent's findings are automatically
 - A finding is valid only when **both agents agree** based on evidence.
 - **Converge by negotiation, not concession.** Never fake agreement; a real surviving disagreement is reported honestly, not smoothed over.
 - **Report only a clean result** — or, if the 20-round cap is hit first, report the remaining disagreements honestly.
+- **Disclose verification limits BEFORE the claim, never after.** If a finding, rebuttal, or
+  verification note rests on incomplete verification (e.g., a read-only sandbox preventing a
+  direct check, a claim inferred rather than directly tested), say so as the FIRST sentence —
+  never append it as a trailing caveat once the confident claim has already been stated. A claim
+  stated first and only walked back later, after direct re-verification, is a real failure mode
+  observed in practice, not a hypothetical one — leading with the limitation lets the other side
+  weigh it before treating the claim as settled, instead of after.
 
 > Codex is read-only for the whole run (`--sandbox read-only` on the fresh round; a resumed round
 > inherits that same sandbox with no flag of its own — `codex exec resume` has none). Claude
@@ -636,7 +643,10 @@ round's `--focus` text plus a trailing `x` sentinel into that group's own `FOCUS
   `run-ccs-review.sh`'s own prompt template does not add it for you. **State the collaboration
   frame in this same Round-1 `--focus` text too**: Claude
   and Codex are equal peers, findings must be evidence-based (file:line + why), and the goal is
-  100% clean mutual agreement.
+  100% clean mutual agreement. (The disclosure-ordering requirement below is instead enforced via
+  `run-ccs-review.sh`'s own trusted prompt template, not restated here — `--focus` content sits
+  inside that prompt's untrusted-data boundary, so an instruction placed only here would reach
+  Codex as informational context rather than a binding rule.)
   - **Parallel mode:** see `references/parallel-mode.md`'s "Round-1 focus text" section
     (you already read this file per the parallel-mode decision above) for how each group's Scope
     text differs.
