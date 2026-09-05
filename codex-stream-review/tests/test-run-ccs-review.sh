@@ -342,14 +342,14 @@ pd_test_interrupted resume "$TID"
 # that the normal (non-signal) code path uses -- so a signal-interrupted
 # round never populates the requested capture path. Worth locking in
 # explicitly rather than leaving it an unverified assumption.
-CAPTURE_PATH="$(mktemp -u)"
+CAPTURE_DIR="$(mktemp -d)"; CAPTURE_PATH="$CAPTURE_DIR/eventlog.jsonl"
 pd_test_interrupted fresh "" "$CAPTURE_PATH"
 if [ ! -e "$CAPTURE_PATH" ]; then
   pass "interrupted: --capture-eventlog is NOT populated (on_signal skips the copy step)"
 else
   fail "interrupted: expected no eventlog capture, but $CAPTURE_PATH was created"
-  rm -f "$CAPTURE_PATH"
 fi
+rm -rf "$CAPTURE_DIR"
 
 # --- timeout: the wrapper's own --timeout deadline, not a fake-codex exit.
 export FAKE_CODEX_SCENARIO=hang FAKE_CODEX_SLEEP_SECS=5
@@ -378,7 +378,7 @@ done
 
 # --capture-eventlog must contain fake-codex's own raw stdout for a
 # non-signal failure path (unlike interrupted above).
-CAPTURE_PATH="$(mktemp -u)"
+CAPTURE_DIR="$(mktemp -d)"; CAPTURE_PATH="$CAPTURE_DIR/eventlog.jsonl"
 export FAKE_CODEX_SCENARIO=exit_nonzero FAKE_CODEX_EXIT_CODE=1
 OUT="$(pd_run fresh --capture-eventlog "$CAPTURE_PATH")"
 pd_assert_reason "$OUT" "nonzero_exit" "nonzero_exit (fresh, --capture-eventlog)"
@@ -387,7 +387,7 @@ if [ -f "$CAPTURE_PATH" ] && grep -q '"type":"thread.started"' "$CAPTURE_PATH"; 
 else
   fail "nonzero_exit: --capture-eventlog should contain thread.started, file: $([ -f "$CAPTURE_PATH" ] && cat "$CAPTURE_PATH" || echo MISSING)"
 fi
-rm -f "$CAPTURE_PATH"
+rm -rf "$CAPTURE_DIR"
 unset FAKE_CODEX_SCENARIO FAKE_CODEX_EXIT_CODE
 
 # --- missing_task_complete: process exits 0, task_complete never appears.
@@ -434,7 +434,7 @@ for VARIANT in "${PD_INVALID_JSON_VARIANTS[@]}"; do
   pd_assert_threadid_present "$OUT" "invalid_json (resume, variant $i)"
 done
 
-CAPTURE_PATH="$(mktemp -u)"
+CAPTURE_DIR="$(mktemp -d)"; CAPTURE_PATH="$CAPTURE_DIR/eventlog.jsonl"
 export FAKE_CODEX_SCENARIO=invalid_json FAKE_CODEX_FINAL_ANSWER="${PD_INVALID_JSON_VARIANTS[0]}"
 OUT="$(pd_run fresh --capture-eventlog "$CAPTURE_PATH")"
 pd_assert_reason "$OUT" "invalid_json" "invalid_json (fresh, --capture-eventlog)"
@@ -443,7 +443,7 @@ if [ -f "$CAPTURE_PATH" ] && grep -q '"type":"thread.started"' "$CAPTURE_PATH"; 
 else
   fail "invalid_json: --capture-eventlog should contain thread.started, file: $([ -f "$CAPTURE_PATH" ] && cat "$CAPTURE_PATH" || echo MISSING)"
 fi
-rm -f "$CAPTURE_PATH"
+rm -rf "$CAPTURE_DIR"
 unset FAKE_CODEX_SCENARIO FAKE_CODEX_FINAL_ANSWER
 
 # --- schema_mismatch: valid JSON, but fails the wrapper's own semantic
@@ -508,7 +508,7 @@ for NAME_IDX in 0 1; do
   pd_assert_threadid_present "$OUT" "schema_mismatch (resume, $NAME)"
 done
 
-CAPTURE_PATH="$(mktemp -u)"
+CAPTURE_DIR="$(mktemp -d)"; CAPTURE_PATH="$CAPTURE_DIR/eventlog.jsonl"
 export FAKE_CODEX_SCENARIO=schema_mismatch FAKE_CODEX_FINAL_ANSWER="${PD_SCHEMA_MISMATCH_JSON[0]}"
 OUT="$(pd_run fresh --capture-eventlog "$CAPTURE_PATH")"
 pd_assert_reason "$OUT" "schema_mismatch" "schema_mismatch (fresh, --capture-eventlog)"
@@ -517,8 +517,162 @@ if [ -f "$CAPTURE_PATH" ] && grep -q '"type":"thread.started"' "$CAPTURE_PATH"; 
 else
   fail "schema_mismatch: --capture-eventlog should contain thread.started, file: $([ -f "$CAPTURE_PATH" ] && cat "$CAPTURE_PATH" || echo MISSING)"
 fi
-rm -f "$CAPTURE_PATH"
+rm -rf "$CAPTURE_DIR"
 unset FAKE_CODEX_SCENARIO FAKE_CODEX_FINAL_ANSWER
+
+# --- investigation_evidence extraction fixtures (capture-evidence, no real API calls) ---
+# Exercises the two jq filters documented in skills/ccs/SKILL.md's
+# "Investigation evidence capture" section, copied VERBATIM from that file
+# below (never paraphrased/simplified) -- step 2's per-(round,group)
+# extraction filter and step 3's parallel-mode merge filter. fake-codex's
+# FAKE_CODEX_COMMANDS/FAKE_CODEX_GARBAGE_LINE env vars (see
+# tests/fixtures/fake-codex) make its own stdout -- which --capture-eventlog
+# copies verbatim, per the nonzero_exit/invalid_json/schema_mismatch
+# fixtures above -- contain real item.completed/command_execution events (or
+# a deliberately unparseable line) without ever touching a real Codex
+# backend.
+
+# ccs_extract_evidence EVENTLOG_FILE -> sets (global) INVESTIGATION_EVIDENCE_JSON.
+# Verbatim body of SKILL.md step 2's extraction snippet, including its own
+# [ -s ... ] guard -- only the surrounding function wrapper and the
+# parameter name are test scaffolding.
+ccs_extract_evidence() {
+  local EVENTLOG_FILE="$1"
+  if [ -s "$EVENTLOG_FILE" ]; then
+    INVESTIGATION_EVIDENCE_JSON=$(jq -Rn -c '
+      [inputs | fromjson? | select(.type == "item.completed" and .item.type == "command_execution") | .item.command]
+      | {command_count: length, commands: .}
+    ' "$EVENTLOG_FILE")
+  else
+    INVESTIGATION_EVIDENCE_JSON='{"command_count":0,"commands":[]}'
+  fi
+}
+
+# 1. Basic extraction, nonzero commands (fresh dispatch). One command
+# embeds a double quote, a "$", and a space together, to prove the
+# extraction is JSON-safe rather than string-concatenation-safe.
+IE_CMD1='grep -rn "foo $HOME" src/dir'
+IE_CMD2='cat package.json'
+IE_CMD3='npm test -- --watch=false'
+CAPTURE_DIR="$(mktemp -d)"; CAPTURE_PATH="$CAPTURE_DIR/eventlog.jsonl"
+export FAKE_CODEX_SCENARIO=normal FAKE_CODEX_COMMANDS="$IE_CMD1
+$IE_CMD2
+$IE_CMD3"
+OUT="$(pd_run fresh --capture-eventlog "$CAPTURE_PATH")"
+if [ "$(printf '%s' "$OUT" | tail -1 | jq -r '.ok')" = "true" ]; then
+  pass "investigation_evidence: fresh dispatch with 3 commands returns ok:true"
+else
+  fail "investigation_evidence: fresh dispatch with 3 commands should return ok:true, got: $OUT"
+fi
+ccs_extract_evidence "$CAPTURE_PATH"
+IE_EXPECTED_COMMANDS="$(jq -nc --arg c1 "$IE_CMD1" --arg c2 "$IE_CMD2" --arg c3 "$IE_CMD3" '[$c1,$c2,$c3]')"
+IE_ACTUAL_COUNT="$(printf '%s' "$INVESTIGATION_EVIDENCE_JSON" | jq -r '.command_count')"
+IE_ACTUAL_COMMANDS="$(printf '%s' "$INVESTIGATION_EVIDENCE_JSON" | jq -c '.commands')"
+if [ "$IE_ACTUAL_COUNT" = "3" ] && [ "$IE_ACTUAL_COMMANDS" = "$IE_EXPECTED_COMMANDS" ]; then
+  pass "investigation_evidence: extraction filter yields command_count=3 and the exact commands, special characters intact"
+else
+  fail "investigation_evidence: expected command_count=3 commands=$IE_EXPECTED_COMMANDS, got: $INVESTIGATION_EVIDENCE_JSON"
+fi
+rm -rf "$CAPTURE_DIR"
+unset FAKE_CODEX_SCENARIO FAKE_CODEX_COMMANDS
+
+# 2. Zero commands, but a genuinely non-empty/successful round (ok:true) --
+# the extraction filter must report a real, honest zero here, distinct from
+# the (separately-decided, not tested here) skip-extraction-entirely case.
+CAPTURE_DIR="$(mktemp -d)"; CAPTURE_PATH="$CAPTURE_DIR/eventlog.jsonl"
+export FAKE_CODEX_SCENARIO=normal
+OUT="$(pd_run fresh --capture-eventlog "$CAPTURE_PATH")"
+if [ "$(printf '%s' "$OUT" | tail -1 | jq -r '.ok')" = "true" ]; then
+  pass "investigation_evidence: fresh dispatch with zero commands returns ok:true"
+else
+  fail "investigation_evidence: fresh dispatch with zero commands should return ok:true, got: $OUT"
+fi
+ccs_extract_evidence "$CAPTURE_PATH"
+if [ "$INVESTIGATION_EVIDENCE_JSON" = '{"command_count":0,"commands":[]}' ]; then
+  pass "investigation_evidence: a genuinely-ran zero-command round extracts a real, honest zero"
+else
+  fail "investigation_evidence: expected {\"command_count\":0,\"commands\":[]}, got: $INVESTIGATION_EVIDENCE_JSON"
+fi
+rm -rf "$CAPTURE_DIR"
+unset FAKE_CODEX_SCENARIO
+
+# 3. Malformed/garbage line tolerance: fromjson? must silently skip an
+# unparseable line -- not count it, not error the whole jq invocation --
+# while still extracting the real commands around it.
+IE_CMD_A='echo hello'
+IE_CMD_B='ls -la /tmp'
+CAPTURE_DIR="$(mktemp -d)"; CAPTURE_PATH="$CAPTURE_DIR/eventlog.jsonl"
+export FAKE_CODEX_SCENARIO=normal FAKE_CODEX_GARBAGE_LINE=1 FAKE_CODEX_COMMANDS="$IE_CMD_A
+$IE_CMD_B"
+OUT="$(pd_run fresh --capture-eventlog "$CAPTURE_PATH")"
+if [ "$(printf '%s' "$OUT" | tail -1 | jq -r '.ok')" = "true" ]; then
+  pass "investigation_evidence: fresh dispatch with garbage line + 2 commands returns ok:true"
+else
+  fail "investigation_evidence: fresh dispatch with garbage line + 2 commands should return ok:true, got: $OUT"
+fi
+if [ -f "$CAPTURE_PATH" ] && grep -qxF "not valid json at all" "$CAPTURE_PATH"; then
+  pass "investigation_evidence: eventlog genuinely contains the injected garbage line"
+else
+  fail "investigation_evidence: expected the injected garbage line in the eventlog, file: $([ -f "$CAPTURE_PATH" ] && cat "$CAPTURE_PATH" || echo MISSING)"
+fi
+IE_MALFORMED_JSON=$(jq -Rn -c '
+  [inputs | fromjson? | select(.type == "item.completed" and .item.type == "command_execution") | .item.command]
+  | {command_count: length, commands: .}
+' "$CAPTURE_PATH")
+IE_JQ_STATUS=$?
+IE_EXPECTED="$(jq -nc --arg a "$IE_CMD_A" --arg b "$IE_CMD_B" '{command_count:2, commands:[$a,$b]}')"
+if [ "$IE_JQ_STATUS" -eq 0 ] && [ "$IE_MALFORMED_JSON" = "$IE_EXPECTED" ]; then
+  pass "investigation_evidence: fromjson? swallows the garbage line (jq exit 0), extracts exactly the 2 real commands"
+else
+  fail "investigation_evidence: expected jq exit 0 and $IE_EXPECTED, got exit=$IE_JQ_STATUS value=$IE_MALFORMED_JSON"
+fi
+rm -rf "$CAPTURE_DIR"
+unset FAKE_CODEX_SCENARIO FAKE_CODEX_GARBAGE_LINE FAKE_CODEX_COMMANDS
+
+# 4. Parallel-mode merge filter -- SKILL.md step 3, verbatim, including its
+# own heredoc-style two-line input. No wrapper dispatch needed: this filter
+# operates purely on two already-produced INVESTIGATION_EVIDENCE_JSON-shaped
+# objects.
+IE_GROUP1_JSON='{"command_count":2,"commands":["a","b"]}'
+IE_GROUP2_JSON='{"command_count":1,"commands":["c"]}'
+MERGED_INVESTIGATION_EVIDENCE_JSON=$(jq -sc '{command_count: (map(.command_count) | add), commands: (map(.commands) | add)}' <<< "$IE_GROUP1_JSON
+$IE_GROUP2_JSON")
+IE_EXPECTED_MERGE='{"command_count":3,"commands":["a","b","c"]}'
+if [ "$MERGED_INVESTIGATION_EVIDENCE_JSON" = "$IE_EXPECTED_MERGE" ]; then
+  pass "investigation_evidence: parallel-mode merge filter sums command_count and concatenates commands in order"
+else
+  fail "investigation_evidence: expected $IE_EXPECTED_MERGE, got: $MERGED_INVESTIGATION_EVIDENCE_JSON"
+fi
+
+# 5. Resume-dispatch extraction: same nonzero-commands case as #1, but via
+# --resume, confirming the extraction filter itself has no fresh/resume
+# distinction (that distinction lives entirely in the separate
+# should-extraction-run decision, not in this filter's logic).
+IE_CMD1R='grep -rn "foo $HOME" src/dir'
+IE_CMD2R='cat package.json'
+IE_CMD3R='npm test -- --watch=false'
+TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
+CAPTURE_DIR="$(mktemp -d)"; CAPTURE_PATH="$CAPTURE_DIR/eventlog.jsonl"
+export FAKE_CODEX_SCENARIO=normal FAKE_CODEX_COMMANDS="$IE_CMD1R
+$IE_CMD2R
+$IE_CMD3R"
+OUT="$(pd_run resume "$TID" --capture-eventlog "$CAPTURE_PATH")"
+if [ "$(printf '%s' "$OUT" | tail -1 | jq -r '.ok')" = "true" ]; then
+  pass "investigation_evidence: resume dispatch with 3 commands returns ok:true"
+else
+  fail "investigation_evidence: resume dispatch with 3 commands should return ok:true, got: $OUT"
+fi
+ccs_extract_evidence "$CAPTURE_PATH"
+IE_EXPECTED_COMMANDS="$(jq -nc --arg c1 "$IE_CMD1R" --arg c2 "$IE_CMD2R" --arg c3 "$IE_CMD3R" '[$c1,$c2,$c3]')"
+IE_ACTUAL_COUNT="$(printf '%s' "$INVESTIGATION_EVIDENCE_JSON" | jq -r '.command_count')"
+IE_ACTUAL_COMMANDS="$(printf '%s' "$INVESTIGATION_EVIDENCE_JSON" | jq -c '.commands')"
+if [ "$IE_ACTUAL_COUNT" = "3" ] && [ "$IE_ACTUAL_COMMANDS" = "$IE_EXPECTED_COMMANDS" ]; then
+  pass "investigation_evidence: resume-dispatch extraction works identically to fresh (command_count=3, commands intact)"
+else
+  fail "investigation_evidence: expected command_count=3 commands=$IE_EXPECTED_COMMANDS, got: $INVESTIGATION_EVIDENCE_JSON"
+fi
+rm -rf "$CAPTURE_DIR"
+unset FAKE_CODEX_SCENARIO FAKE_CODEX_COMMANDS
 
 rm -rf "$FAKE_HOME" "$FAKE_BIN_DIR" "$PD_REPO"
 

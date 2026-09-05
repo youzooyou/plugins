@@ -30,6 +30,16 @@
 #                         can detect "dispatch genuinely began" (needed for
 #                         --resume, which has no thread.started event to
 #                         poll for)
+#   FAKE_CODEX_COMMANDS   newline-separated shell command strings (blank
+#                         lines skipped). When set, emits one
+#                         {"type":"item.completed","item":{"type":"command_execution",...}}
+#                         JSON line per command to stdout, for
+#                         --capture-eventlog investigation_evidence tests.
+#                         Unset (default): no such lines, stdout unchanged.
+#   FAKE_CODEX_GARBAGE_LINE  when set (any value), emits one line of
+#                         deliberately non-JSON text to stdout, to test that
+#                         extraction's `fromjson?` tolerates a malformed
+#                         line. Unset (default): no such line.
 set -u
 
 # `codex delete --force -- <threadId>` (run-ccs-review.sh's --cleanup mode)
@@ -85,6 +95,21 @@ else
   mkdir -p "$DAY_DIR"
   ROLLOUT="$DAY_DIR/rollout-fake-${THREAD_ID}.jsonl"
   : > "$ROLLOUT"
+fi
+
+# Optional command_execution / garbage stdout lines for --capture-eventlog
+# tests -- placed after the mode's own distinctive first line (thread.started
+# for fresh, the resume marker line for resume) to match the realistic
+# sequence. A no-op, byte-for-byte identical to before, when both env vars
+# are unset (the default every pre-existing fixture relies on).
+if [ -n "${FAKE_CODEX_GARBAGE_LINE:-}" ]; then
+  echo "not valid json at all"
+fi
+if [ -n "${FAKE_CODEX_COMMANDS:-}" ]; then
+  while IFS= read -r _cmd; do
+    [ -n "$_cmd" ] || continue
+    jq -nc --arg cmd "$_cmd" '{type: "item.completed", item: {type: "command_execution", command: $cmd}}'
+  done <<< "$FAKE_CODEX_COMMANDS"
 fi
 
 if [ -z "$ROLLOUT" ]; then
