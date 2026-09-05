@@ -1,6 +1,6 @@
 ---
 name: ccs
-description: Claude executes a task then runs a Claude+Codex adversarial cross-review loop (max 20 rounds) until fact-based consensus, built on a single resumable Codex thread per reviewer instead of a fresh process per round, so follow-up rounds are cheaper (no diff re-send after round 1) and, in a tmux-capable environment, a live progress pane opens automatically per reviewer. Supports both single-reviewer and parallel multi-reviewer (N concurrent, dimension-focused reviewers, each on its own resumable thread) modes.
+description: Claude executes a task then runs a Claude+Codex adversarial cross-review loop (max 20 rounds) until fact-based consensus, built on a single resumable Codex thread per reviewer instead of a fresh process per round, so follow-up rounds are cheaper (no diff re-send after round 1). Supports both single-reviewer and parallel multi-reviewer (N concurrent, dimension-focused reviewers, each on its own resumable thread) modes.
 ---
 
 # /ccs — Claude + Codex Cross-Review on a Resumable Thread
@@ -9,7 +9,8 @@ description: Claude executes a task then runs a Claude+Codex adversarial cross-r
 `/ccs` slash command; it is invoked plugin-qualified, like every other plugin-supplied skill. Leave
 the task description empty to review the work just done in this session. Optional prefix:
 `codex-stream-review:ccs --capture-evidence <task description>` — opt-in investigation-evidence
-capture for every round of this session (see "Investigation evidence capture" below). Omit it and
+capture for every round of this session (see `references/capture-evidence.md`, read only when this
+flag is used). Omit it and
 `/ccs` behaves exactly as documented everywhere else in this file, with zero added fields anywhere.
 Any other free text is the TASK.
 
@@ -25,8 +26,7 @@ non-repo artifact is handled, via the `CLEAN_REPO_DIR` mechanism).
 
 `/ccs` dispatches every review round through `run-ccs-review.sh`, a resumable-thread wrapper — one
 persistent Codex thread per reviewer for the whole run, `--resume`d every round after the first
-rather than re-sent the diff each time. It opens a live tmux pane on the round's rollout file when
-possible, and **always cleans up its Codex thread on every terminal path** — never left to the
+rather than re-sent the diff each time. It **always cleans up its Codex thread on every terminal path** — never left to the
 user, unlike `stream-review`'s own caller-owns-cleanup contract.
 
 `/ccs` also supports parallel multi-reviewer mode — N concurrent, dimension-focused reviewers
@@ -39,7 +39,8 @@ same mechanism, not a separate code path.
 
 ## Scope
 
-`--capture-evidence` is supported — see "Investigation evidence capture" below. No version-gating
+`--capture-evidence` is supported — see `references/capture-evidence.md` for its full mechanics,
+read only when this flag is used. No version-gating
 preflight is needed for it: `run-ccs-review.sh` has supported `--capture-eventlog <path>` since
 this wrapper's first release (confirmed directly — `grep -n capture-eventlog
 scripts/run-ccs-review.sh` finds it in the argument parser and the terminal-copy step both), so
@@ -118,8 +119,8 @@ run-ccs-review.sh --cwd <dir> --resume <threadId> --focus <text> [--timeout <sec
   pass it explicitly unless a round genuinely needs longer; the PID-liveness watcher's own wait
   bound (below) matches whatever value is actually used.
 - `--capture-eventlog <path>` — optional, best-effort raw event-log dump. Used by this skill only
-  when `--capture-evidence` was given for this session (see "Investigation evidence capture"
-  below) — omitted entirely otherwise.
+  when `--capture-evidence` was given for this session (see `references/capture-evidence.md`)
+  — omitted entirely otherwise.
 - A `--base`/`--commit` value starting with `-` is rejected (`bad_args`) as a git-option-
   injection guard; a `--resume` threadId starting with `-` is rejected the same way.
 
@@ -247,154 +248,17 @@ step a human needs to remember. See "Phase 3 — Terminal path" below.
 
 ## Investigation evidence capture (opt-in via `--capture-evidence`)
 
-**Off by default.** A normal `codex-stream-review:ccs <task description>` invocation (no
-`--capture-evidence` prefix) never touches anything in this section — no extra dispatch flag, no
-extra JSONL field, zero behavior change from everything else this file documents. Adapted to this
-skill's already-GROUP-aware temp-file conventions; no version-gating preflight is needed (see
-"Scope" above — `run-ccs-review.sh` has supported `--capture-eventlog` since its first release).
+**Off by default.** Full mechanics live in `references/capture-evidence.md`, read only when this
+session actually uses `--capture-evidence`.
 
-**What turns it on:** the one-time Phase 0 Step 0 decision above.
-
-**What it captures:** only the literal shell commands Codex actually ran during that round's
-investigation (e.g. `grep -rn foo src/`, `cat package.json`, `npm test`) — never their output,
-never file contents, never anything else from the raw event stream. This lets Claude's
-re-verification step (Phase 2, "Re-verify EACH finding against facts/evidence") cross-check a
-finding's self-reported "verification" narrative against what Codex actually ran, instead of
-trusting the claim at face value.
-
-**How it's captured, per (round, group) dispatch:**
-1. When capture is ON for this session, allocate a 5th temp file alongside
-   `PID_FILE`/`OUT_FILE`/`ERR_FILE`/`FOCUS_FILE` in Phase 1 Step 0, same template style, same
-   `GROUP` segment:
-   ```bash
-   EVENTLOG_FILE=$(mktemp "/tmp/ccs-${SESSION_ID}-round-<R>-${GROUP}-eventlog.jsonl.XXXXXX")
-   echo "EVENTLOG_FILE=$EVENTLOG_FILE"
-   ```
-   Then pass the exact literal resolved path as `--capture-eventlog "$EVENTLOG_FILE"` on THAT
-   group's Phase 1 Step 1 dispatch call — fresh or resumed, every round, not just round 1 (each
-   `run-ccs-review.sh` invocation is its own separate `codex exec`/`codex exec resume` process
-   with its own event log, whether or not the underlying Codex thread is being resumed). **This
-   applies to EVERY `run-ccs-review.sh` dispatch this file ever constructs, with no exception —
-   Phase 1 Step 1's own fresh/resume examples, AND every retry variant in Guards below** (the
-   no-threadId-yet fresh retry, the resume-safe bounded retry, the resume-retries-exhausted
-   fallback fresh retry, and the non-resume-safe immediate fresh retry): each is its own separate
-   process invocation and gets its own freshly-`mktemp`'d `EVENTLOG_FILE` the same way, never the
-   original round's already-consumed one, when capture is ON — see the Guards section's
-   resume-safe retry bullet for the one case (a genuine resume-retry succeeding) where more than
-   one eventlog for the same (round, group) needs an explicit rule for which one actually gets
-   extracted from.
-2. **Extract the command list and wrap it into the JSONL schema's required object shape, in ONE
-   `jq` call**, once that group's dispatch call has returned and its JSON stdout has been parsed.
-   The `investigation_evidence` field (see "Review history log" below) is an OBJECT —
-   `{"command_count": N, "commands": [...]}` — not a bare array. **First decide whether this
-   group's dispatch ever actually invoked `codex exec`/`codex exec resume` as a subprocess at
-   all — this is NOT the same question as whether `$EVENTLOG_FILE` is empty** (`mktemp`
-   pre-creates it as 0 bytes before the round even dispatches, so a genuinely-ran process that
-   issued zero commands and a process that never got that far look identical on disk). **`threadId`
-   presence means two DIFFERENT things depending on whether this was a fresh or a `--resume`
-   dispatch — never use one rule for both:**
-   - **Fresh dispatch:** `threadId` is only ever set once a real `thread.started` event actually
-     fires (confirmed from the wrapper's own fresh-dispatch code path) — its presence in the
-     result IS a reliable "a process genuinely started" signal here. Skip extraction only for
-     `bad_args`/`git_error`/`incomplete_collection`/`no_thread_started` (never carry a `threadId`
-     at all) or for `interrupted` specifically WITHOUT a `threadId` in the result (the signal
-     arrived before `thread.started` ever fired). Every other fresh-dispatch outcome — `ok:true`,
-     or `ok:false` with `threadId` present — means extraction is meaningful; run it, even if it
-     ends up reporting a real, honest zero.
-   - **`--resume` dispatch: `threadId` is asymmetric, and this skill still classifies by `reason`
-     alone rather than by `threadId` at all** — confirmed directly from the wrapper's own source:
-     `THREAD_ID` starts empty, is assigned exactly once — `THREAD_ID="$RESUME_THREAD_ID"` (the
-     caller's own input argument, echoed straight back), only after focus/scope validation has
-     already passed — and is never reassigned or cleared afterward on this path; `codex exec
-     resume` doesn't launch until later still. That makes an ABSENT `threadId` in a resume-dispatch
-     result a reliable negative: it can only happen before that one assignment, meaning this
-     invocation never reached the point of launching `codex exec resume` at all (a `bad_args`
-     failure — always before the signal trap is even installed — or a pre-assignment
-     `interrupted`). A PRESENT `threadId`, by contrast, is genuinely ambiguous — merely the echoed
-     input, it is present whether the failure landed microseconds after that echo (nothing
-     launched yet) or well after `codex exec resume` actually ran, so presence alone never confirms
-     a launch. This asymmetry doesn't change any actual extraction decision here, so `threadId` is
-     still never checked: `bad_args` and `resume_thread_not_found` are already skipped by `reason`
-     name alone (the former is always ID-less by the above, the latter is always ID-present but by
-     definition always pre-launch — see its own row in the reason table). `interrupted` is skipped
-     as the conservative choice either way it occurs — an ID-less occurrence is a confirmed
-     non-launch, and an ID-present occurrence is unresolvably ambiguous, so treating both alike
-     avoids a `threadId`-shaped special case for this one reason: reporting a fabricated
-     zero-command object for an investigation that may never have happened is worse than the
-     (typically rare, narrow-window) case of omitting a real-but-brief one. Every other reason —
-     `ok:true`,
-     `timeout`, `nonzero_exit`, `missing_task_complete`, `rollout_not_found`, `no_final_answer`,
-     `invalid_json`, `schema_mismatch` — can ONLY occur after `codex exec resume` genuinely
-     launched (`rollout_not_found` specifically is a POST-launch rollout re-resolution failure,
-     not the resume-only PRE-flight `resume_thread_not_found` check above — the two are separate
-     reasons at separate points, never conflate them); extraction is meaningful and always runs
-     for these.
-   Either skip path means this group's contribution to `investigation_evidence` is simply absent
-   (see step 3's merge behavior for what that means in parallel mode) — never a zero-command
-   placeholder standing in for "nothing actually happened":
-   ```bash
-   EVENTLOG_FILE="<this group's literal path from step 1 above, same round>"
-   if [ -s "$EVENTLOG_FILE" ]; then
-     INVESTIGATION_EVIDENCE_JSON=$(jq -Rn -c '
-       [inputs | fromjson? | select(.type == "item.completed" and .item.type == "command_execution") | .item.command]
-       | {command_count: length, commands: .}
-     ' "$EVENTLOG_FILE")
-   else
-     INVESTIGATION_EVIDENCE_JSON='{"command_count":0,"commands":[]}'
-   fi
-   ```
-   The ONLY bash-level capture here is the well-formed, complete JSON object as `jq`'s own stdout
-   via `$(...)` into `INVESTIGATION_EVIDENCE_JSON` — safe regardless of what characters the
-   captured commands contain, since the object is never disassembled into and reassembled from an
-   intermediate bash string; `jq` handles all JSON construction internally in one pass.
-   `fromjson?` swallows any unparseable line rather than erroring the whole extraction, so a
-   partial or malformed event log still yields whatever valid entries it contains. This group's own
-   `$INVESTIGATION_EVIDENCE_JSON` (when extraction ran at all) is the final value used at step 4
-   below for a single-reviewer round (see step 3 immediately below for the parallel-mode case).
-3. **Merge multiple groups' evidence into one object — parallel mode only.** The review history
-   log's schema has exactly ONE `investigation_evidence` object per ROUND, but a parallel round
-   dispatches more than one group, each producing its own separate `INVESTIGATION_EVIDENCE_JSON`
-   from step 2 — **or no value at all, for a group whose step 2 was skipped entirely** (its
-   dispatch never meaningfully started `codex exec`, per step 2's `ok`/`reason` check above). A
-   skipped group contributes NOTHING to the merge below — not a zero-value placeholder, simply
-   excluded from the list of values combined — same principle as step 2 itself, applied across
-   groups. **Common case — a single-reviewer round (`GROUP="main"`): nothing to merge**, use that
-   group's own value directly, unchanged, or omit `investigation_evidence` entirely from this
-   round's line if that one group's own step 2 was skipped. **Only when this round actually
-   dispatched more than one group AND at least one of them has a real value:** combine every
-   dispatched group's value into ONE merged object by summing `command_count` and concatenating
-   `commands` across groups, in one `jq` call:
-   ```bash
-   MERGED_INVESTIGATION_EVIDENCE_JSON=$(jq -sc '{command_count: (map(.command_count) | add), commands: (map(.commands) | add)}' <<< "$GROUP1_JSON
-   $GROUP2_JSON")
-   ```
-   (one heredoc line per group that actually produced a real value this round — a group whose
-   step 2 was skipped simply isn't one of the lines). If EVERY dispatched group's step 2 was
-   skipped this round, there is nothing to merge — omit `investigation_evidence` from that round's
-   line entirely, the same as the single-reviewer skip case above. Use the merged object — never
-   any single group's own value — as the one `investigation_evidence` field written into that
-   round's single JSONL line. A failure in this merge step follows the same best-effort discipline
-   as the rest of this section: note it once and omit `investigation_evidence` from that round's
-   line rather than blocking the round.
-4. **Delete the raw event-log copy right after extraction, best-effort:** `rm -f "$EVENTLOG_FILE"`
-   (per group, if parallel mode dispatched more than one). The intent is a strong privacy
-   contract — the raw event stream can echo back actual file contents Codex read during its
-   investigation, so only the extracted command strings are meant to persist, and only into the
-   existing review history log. A plain `rm -f` run after the fact has no atomicity or crash guard
-   around it: if this session is interrupted between the dispatch call finishing and this `rm -f`
-   executing, that round's raw event-log file is left behind — a real gap, bounded in practice by
-   the unconditional Phase 0 Step 0 sweep above (removed no later than the start of the next `/ccs`
-   invocation of any kind, at least 60 minutes later), not eliminated outright.
-
-**Where it's stored:** no new file, no new format. When capture is ON for this session, add the
-one optional `investigation_evidence` field to that round's existing JSONL line (see "Review
-history log" below), using the (possibly group-merged) `$INVESTIGATION_EVIDENCE_JSON` from above
-as that field's value. Same log, same append-only write, nothing new to create.
-
-**Failure isolation:** exactly the same best-effort discipline as the rest of this log — a `jq`
-failure in step 2/3's extraction/merge, a missing/empty event-log file, or a failed `rm` must
-never abort or degrade the review round. Note it once in that round's narration and continue with
-`investigation_evidence` simply omitted from that round's line.
+**Once Phase 0 Step 0 determines capture is ON for this session, your very next action — before
+doing anything else in this run — is to Read `codex-stream-review/skills/ccs/references/capture-evidence.md`
+in full.** That file's procedure is required at no fewer than four later points in this run (Phase
+1 Step 0's `EVENTLOG_FILE` allocation, Step 1's `--capture-eventlog` flag, Phase 2's extraction
+step, Guards' retry-time eventlog handling) — proceeding without having read it first will leave
+those points undocumented for this session. If capture is OFF for this session, never read this
+file and never touch anything it describes — zero behavior change from every other place in this
+skill.
 
 ---
 
@@ -555,7 +419,7 @@ up using `--capture-evidence` at all):**
    - **If the material to review isn't a repo diff at all, but there IS real content to review
      (a pasted plan, generated text, analysis text that actually exists — just with no git diff to
      point to): this is a genuine non-repo-artifact review**, handled via the `CLEAN_REPO_DIR`
-     mechanism (full operational detail below).
+     mechanism (full operational detail in `references/non-repo-artifact.md`).
    - **If there is still nothing concrete at all** — no task, no identifiable prior-session work,
      no uncommitted changes, AND no other real content to paste as a non-repo artifact either —
      **do NOT create `CLEAN_REPO_DIR` and do NOT dispatch a round with nothing to review.** Clean
@@ -566,102 +430,13 @@ up using `--capture-evidence` at all):**
      empty `CLEAN_REPO_DIR` round with no actual material pasted into `--focus` would silently
      review nothing while looking like a real review.
 
-     **Why a non-repo-artifact round must NOT dispatch against `$REPO_ROOT`.** Dispatching
-     `--uncommitted --cwd "$REPO_ROOT"` for a non-repo artifact points the wrapper at the user's
-     real working tree — if that tree has ANY unrelated uncommitted changes, the wrapper reviews
-     the ACTUAL DIFF whenever it is non-empty, using `--focus` only as context for it; it does
-     NOT fall back to a focus-only review unless the diff is genuinely empty. So an artifact-only
-     review dispatched against `$REPO_ROOT` would silently ALSO review those unrelated changes,
-     contaminating findings and coverage with material the user never asked to review.
+     Full mechanics — why a non-repo-artifact round must not dispatch against `$REPO_ROOT`, the
+     `CLEAN_REPO_DIR`/`FAKE_GIT_HOME` allocation, the allowlist-not-denylist reasoning, and cleanup —
+     live in `references/non-repo-artifact.md`.
 
-     **The fix:** the first time this session determines a round is a genuine non-repo-artifact
-     review, create a throwaway clean git repo once and reuse it for every round of that same
-     session — never recreate it per round:
-     ```bash
-     FAKE_GIT_HOME=$(mktemp -d "/tmp/ccs-${SESSION_ID}-fake-git-home.XXXXXX")
-     CLEAN_REPO_DIR=$(mktemp -d "/tmp/ccs-${SESSION_ID}-artifact-repo.XXXXXX")
-     env -i "PATH=$PATH" "HOME=$FAKE_GIT_HOME" "GIT_CONFIG_NOSYSTEM=1" \
-       git -C "$CLEAN_REPO_DIR" init -q
-     echo "CLEAN_REPO_DIR=$CLEAN_REPO_DIR"
-     echo "FAKE_GIT_HOME=$FAKE_GIT_HOME"
-     ```
-     **This is an ALLOWLIST, not a denylist — deliberately: a denylist enumeration approach was
-     tried here first and repeatedly bypassed.** `git`'s own repository/worktree discovery honors
-     several environment variables OVER `-C`/`cd` (confirmed directly), and each successive
-     hand-picked-then-dynamically-queried unset list was defeated by another variable or by a
-     bootstrap failure in the query itself — a denylist cannot converge on "every variable,
-     including ones that can break the very discovery mechanism used to build the list." `env -i`
-     sidesteps this entirely by clearing the ENTIRE environment unconditionally and re-admitting
-     only `PATH` (to find the `git` binary at all), a dedicated `FAKE_GIT_HOME` (so no real or
-     attacker-controlled `HOME` can supply a `.gitconfig`), and `GIT_CONFIG_NOSYSTEM=1` (so
-     `/etc/gitconfig` is never read) — the same `env -i` allowlist pattern this project's own
-     git-isolation code already uses elsewhere (see `scripts/lib/git-safe.sh`'s `git_safe()`
-     helper, referenced again below).
-
-     `FAKE_GIT_HOME` is session-scoped exactly like `CLEAN_REPO_DIR` — allocated once, lazily, the
-     first time this session needs it, remembered as an exact literal for the rest of the run, and
-     cleaned up in Phase 3 alongside `CLEAN_REPO_DIR` (`rm -rf`, not just `CLEAN_REPO_DIR`'s own
-     cleanup — see Phase 3 below). It must be a genuinely SEPARATE directory from `CLEAN_REPO_DIR`
-     itself (never reuse one for the other) — `HOME` and the git worktree being initialized are
-     different concerns, and collapsing them risks `git init` writing `.gitconfig`-adjacent state
-     into the same directory whose content is supposed to be exactly what `CLEAN_REPO_DIR` isolates.
-
-     **Two separate isolation mechanisms exist for two separate call sites — keep them distinct.**
-     The allowlist above protects Claude's own pre-flight `git init` call for `CLEAN_REPO_DIR`.
-     Every round's actual review dispatch (Phase 1 Step 1 below) invokes `run-ccs-review.sh`, a
-     different call site with its own, separate isolation: the wrapper sources
-     `scripts/lib/git-safe.sh` and routes all of its internal git calls (diff/show/rev-parse/
-     hash-object) through its `git_safe()` helper — a pre-resolved, absolute `git` binary run under
-     `env -i` with a fixed `PATH`, an isolated `HOME`, `GIT_CONFIG_NOSYSTEM=1`, `-C "$CWD"` (never a
-     bare `cd`), and `-c core.fsmonitor=` to close the repo-local-config execution gap an
-     environment-only allowlist can't reach on its own. See `scripts/lib/git-safe.sh` for the full
-     mechanism and rationale — the two-front gap this paragraph used to describe (no wrapper-side
-     isolation, plus an uncovered `core.fsmonitor` execution path) is closed; nothing further is
-     needed at the SKILL.md layer for this call site.
-
-     That's otherwise the whole setup — no seed file, no `git add`, no `git commit`. `CLEAN_REPO_DIR` is
-     left exactly as `git init -q` leaves it: an unborn-HEAD repository with zero commits and
-     nothing ever staged. No seed commit is needed to make `--uncommitted` resolve to an empty
-     diff there — an earlier revision of this fix seeded a placeholder commit,
-     reasoning `--uncommitted` needed a committed `HEAD` to diff against safely; that reasoning
-     was wrong (a freshly-`git init`'d repo's unborn HEAD already makes `--uncommitted` resolve
-     to an empty diff against git's own empty-tree object — this project's own unborn-HEAD
-     handling, `git rev-parse --verify -q HEAD` then either `HEAD` or `git hash-object -t tree
-     /dev/null`, already covers it), and the seed commit was also unsafe: its exit status was
-     never checked, so a globally-configured `pre-commit`/`commit-msg` hook could reject it and
-     leave the placeholder file STAGED but uncommitted — `--uncommitted` against this "clean"
-     repo would then show a non-empty diff (the staged placeholder itself), silently defeating
-     the exact "guaranteed empty diff" property this mechanism exists to provide. Removing the
-     seed commit removes this failure mode entirely: there is no `git commit` call left that
-     could fail, and no placeholder file left to go stray. Like `PID_FILE`/`OUT_FILE`/`FOCUS_FILE`
-     (see Phase 1 step 0 below), `CLEAN_REPO_DIR` is `mktemp -d`'s own output — a path Claude
-     fully controls the template of, guaranteed free of shell metacharacters — so it is simply
-     printed and remembered as an exact literal string for the rest of the session, with no
-     file-plus-sentinel indirection needed (unlike `REPO_ROOT_FILE`/`INSTALL_PATH_FILE`, which
-     hold externally-resolved values Claude does not fully control character-by-character).
-
-     **A non-repo-artifact round is always single-group `main`, never parallel — full stop.**
-     Phase 1's sizing/mode-selection logic (below) measures review scope by counting files in a
-     real diff; run against a freshly-`git init`'d, zero-file `CLEAN_REPO_DIR` it would trivially
-     return `0` and there is nothing to partition by file count in the first place, so the
-     parallel-mode machinery simply does not apply to this case — skip it entirely and dispatch
-     exactly one group (`GROUP="main"`) against `CLEAN_REPO_DIR`.
-
-     Dispatch every artifact-only round's wrapper call with `--cwd "<the exact literal
-     CLEAN_REPO_DIR path>" --uncommitted --focus "$FOCUS_TEXT"` in place of `--cwd "$REPO_ROOT"`
-     — see Phase 1 Step 1 below for exactly where this substitution applies. **A non-repo-
-     artifact round always uses `--uncommitted` against `CLEAN_REPO_DIR`, never `--base`/
-     `--commit`** — there is no commit in `CLEAN_REPO_DIR` to diff against, and round 2+ still
-     uses `--resume` exactly as normal (the resumed thread already has the pasted artifact
-     content in its own context, same as any other round 2+).
-
-     **Cleanup:** `CLEAN_REPO_DIR` (when created this session) is removed in Phase 3 alongside
-     `REPO_ROOT_FILE`/`INSTALL_PATH_FILE` — see Phase 3 below. It is created lazily (only if this
-     session ever actually needs it, i.e. only in the genuine-non-repo-artifact branch above, never
-     in the still-nothing-concrete-at-all branch), so Phase 3's cleanup only runs when one was
-     actually allocated. (The still-nothing-concrete-at-all early exit's own `rm -f` for
-     `REPO_ROOT_FILE`/`INSTALL_PATH_FILE` is already covered in that bullet above — nothing further
-     to clean up there, since `CLEAN_REPO_DIR` is never allocated on that path.)
+     **Once you reach this branch (real content to review, but no git diff), your very next action —
+     before creating anything or dispatching any round — is to Read
+     `codex-stream-review/skills/ccs/references/non-repo-artifact.md` in full.**
 
 ---
 
@@ -804,54 +579,13 @@ Sizing must reflect whatever scope was actually selected, using the wrapper's ow
 logic for that scope — never silently default to counting the uncommitted working-tree diff (or
 any other approximation) for a review that was never scoped to it.
 
-**What "parallel mode" actually is — read this before the table below.** `run-ccs-review.sh`
-accepts only `--uncommitted`/`--base`/`--commit` as review-scope selectors — there is no
-`--paths`/file-filter flag (confirmed directly from the wrapper's arg parser: an unrecognized
-flag falls through to `{"ok":false,"reason":"bad_args","detail":"unknown argument: ..."}`), and
-`--uncommitted`'s collector always reviews the ENTIRE working-tree diff plus all untracked files,
-every time, no matter what `--focus` text accompanies it. So every parallel group dispatched this
-way receives the IDENTICAL full diff — the groups differ ONLY in their `--focus` review-angle
-prompt, never in the actual material reviewed. Parallel mode is therefore multiple concurrent
-reviewers each given the SAME full diff but a DIFFERENT dimensional focus (e.g. one group's
-`--focus` emphasizes correctness, another's emphasizes security, a third's emphasizes
-performance/reuse) — genuinely useful for broader, more attentive coverage of a large or
-many-concerned diff via diverse reviewer attention, and for getting several review angles back
-within one wall-clock window via concurrent dispatch. **It is NOT a way to shrink any single
-call's context size or avoid a timeout risk from sheer diff size** — every group's Codex process
-still has to read the same full diff regardless of how many groups are running. A genuinely
-oversized diff still needs a narrower `--focus` in the sense of a narrower TOPICAL concern, or
-manual review — not more parallel dispatches of the same full material.
+Full mechanics — what parallel mode actually is, the scope-sizing table, when to use
+multiple reviewers, and how convergence works across groups — live in `references/parallel-mode.md`.
 
-| Scope | Strategy |
-|-------|----------|
-| Small (< 20 files, single concern) | **Single reviewer** (`GROUP="main"`) — standard flow |
-| Medium (20–50 files, or multiple concerns) | **2–3 parallel groups** — same full diff/scope, one review dimension/concern each |
-| Large (> 50 files, or large skill/doc files, or broad audit) | **3+ parallel groups** — same full diff/scope, one focused review dimension/concern each |
-
-**When to use multiple reviewers (flexible judgment) — grouped BY REVIEW DIMENSION/CONCERN, since
-that is the only thing a group's `--focus` can actually vary:**
-- The task spans multiple unrelated concerns worth distinct reviewer attention (e.g., path
-  correctness + workflow quality + consistency + security)
-- A large or many-concerned diff benefits from several reviewers' independent, differently-focused
-  passes, even though each one reads everything
-- Wanting several review angles back within the same wall-clock window (concurrent dispatch, not
-  sequential rounds)
-
-Do not reach for parallel mode to cope with diff size or context exhaustion — every group still
-reads the identical full diff (see above), so a single reviewer's exhaustion on it recurs in every
-parallel group just the same.
-
-**How to split:** group BY REVIEW DIMENSION/CONCERN — one group's `--focus` emphasizes
-correctness, another's security, another's performance/reuse, another's path correctness or
-workflow consistency for a doc/skill review, etc. (every group still calls `run-ccs-review.sh` with
-the identical scope flag, differing only in `--focus` text — see above).
-
-**This decision is made once, before round 1, and holds for the whole run.** Convergence in this
-skill is round-level and all-groups-together (see "Convergence = 100% CLEAN" below): every group
-dispatched at round 1 keeps being resumed at every subsequent round — with its own lightweight
-"nothing new from your dimension, here's what changed elsewhere" `--focus` when it has nothing new
-to raise — until the whole round converges together. A group is never added or dropped mid-run,
-and never exits the loop on its own separate cadence.
+**Once the sizing step above concludes this round warrants more than one concurrent reviewer group,
+your very next action — before Step 0 below — is to Read
+`codex-stream-review/skills/ccs/references/parallel-mode.md` in full.** This decision is made once,
+before round 1, and holds for the whole run.
 
 ### Step 0 — pre-allocate this round's temp files
 
@@ -872,7 +606,7 @@ echo "FOCUS_FILE=$FOCUS_FILE"
 ```
 
 **A 5th temp file, `EVENTLOG_FILE`, joins this same block only when capture-evidence is ON for
-this session** (Phase 0 Step 0's decision) — see "Investigation evidence capture" above for its
+this session** (Phase 0 Step 0's decision) — see `references/capture-evidence.md` for its
 exact template and how it's consumed; omitted entirely, every round, when capture is OFF.
 
 `GROUP` is baked into the `mktemp` *template* (not just the random suffix) — the
@@ -885,10 +619,10 @@ before) — harmless, since these are ephemeral per-run files cleaned up at the 
 
 **Why `ERR_FILE` is separate from `OUT_FILE`.** `run-ccs-review.sh` prints the early
 `THREAD_ID=<uuid>` signal on **stderr** the moment a thread starts (or immediately, on a resumed
-round) — well before the round's final JSON appears on stdout. `/ccs` needs the early signal for
-the tmux pane and for holding onto a threadId even if the round later fails, so the two streams
-are kept apart, exactly as `stream-review`'s own SKILL.md documents ("redirect stdout and stderr
-to SEPARATE files"). This
+round) — well before the round's final JSON appears on stdout. `/ccs` keeps this stream separate from stdout's clean JSON, exactly as `stream-review`'s
+own SKILL.md documents ("redirect stdout and stderr to SEPARATE files") — any wrapper-emitted
+stderr noise (there is none in normal operation today, but the separation costs nothing and
+matches the sibling skill's own convention) never contaminates the JSON parse. This
 reasoning applies identically per group — each dispatched group has its own `OUT_FILE`/`ERR_FILE`
 pair (Step 0 above), so each group's early `THREAD_ID` signal and final JSON are separated from
 every other group's, never just from each other within one group's own pair.
@@ -903,12 +637,9 @@ round's `--focus` text plus a trailing `x` sentinel into that group's own `FOCUS
   frame in this same Round-1 `--focus` text too**: Claude
   and Codex are equal peers, findings must be evidence-based (file:line + why), and the goal is
   100% clean mutual agreement.
-  - **Parallel mode (more than one group this round):** every group's Round-1 `--focus` shares the
-    same Why and the same `⚠️ SCOPE CONSTRAINT`/collaboration-frame text, but each group's Scope
-    additionally states its own review dimension/concern (e.g. one group's Scope emphasizes
-    correctness, another's security, another's performance/reuse) — this dimension text is the
-    ONLY thing that varies between groups' Round-1 `--focus`, since every group reviews the
-    IDENTICAL full diff (see "Determine review mode" above).
+  - **Parallel mode:** see `references/parallel-mode.md`'s "Round-1 focus text" section
+    (you already read this file per the parallel-mode decision above) for how each group's Scope
+    text differs.
   - **Non-repo artifact round — the Round-1 `--focus` text MUST also contain the actual material
     being reviewed, not merely Why/Scope describing it.** Paste the produced content — the design
     doc, plan, or analysis text itself — directly into this same `--focus` text.
@@ -921,20 +652,8 @@ round's `--focus` text plus a trailing `x` sentinel into that group's own `FOCUS
 - **Round 2+:** History (fixes applied and findings rejected last round, built from the review
   history log below, not memory alone) / Scope for this round's rebuttal — **never the diff
   again**. Same `⚠️ SCOPE CONSTRAINT` block, every round.
-  - **Per-group History construction (parallel mode subtlety).** A group's round-2+ `--focus`
-    must recap two DISTINCT things, kept separate rather than blended into one summary: (a) any
-    diff/code changes made since THIS group's last round, *including* fixes prompted by a
-    *different* group's finding — a fix for one review dimension can regress another, this is the
-    whole-flow principle (Phase 2 below) applied ACROSS dimensions, not only within one; and (b)
-    this specific group's own prior findings and Claude's response to them (accepted/rebutted),
-    distinct from (a). Build this from the review history log's full round history, filtered/
-    tagged by this group's own `group` value in `groups[]` (see "Review history log" below), not
-    from the round's aggregated top-level summary alone — the aggregated summary is a worst-case-
-    wins synthesis across all groups and does not preserve which finding came from which group. A
-    group with nothing new to raise about its own dimension still gets a lightweight History
-    noting "nothing new from your dimension this round; here is what changed elsewhere" — it is
-    still resumed and re-checked, never dropped from the round (see "Convergence = 100% CLEAN"
-    below).
+  - **Per-group History construction:** see `references/parallel-mode.md`'s "Round-2+
+    focus text" section (already read per the parallel-mode decision above).
 
 ### Step 1 — dispatch (primary channel)
 
@@ -966,7 +685,7 @@ for _v in $(git rev-parse --local-env-vars 2>/dev/null || printf '%s\n' GIT_ALTE
 done
 
 # Capture-evidence is a Phase 0 Step 0 decision Claude already knows, not a live variable (see
-# that section and "Investigation evidence capture" above) -- if ON for this session, literally
+# that section and references/capture-evidence.md) -- if ON for this session, literally
 # include --capture-eventlog "<this group's literal EVENTLOG_FILE from Step 0>" as concrete text
 # in this same dispatch call (both the fresh and the resume form below); if OFF, literally omit
 # the flag entirely. Never write this as a variable-gated bash branch for a later call to
@@ -1021,9 +740,10 @@ fallback-artifact-detection commands in Phase 0 step 4 — since those cannot in
 commands and the live confirmation that a repo-local `core.fsmonitor` hook does not fire through
 them either.
 
-**`GROUP_THREADS` — the ordered set of `(GROUP, THREAD_ID)` pairs.** Established once, right after
-round 1's dispatched groups each independently signal their own `THREAD_ID` via Step 3 below (run
-once per group). Remembered by Claude as a literal fact for the rest of the run, the same way a
+**`GROUP_THREADS` — the ordered set of `(GROUP, THREAD_ID)` pairs.** Established once, right after round 1's dispatched groups' results are each parsed in
+Phase 2 step 1 below — every group's own JSON response carries its `threadId` whenever one exists
+(the reason table above shows exactly which failure reasons do), whether that round succeeded or
+failed, so no earlier capture step is needed. Remembered by Claude as a literal fact for the rest of the run, the same way a
 single `THREAD_ID` is already remembered today — just N instances of an already-accepted pattern.
 Carried forward by hand into every group's `--resume` dispatch at round 2+ (each group resumes
 ONLY its own thread, never another group's). Durable backstop, not the primary carrier: each
@@ -1032,38 +752,10 @@ single-reviewer case, or per-entry in `groups[].thread_id` for a parallel round 
 history log" below for both) — so `jq '.thread_id // (.groups[] | {group, thread_id})'` on the
 latest round's log line re-derives the mapping if memory is ever in doubt, for either mode.
 
-**Non-repo artifact round?** Substitute the exact literal `CLEAN_REPO_DIR` path (see Phase 0 step
-4) for `$REPO_ROOT` in the `--cwd` argument above instead — never `$REPO_ROOT` for a genuine
-non-repo-artifact review — and always keep `--uncommitted` (never `--base`/`--commit`, since
-`CLEAN_REPO_DIR` has no commits to diff against). **Also run the git-environment sanitization
-loop defined in Step 1's dispatch section above, immediately before that section's own "Round 1
-(fresh ...)" comment.** Reuse that one fenced code block by reference only — never retype it, never
-abbreviate it, and never reproduce any piece of its actual shell syntax as a separate backtick-
-quoted span anywhere in this file, including here. Multiple earlier revisions of this exact
-instruction each tried to show a shortened or reflowed copy directly in prose, and each one turned
-out broken in its own way once actually executed (a line break landing mid-command; an abbreviated
-placeholder that parses as valid shell but silently does nothing) — this is a real,
-repeatedly-reintroduced bug, not a hypothetical one, and the only fix that has actually held is
-naming the one canonical block instead of ever showing a second rendering of it. **In this same
-dispatch call, every round, before invoking the wrapper** — this is a separately-dispatched call and an
-unset environment variable does not carry over between calls any more than a literal value does;
-skipping it here would silently reopen the exact bypass Phase 0 step 4 already fixed at creation
-time, on every round after the first. As explained in Phase 1 Step 1's own dispatch block above,
-this does not protect the wrapper's internal collection (already safe via `git_safe()`) — it
-protects `codex exec`/`codex exec resume` itself, which the wrapper launches inside a plain
-`cd "$CWD"` subshell with no isolation of its own, so a leaked `GIT_DIR`/`GIT_WORK_TREE` here could
-redirect Codex's own investigation-time git commands to the wrong repository (the user's real one,
-not `CLEAN_REPO_DIR`) instead.
-**This substitution applies to EVERY round of a
-non-repo-artifact session, round 2+ included — never revert to `$REPO_ROOT` on a resume.** The
-wrapper still `cd`s into whatever `--cwd` names immediately before running `codex exec resume`,
-even though diff collection itself is skipped on resume — passing `$REPO_ROOT` on a resumed
-artifact round would silently hand Codex's tool context back to the user's real, unrelated working
-tree for that round, defeating the whole point of the isolation `CLEAN_REPO_DIR` exists to
-guarantee. Only the diff-collection scope flag changes between round 1 (`--uncommitted`) and round
-2+ (`--resume <threadId>`) — `--cwd "$CLEAN_REPO_DIR"` stays constant across every round of the
-session. (A non-repo-artifact round is always single-group `main` — see Phase 0 step 4 and
-"Determine review mode" above — so this substitution never applies to more than one group.)
+**Non-repo artifact round?** You already read `references/non-repo-artifact.md` in full
+per Phase 0 step 4's mandatory-read instruction — follow its own Step-1-dispatch-substitution
+section now (it points back at this exact dispatch block for the sanitization loop, never a
+retyped copy).
 
 Dispatch via Bash with `run_in_background: true` — a round can legitimately take up to the
 wrapper's own timeout (1800s default). Never route this through a subagent (including `runner`):
@@ -1116,206 +808,6 @@ an already-finished round by up to ~180s for no benefit, compounding across up t
 that group's watcher (it has no further purpose) as soon as its primary result is in hand, exactly
 as done for every group in this same round.
 
-### Step 3 — early `THREAD_ID` signal (ccs-specific; drives the tmux pane)
-
-**Round 1 only, per group — skip entirely on that group's round 2+.** On a resume round, that
-group's `THREAD_ID` is already known (it's the literal value passed to `--resume`, looked up from
-`GROUP_THREADS`), so this poll would be redundant work; same skip-on-resume logic as step 4's tmux
-pane below. **One independent poll per group dispatched at round 1** — N concurrent polls for a
-parallel round's first round, one per group's own `ERR_FILE`.
-
-A third, independent, bounded poll per group — this is a genuine "notify me once" case, so use
-Bash with `run_in_background: true` and an `until` loop that exits on its own, not `Monitor`
-(which is for repeated/indefinite events):
-
-```bash
-GROUP="<literal from step 0 — e.g. main or g1>"
-ERR_FILE="<this group's literal from step 0>"
-DEADLINE=$(( $(date +%s) + 30 ))
-until grep -q '^THREAD_ID=' "$ERR_FILE" 2>/dev/null; do
-  [ "$(date +%s)" -ge "$DEADLINE" ] && { echo "${GROUP}: no THREAD_ID signal within 30s — round likely failed before/during dispatch"; exit 1; }
-  sleep 0.5
-done
-grep '^THREAD_ID=' "$ERR_FILE" | head -1
-```
-
-30s is generous: the wrapper's own internal "no thread.started" timeout is 10s, and a live,
-timestamped test of this exact mechanism (see the design doc) measured a 5.46s real
-dispatch→signal gap. This poll is **purely informational** — it exists only to decide whether/
-when to open that group's tmux pane below. If it times out for a given group (a genuine
-`bad_args`/`no_thread_started` failure for that group, or just an unusually slow start), skip the
-pane for that group this round; nothing about the review's correctness depends on it ever
-succeeding — the primary channel (step 1) and its JSON `ok:false` remain the actual source of
-truth for that group's round failure.
-
-Once this fires for a group, parse `<uuid>` out of the `THREAD_ID=<uuid>` line and remember it as
-that group's literal `THREAD_ID`, adding `(GROUP, THREAD_ID)` to `GROUP_THREADS` (needed for that
-group's tmux pane immediately below, for that group's `--resume` next round, and for that group's
-`--cleanup` at the terminal path — capture it from here or from that group's round-1 final JSON,
-whichever arrives; either source is the same value).
-
-**Per-group retry-leaks-a-thread case.** A round-1 retry (see Guards below) after a
-post-`thread.started` failure abandons that group's first, still-real thread the moment it
-dispatches fresh again with a new `threadId`. Append that abandoned id to that group's entry in
-`LEAKED_THREAD_IDS` — now a set of `(GROUP, threadId)` pairs rather than a flat list, since a
-round-1 retry is scoped to the ONE failed group only ("retry just that failed group once") — so
-only that group's old thread ever leaks, never another group's. Cleaned up at the terminal path
-(Phase 3 below), never here.
-
-**`GROUP_THREADS` must hold exactly one entry per group at all times — a retry REPLACES, never
-adds alongside.** If this failed group already had an earlier `(GROUP, THREAD_ID)` pair in
-`GROUP_THREADS` from a prior attempt this same round (the one that just failed and got leaked
-above), remove that stale pair before — or atomically with — adding the retry's new
-`(GROUP, THREAD_ID)` pair once its own Step 3 signal succeeds. Never leave both the leaked and the
-retry's `THREAD_ID` present for the same `GROUP` key: `GROUP_THREADS` is looked up by group slug
-for every later `--resume` dispatch and for terminal-path `--cleanup`, so two candidate values for
-one group makes both non-deterministic.
-
-### Step 4 — tmux auto-pane(s) (Round 1 only; best-effort, never fatal)
-
-Only on the round that first obtains a `THREAD_ID` for a given group (in practice, usually that
-group's round 1 — round 2+ resumes the same thread and therefore the same rollout file, so the
-pane already open from round 1 keeps tailing it with no action needed). Track "did I already open
-a pane for this group this session" the same way `SESSION_ID` is tracked — a fact Claude itself
-remembers per group, not a live shell variable. `PANE_IDS` is the per-group set of opened pane
-ids, parallel to `GROUP_THREADS`.
-
-**Retry case — retarget the existing pane, don't open a second one and don't leave it stale.** A
-round-1 retry after a post-`thread.started` failure (see "Per-group retry-leaks-a-thread case"
-above) obtains a genuinely NEW `THREAD_ID` for that same group, while that group's pane (if one was
-already opened for the now-abandoned first attempt) is still tailing the OLD thread's rollout file
-— left alone, it would keep showing stale/dead progress for a thread that was already abandoned.
-If that group already has a `PANE_ID` in `PANE_IDS` when its retry succeeds, do not open a new pane
-for it — interrupt the pane's current `watch-rollout.sh` foreground process first
-(`tmux send-keys -t "$PANE_ID" C-c` then `Enter`, since typing a new command into a pane whose
-shell is still occupied by a running foreground process just becomes that process's stdin, not a
-new shell command) and then re-run the same rollout-lookup-and-tail command shown below with the
-retry's new `THREAD_ID` substituted in. The pane's identity (`PANE_ID`) does not change — only
-which rollout file it tails.
-
-**N panes, one per dispatched group.** Create the first group's pane with the existing
-`tmux split-window -h -P -F '#{pane_id}'` (no `-t`, splitting the current window) and remember its
-printed pane id as `FIRST_PANE_ID`. For every additional group (parallel mode only), target that
-same pane id — `tmux -t` accepts a pane id as a target and splits the WINDOW that pane belongs to,
-which is exactly "the same window" every additional split needs, with no separate window-capture
-step required: `tmux split-window -h -t "$FIRST_PANE_ID" -P -F '#{pane_id}'`. Once ALL panes for
-this round's groups exist, run `tmux select-layout tiled 2>/dev/null || true` **once** — tmux's own
-auto-balancing grid layout, no hand-computed split geometry needed per N. A single-reviewer round
-(N=1) creates exactly one pane and skips `select-layout` (nothing to tile).
-
-Before ever creating a pane, guard — **per group** — against either value containing anything
-outside a strict path-safe charset — `$INSTALL_PATH` and that group's own `$THREAD_ID` are
-interpolated directly into a string that the *pane's own separate shell* re-parses as its command
-line, which is a different trust boundary than the sentinel-file idiom above (that idiom only
-protects a value passed as one already-quoted shell argument, not a value re-interpolated into a
-second string a different shell re-parses). A quote-only check is not enough here: a value
-containing `$(...)` or a backtick needs no quote character to run a command when the pane's shell
-parses the double-quoted segment it ends up inside — so the guard denies everything except
-letters, digits, `_./-`, and a literal space (a real install path can live under a directory whose
-name contains one, e.g. a macOS home directory like `/Users/John Doe/...` — a space is inert
-inside the double-quoted segment both values land in, so allowing it costs nothing while widening
-legitimate coverage), checked *before* that group's pane exists so a rejected value never leaves
-an orphaned blank pane behind:
-
-```bash
-GROUP="<literal from step 0 — e.g. main or g1>"
-THIS_IS_FIRST_PANE_THIS_ROUND="<true for the first group whose pane is opened this round, else false>"
-GROUP_COUNT="<the number of groups dispatched this round — 1 for single-reviewer, N for parallel>"
-# Separately-dispatched call -- rehydrate INSTALL_PATH/THREAD_ID by hand (see Phase 0's opening
-# note). THREAD_ID is a Codex-generated UUID (safe as a direct literal, per the safe-charset guard
-# above); INSTALL_PATH is externally resolved `jq` output and MUST go through the sentinel-file
-# safe-read idiom, never a hand-typed `VAR="<value>"` literal:
-INSTALL_PATH_FILE="<literal INSTALL_PATH_FILE path resolved once in Phase 0>"
-INSTALL_PATH="$(cat "$INSTALL_PATH_FILE")"; INSTALL_PATH="${INSTALL_PATH%x}"
-THREAD_ID="<this group's own literal THREAD_ID, already captured into GROUP_THREADS by Step 3
-above before Step 4 ever runs>"
-PANE_ID=""
-case "$INSTALL_PATH$THREAD_ID" in
-  *[!-A-Za-z0-9_./\ ]*)
-    :  # unsafe to interpolate into the pane's send-keys command; skip this group's pane
-       # without ever creating one
-    ;;
-  *)
-    if [ -n "${TMUX:-}" ]; then
-      if [ "$THIS_IS_FIRST_PANE_THIS_ROUND" = "true" ]; then
-        PANE_ID=$(tmux split-window -h -P -F '#{pane_id}' 2>/dev/null)
-        # Remember this printed PANE_ID as the literal fact "FIRST_PANE_ID" for the rest of the
-        # round (added to PANE_IDS below) -- every later branch rehydrates it from that literal,
-        # never from a live "$FIRST_PANE_ID" shell variable.
-      else
-        # FIRST_PANE_ID is rehydrated the same way -- substitute that group's own remembered
-        # literal pane id directly:
-        FIRST_PANE_ID="<the literal PANE_ID printed by the first group's own split above, already
-        remembered by Claude in PANE_IDS>"
-        PANE_ID=$(tmux split-window -h -t "$FIRST_PANE_ID" -P -F '#{pane_id}' 2>/dev/null)
-      fi
-    fi
-    ;;
-esac
-```
-
-After every group this round has attempted its split (the block above runs once per group), run
-this as a separate, final step — never inline inside the per-group loop, since it needs every
-group's own outcome first:
-
-```bash
-# CREATED_PANE_COUNT is likewise a literal Claude computes by hand from PANE_IDS (the per-group set
-# of opened pane ids, one entry per group whose split above actually returned a non-empty PANE_ID).
-# Only retile when this was actually a
-# parallel round (GROUP_COUNT > 1) AND more than one pane was actually created (a per-group
-# unsafe-charset skip, or TMUX being unset partway through, can leave fewer real panes than
-# GROUP_COUNT would suggest) — never for a single-reviewer round (nothing to tile), and never off
-# a bare $TMUX check alone, which would fire even with zero or one real pane and could retile
-# unrelated panes already in the user's window.
-GROUP_COUNT="<the same literal from the per-group block above>"
-CREATED_PANE_COUNT="<count of non-empty PANE_ID entries in PANE_IDS after every group's split attempt this round>"
-if [ "$GROUP_COUNT" -gt 1 ] && [ "$CREATED_PANE_COUNT" -gt 1 ]; then
-  tmux select-layout tiled 2>/dev/null || true
-fi
-```
-
-`tmux split-window -h` with **no command argument** spawns the pane's normal interactive shell —
-this is the load-bearing detail: a pane whose command argument directly runs a foreground
-process (e.g. `tmux split-window -h "codex ..."`) closes the instant that process exits, which is
-exactly the real, live-learned lesson this session's own design doc records. Typing a command
-into an already-running shell via `send-keys` instead means the shell survives even if the typed
-command (or the `tail -F` inside `watch-rollout.sh`) ever exits.
-
-If a group's `PANE_ID` is non-empty, resolve that group's round-1 rollout file and start watching
-it, all inside that pane's own shell. The rollout file can genuinely not exist on disk yet at the
-instant this runs — the `THREAD_ID` stderr signal (Step 3) fires before Codex is guaranteed to
-have created the file — so the pane's own command retries the lookup itself for up to ~10s rather
-than passing a possibly-empty path straight to `watch-rollout.sh`, which would otherwise exit
-immediately on its own required-argument check and never reach its unrelated file-wait loop:
-
-```bash
-tmux send-keys -t "$PANE_ID" 'R=""; for _i in $(seq 1 20); do R=$(find "$HOME/.codex/sessions/'"$(date +%Y/%m/%d)"'" -maxdepth 1 -name "rollout-*-'"$THREAD_ID"'.jsonl" 2>/dev/null | head -1); [ -z "$R" ] && R=$(find "$HOME/.codex/sessions" -name "rollout-*-'"$THREAD_ID"'.jsonl" 2>/dev/null | head -1); [ -n "$R" ] && break; sleep 0.5; done; "'"$INSTALL_PATH"'/scripts/watch-rollout.sh" "$R"' Enter
-```
-
-This directly interpolates that group's `$THREAD_ID` and `$INSTALL_PATH` rather than going through
-the sentinel-file idiom above — deliberately: `THREAD_ID` is a UUID Codex itself generated (not
-attacker-influenced) and, per the guard above, neither value reaching this point contains
-anything outside the safe charset. `INSTALL_PATH` was already safely resolved through the
-sentinel idiom earlier for its own purpose (passing it as one shell argument), and this command
-is a best-effort convenience typed into a pane for a human to watch, not an argument to the
-review wrapper itself — a malformed or skipped pane command only costs the live view for that
-group, never the round's correctness.
-
-`watch-rollout.sh` narrates `investigating: <command>` (from `custom_tool_call` events) and
-`round complete` (from `task_complete`) reliably; it may also print `reasoning: ...` lines
-depending on the provider/model configuration — don't rely on those appearing.
-
-If `TMUX` is unset, or `split-window`/`send-keys` fail for any reason (for one group or all), that
-group proceeds without a pane — narrate its progress through ordinary English text updates only.
-One group's pane failure never blocks another group's pane from being created.
-
-**UX note (not a hard limit):** past roughly 3–4 simultaneous panes, N concurrent narration
-streams get harder to usefully watch than one. This skill does not enforce a hard cap on live-pane
-creation — every dispatched group still gets a pane attempt regardless of N — but treat this as a
-known, human-watchability tradeoff of a large parallel run, not a defect.
-
----
-
 ## Phase 2 — Converge loop (R = 1 … 20)
 
 For each round, after Phase 1 delivers a result:
@@ -1349,10 +841,13 @@ For each round, after Phase 1 delivers a result:
    rebutted B — <clean | continuing>` (aggregated across all groups this round, worst-case-wins,
    for a parallel round). **Construct this round's `groups[]` field** (parallel round only — see
    "Review history log" below) from each dispatched group's own `--focus` text, `codex_review`
-   result, and `thread_id` kept from Step 1/3 above; a single-reviewer round has only one group's
+   result, and `thread_id` kept from Phase 2 step 1 above (each group's JSON response carries its own
+   `threadId` whenever one exists — the reason table above shows exactly which failure reasons don't —
+   the sole non-empty source `GROUP_THREADS` is established from; a failed group with no threadId in its
+   response is instead represented and handled by the Guards flow below); a single-reviewer round has only one group's
    result to carry forward, which becomes the round's own `target.focus`/`codex_review` directly,
    unchanged, with `groups[]` omitted entirely. **If capture-evidence is ON for this session**,
-   also run "Investigation evidence capture" steps 2-4 now, per dispatched group (extract via
+   also run `references/capture-evidence.md`'s steps 2-4 now, per dispatched group (extract via
    `jq`, merge across groups if this was a parallel round, delete the raw eventlog) — the
    resulting `investigation_evidence` object is one more field on this same round's line. Then
    append this round's line to the review history log (below), best-effort. Clean up this round's
@@ -1488,7 +983,7 @@ meaning.
       possible on round 1, before that round's own first dispatch has ever returned a `threadId`):
       nothing exists to resume — retry the same scope flag fresh, exactly once (include
       `--capture-eventlog` with its own fresh `EVENTLOG_FILE` when capture is ON, same as every
-      dispatch — see "Investigation evidence capture" above). **If this is round 1 and the reason
+      dispatch — see `references/capture-evidence.md`). **If this is round 1 and the reason
       is `no_thread_started`, capture coverage from the failing attempt BEFORE dispatching that
       retry** — see the "Round 1 only — capture coverage from the failing attempt BEFORE
       retrying" note below; it applies here identically, even though `no_thread_started` never
@@ -1544,8 +1039,8 @@ meaning.
     # If capture-evidence is ON for this session, literally include --capture-eventlog "<a
     # freshly-mktemp'd EVENTLOG_FILE, same template as Phase 1 Step 0 -- NOT the original round's
     # already-consumed one>" here too -- this retry is its own separate codex exec process with
-    # its own event log, exactly like every other dispatch call in this file (see "Investigation
-    # evidence capture" above, including its multi-attempt handling note); omit the flag entirely
+    # its own event log, exactly like every other dispatch call in this file (see
+    # references/capture-evidence.md, including its multi-attempt handling note); omit the flag entirely
     # when capture is OFF, same rule as Step 1.
     "$INSTALL_PATH/scripts/run-ccs-review.sh" --cwd "$REPO_ROOT_OR_CLEAN_REPO_DIR" \
       --resume "<that threadId>" --timeout 300 \
@@ -1560,7 +1055,7 @@ meaning.
     EARLIER attempt's `EVENTLOG_FILE` too, without extracting from it, once the round concludes —
     a disclosed, deliberate simplification: any commands Codex ran during an earlier failed
     attempt before it failed are not merged into that round's evidence, only the final attempt's
-    are. This keeps the merge model in "Investigation evidence capture" above to exactly one value
+    are. This keeps the merge model in `references/capture-evidence.md` to exactly one value
     per (round, group) rather than needing a second, attempt-level merge layer on top of the
     existing group-level one — and still closes the privacy contract (every allocated eventlog
     this session ever creates is deleted, extracted from or not), just narrows what gets reported
@@ -1583,7 +1078,7 @@ meaning.
     - If both resume-retries are exhausted and this was **round 1**: fall back to one fresh retry
       of the original scope flag, for that group, abandoning the now-unrecoverable thread (this
       fresh retry gets its own new `--capture-eventlog`/`EVENTLOG_FILE` too, when capture is ON,
-      same as every dispatch — see "Investigation evidence capture" above).
+      same as every dispatch — see `references/capture-evidence.md`).
       **Append that abandoned `(GROUP, threadId)` pair to `LEAKED_THREAD_IDS`** — Claude remembers
       this set for the rest of the run, the same way `GROUP_THREADS`/`SESSION_ID` are remembered —
       so Phase 3's terminal path (below) can clean it up alongside the run's final threads; it is
@@ -1599,8 +1094,8 @@ meaning.
     attempt would just fail the same way again, wasting up to a full timeout for a result already
     known in advance): skip the resume-retry step entirely.
     - **Round 1:** retry the original scope flag fresh, exactly once, for that group (its own new
-      `--capture-eventlog`/`EVENTLOG_FILE` too, when capture is ON — see "Investigation evidence
-      capture" above) — append the now-confirmed-dead `(GROUP, threadId)` to `LEAKED_THREAD_IDS`
+      `--capture-eventlog`/`EVENTLOG_FILE` too, when capture is ON — see
+      `references/capture-evidence.md`) — append the now-confirmed-dead `(GROUP, threadId)` to `LEAKED_THREAD_IDS`
       (its rollout is already gone or unreachable, but the thread record itself may still need
       explicit `--cleanup` at the terminal path). If the fresh retry also fails, stop — report
       **⚠️ COULD NOT VERIFY**.
@@ -1640,8 +1135,8 @@ Claude is the sole writer/reader of this log — Codex never sees it.
 
 **Line schema (one JSON object per round)** — `target`,
 `codex_review`, `coverage_source`, `claude_verification`, `round_outcome`, and
-`investigation_evidence` when capture-evidence is ON for this session (see "Investigation
-evidence capture" above), plus `groups`, for a parallel round only, with one
+`investigation_evidence` when capture-evidence is ON for this session (see
+`references/capture-evidence.md`), plus `groups`, for a parallel round only, with one
 `ccs`-specific addition (`thread_id`). `target.scope` also gains
 one more legal value (`"resume"`) to describe what `/ccs` rounds 2+ actually do. **The common
 case — a single-reviewer round (`GROUP="main"`), capture-evidence OFF — is completely unchanged
@@ -1666,24 +1161,17 @@ omitted entirely, and so is `investigation_evidence`, exactly as shown below:
 }
 ```
 
-**With capture-evidence ON**, that same line gains one more sibling field, `investigation_evidence`
-— the `{"command_count": N, "commands": [...]}` object "Investigation evidence capture" above
-produces (group-merged first, for a parallel round):
-```json
-{"investigation_evidence": {"command_count": 3, "commands": ["grep -rn foo src/", "cat package.json", "npm test"]}}
-```
-(shown here as its own standalone object containing only the field being illustrated; in the
-actual log line it is one sibling field alongside `session_id`/`round`/`target`/etc., exactly as
-in the full example above.) Omitted entirely — never an empty `{"command_count":0,"commands":[]}`
-placeholder — when capture-evidence is OFF for this session, so a plain `jq 'has
-("investigation_evidence")'` on any line reliably tells whether that session had capture on.
+**With capture-evidence ON**, that same line gains one more sibling field,
+`investigation_evidence` — see `references/capture-evidence.md`'s JSONL field section (you already
+read this file per this session's capture-evidence decision above) for its exact shape and
+omission rule.
 
 - `thread_id`: the single-reviewer round's own `THREAD_ID` (`GROUP="main"`'s entry in
   `GROUP_THREADS`) — the exact same durable-backstop purpose the parallel case's `groups[].thread_id`
-  serves (see below), just at the top level here since there is only ever one thread to track for
-  a single-reviewer round. Without this field, a single-reviewer session's log would have no way to
-  recover a lost/forgotten `THREAD_ID` at all — unlike the parallel case, which always had this
-  backstop via `groups[]`.
+  serves (see `references/parallel-mode.md`'s "JSONL field: `groups`" section), just at the top
+  level here since there is only ever one thread to track for a single-reviewer round. Without this
+  field, a single-reviewer session's log would have no way to recover a lost/forgotten `THREAD_ID`
+  at all — unlike the parallel case, which always had this backstop via `groups[]`.
 
 - `target.scope`: `"uncommitted"` / `"base"` / `"commit"` for round 1 (whichever fresh scope flag
   was used); `"resume"` for every round 2+ — no scope flag is ever sent on those, so logging the
@@ -1700,53 +1188,10 @@ placeholder — when capture-evidence is OFF for this session, so a plain `jq 'h
   across all rounds, `linked_finding_id` traces a
   disputed finding's multi-round thread, actions are `accept` / `reject_with_rationale` /
   `request_rereview` / `parked`.
-- `groups`: **added only for a parallel round — more than one group dispatched this round (see
-  "Determine review mode" above).** Each dispatched group runs its own separate wrapper call with
-  its own `--focus` text and produces its own separate `codex_review` result, and without this
-  field only one group's result (or an undefined amalgamation) would ever be recorded, silently
-  losing every other group's real findings. **Common case — a single-reviewer round: omit this
-  field entirely**, exactly as shown in the example above. **Only when this round actually
-  dispatched more than one group:** `groups` is an array with exactly one element per dispatched
-  group:
-  ```json
-  {
-    "groups": [
-      {"group": "g1", "thread_id": "<g1's own threadId>", "focus": "<g1's exact --focus text>", "codex_review": {"ok": true, "verdict": "ISSUES", "findings": [{"id": "f1", "file": "...", "line": 42, "severity": "high", "summary": "...", "evidence": "...", "linked_finding_id": null}]}},
-      {"group": "g2", "thread_id": "<g2's own threadId>", "focus": "<g2's exact --focus text>", "codex_review": {"ok": true, "verdict": "CLEAN", "findings": []}},
-      {"group": "g3", "thread_id": "<g3's own threadId, if one was ever obtained>", "focus": "<g3's exact --focus text>", "codex_review": {"ok": false, "reason": "timeout", "detail": "..."}}
-    ]
-  }
-  ```
-  (shown here as its own standalone valid JSON object containing only the `groups` field being
-  illustrated; in the actual log line it is one sibling field alongside `session_id`/`round`/
-  `target`/etc., exactly as in the full single-reviewer example above.)
-  `thread_id` is the durable backstop for
-  `GROUP_THREADS` (see Phase 1 Step 1 above) — `jq '.groups[] | {group, thread_id}'` on the
-  latest round's log line re-derives the group→thread mapping if memory is ever in doubt.
-  What the top-level `target.focus`/`codex_review` fields hold for a parallel round, so a consumer
-  reading only the top-level fields still gets a reasonable, non-misleading summary: `target.focus`
-  is a short synthesized note, e.g. `"(parallel round, 3 groups — see groups[] for each group's
-  actual focus)"` — never any one group's real focus text presented as the round's only focus.
-  `codex_review` is an AGGREGATED verdict/findings, worst-case-wins exactly like the
-  `coverage_source` merge above: `verdict` is `"ISSUES"` if ANY group's own verdict was `"ISSUES"`
-  or had a non-empty `findings` array; `"CLEAN"` only if EVERY group's own verdict was `"CLEAN"`
-  with zero findings. The aggregated `findings` array concatenates every group's own `findings`,
-  each additionally tagged with a `"group"` field naming its source group. **A group that returned
-  `"ok":false` also forces the aggregate `verdict` to `"ISSUES"`** — its `groups[]` entry is the
-  raw wrapper failure shape verbatim (see `g3` above), it contributes nothing to the aggregated
-  `findings` concatenation, and it does not count as `"CLEAN"` for the aggregated verdict; `"ISSUES"`
-  here is a mechanical non-`"CLEAN"` placeholder value only, never a claim that real code defects
-  were found — the actual reason (a group's review never completed) lives in that group's own raw
-  `groups[]` entry, and the round as a whole is never eligible for `✅ CLEAN` in this state anyway
-  (it is `⚠️ COULD NOT VERIFY` once retries are exhausted, per the Guards below) regardless of what
-  this aggregate field says.
-  **`investigation_evidence`, when capture-evidence is ON for this session, is still a single
-  top-level sibling field on the round's line — never nested per-group inside `groups[]` itself.**
-  Each dispatched group produces its own `INVESTIGATION_EVIDENCE_JSON` (see "Investigation
-  evidence capture" above), but the round's single `investigation_evidence` field is always the
-  one, already-merged-across-groups value from that section's step 3 — the same merge-once
-  pattern already used for `coverage_source` above, not a second, independently-invented merge
-  rule.
+- `groups`: added only for a parallel round — see `references/parallel-mode.md`'s
+  "JSONL field: `groups`" section (already read per this session's parallel-mode decision) for
+  the full schema, the worst-case-wins aggregation rule, and the `investigation_evidence`
+  interaction.
 
 **Write:** append via `jq -nc` redirected with `>>`, `umask 077` restated immediately before
 every append (a fresh Bash call each time — the earlier `mkdir`'s umask doesn't carry over).
@@ -1812,16 +1257,7 @@ caller-owns-cleanup contract (see "Mode 2 — cleanup" above).
    (naming which group it belonged to), never hide it, and **a `cleanup_failed` on one pair never
    skips cleaning up any other pair still in the set**.
 
-3. **Close every group's tmux pane**, for every `PANE_ID` opened in Phase 1 step 4 (one pane for
-   the common single-reviewer case, N panes for a parallel run):
-   ```bash
-   tmux kill-pane -t "<that group's literal PANE_ID>" 2>/dev/null || true
-   ```
-   Loop over every group's `PANE_ID` — best-effort per pane, same as today; a failure closing one
-   group's pane never skips closing any other group's pane, and no pane-close failure here is ever
-   worth surfacing to the user.
-
-4. **Clean up session-level temp files:**
+3. **Clean up session-level temp files:**
    ```bash
    rm -f "<literal REPO_ROOT_FILE>" "<literal INSTALL_PATH_FILE>"
    # only if this session ever actually allocated them (most sessions never do — see Phase 0 step 4):
