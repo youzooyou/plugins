@@ -1,6 +1,6 @@
 ---
 name: ccs
-description: Claude executes a task then runs a Claude+Codex adversarial cross-review loop (max 20 rounds) until fact-based consensus, built on a single resumable Codex thread per reviewer instead of a fresh process per round, so follow-up rounds are cheaper (no diff re-send after round 1) and, in a tmux-capable environment, a live progress pane opens automatically per reviewer. Supports both single-reviewer and parallel multi-reviewer (N concurrent, dimension-focused reviewers, each on its own resumable thread) modes.
+description: Claude executes a task then runs a Claude+Codex adversarial cross-review loop (max 20 rounds) until fact-based consensus, built on a single resumable Codex thread per reviewer instead of a fresh process per round, so follow-up rounds are cheaper (no diff re-send after round 1). Supports both single-reviewer and parallel multi-reviewer (N concurrent, dimension-focused reviewers, each on its own resumable thread) modes.
 ---
 
 # /ccs — Claude + Codex Cross-Review on a Resumable Thread
@@ -25,8 +25,7 @@ non-repo artifact is handled, via the `CLEAN_REPO_DIR` mechanism).
 
 `/ccs` dispatches every review round through `run-ccs-review.sh`, a resumable-thread wrapper — one
 persistent Codex thread per reviewer for the whole run, `--resume`d every round after the first
-rather than re-sent the diff each time. It opens a live tmux pane on the round's rollout file when
-possible, and **always cleans up its Codex thread on every terminal path** — never left to the
+rather than re-sent the diff each time. It **always cleans up its Codex thread on every terminal path** — never left to the
 user, unlike `stream-review`'s own caller-owns-cleanup contract.
 
 `/ccs` also supports parallel multi-reviewer mode — N concurrent, dimension-focused reviewers
@@ -885,10 +884,10 @@ before) — harmless, since these are ephemeral per-run files cleaned up at the 
 
 **Why `ERR_FILE` is separate from `OUT_FILE`.** `run-ccs-review.sh` prints the early
 `THREAD_ID=<uuid>` signal on **stderr** the moment a thread starts (or immediately, on a resumed
-round) — well before the round's final JSON appears on stdout. `/ccs` needs the early signal for
-the tmux pane and for holding onto a threadId even if the round later fails, so the two streams
-are kept apart, exactly as `stream-review`'s own SKILL.md documents ("redirect stdout and stderr
-to SEPARATE files"). This
+round) — well before the round's final JSON appears on stdout. `/ccs` keeps this stream separate from stdout's clean JSON, exactly as `stream-review`'s
+own SKILL.md documents ("redirect stdout and stderr to SEPARATE files") — any wrapper-emitted
+stderr noise (there is none in normal operation today, but the separation costs nothing and
+matches the sibling skill's own convention) never contaminates the JSON parse. This
 reasoning applies identically per group — each dispatched group has its own `OUT_FILE`/`ERR_FILE`
 pair (Step 0 above), so each group's early `THREAD_ID` signal and final JSON are separated from
 every other group's, never just from each other within one group's own pair.
@@ -1021,9 +1020,10 @@ fallback-artifact-detection commands in Phase 0 step 4 — since those cannot in
 commands and the live confirmation that a repo-local `core.fsmonitor` hook does not fire through
 them either.
 
-**`GROUP_THREADS` — the ordered set of `(GROUP, THREAD_ID)` pairs.** Established once, right after
-round 1's dispatched groups each independently signal their own `THREAD_ID` via Step 3 below (run
-once per group). Remembered by Claude as a literal fact for the rest of the run, the same way a
+**`GROUP_THREADS` — the ordered set of `(GROUP, THREAD_ID)` pairs.** Established once, right after round 1's dispatched groups' results are each parsed in
+Phase 2 step 1 below — every group's own JSON response carries its `threadId` whenever one exists
+(the reason table above shows exactly which failure reasons do), whether that round succeeded or
+failed, so no earlier capture step is needed. Remembered by Claude as a literal fact for the rest of the run, the same way a
 single `THREAD_ID` is already remembered today — just N instances of an already-accepted pattern.
 Carried forward by hand into every group's `--resume` dispatch at round 2+ (each group resumes
 ONLY its own thread, never another group's). Durable backstop, not the primary carrier: each
@@ -1115,206 +1115,6 @@ watcher's own poll interval (`sleep 180` above) means treating it as a required 
 an already-finished round by up to ~180s for no benefit, compounding across up to 20 rounds — stop
 that group's watcher (it has no further purpose) as soon as its primary result is in hand, exactly
 as done for every group in this same round.
-
-### Step 3 — early `THREAD_ID` signal (ccs-specific; drives the tmux pane)
-
-**Round 1 only, per group — skip entirely on that group's round 2+.** On a resume round, that
-group's `THREAD_ID` is already known (it's the literal value passed to `--resume`, looked up from
-`GROUP_THREADS`), so this poll would be redundant work; same skip-on-resume logic as step 4's tmux
-pane below. **One independent poll per group dispatched at round 1** — N concurrent polls for a
-parallel round's first round, one per group's own `ERR_FILE`.
-
-A third, independent, bounded poll per group — this is a genuine "notify me once" case, so use
-Bash with `run_in_background: true` and an `until` loop that exits on its own, not `Monitor`
-(which is for repeated/indefinite events):
-
-```bash
-GROUP="<literal from step 0 — e.g. main or g1>"
-ERR_FILE="<this group's literal from step 0>"
-DEADLINE=$(( $(date +%s) + 30 ))
-until grep -q '^THREAD_ID=' "$ERR_FILE" 2>/dev/null; do
-  [ "$(date +%s)" -ge "$DEADLINE" ] && { echo "${GROUP}: no THREAD_ID signal within 30s — round likely failed before/during dispatch"; exit 1; }
-  sleep 0.5
-done
-grep '^THREAD_ID=' "$ERR_FILE" | head -1
-```
-
-30s is generous: the wrapper's own internal "no thread.started" timeout is 10s, and a live,
-timestamped test of this exact mechanism (see the design doc) measured a 5.46s real
-dispatch→signal gap. This poll is **purely informational** — it exists only to decide whether/
-when to open that group's tmux pane below. If it times out for a given group (a genuine
-`bad_args`/`no_thread_started` failure for that group, or just an unusually slow start), skip the
-pane for that group this round; nothing about the review's correctness depends on it ever
-succeeding — the primary channel (step 1) and its JSON `ok:false` remain the actual source of
-truth for that group's round failure.
-
-Once this fires for a group, parse `<uuid>` out of the `THREAD_ID=<uuid>` line and remember it as
-that group's literal `THREAD_ID`, adding `(GROUP, THREAD_ID)` to `GROUP_THREADS` (needed for that
-group's tmux pane immediately below, for that group's `--resume` next round, and for that group's
-`--cleanup` at the terminal path — capture it from here or from that group's round-1 final JSON,
-whichever arrives; either source is the same value).
-
-**Per-group retry-leaks-a-thread case.** A round-1 retry (see Guards below) after a
-post-`thread.started` failure abandons that group's first, still-real thread the moment it
-dispatches fresh again with a new `threadId`. Append that abandoned id to that group's entry in
-`LEAKED_THREAD_IDS` — now a set of `(GROUP, threadId)` pairs rather than a flat list, since a
-round-1 retry is scoped to the ONE failed group only ("retry just that failed group once") — so
-only that group's old thread ever leaks, never another group's. Cleaned up at the terminal path
-(Phase 3 below), never here.
-
-**`GROUP_THREADS` must hold exactly one entry per group at all times — a retry REPLACES, never
-adds alongside.** If this failed group already had an earlier `(GROUP, THREAD_ID)` pair in
-`GROUP_THREADS` from a prior attempt this same round (the one that just failed and got leaked
-above), remove that stale pair before — or atomically with — adding the retry's new
-`(GROUP, THREAD_ID)` pair once its own Step 3 signal succeeds. Never leave both the leaked and the
-retry's `THREAD_ID` present for the same `GROUP` key: `GROUP_THREADS` is looked up by group slug
-for every later `--resume` dispatch and for terminal-path `--cleanup`, so two candidate values for
-one group makes both non-deterministic.
-
-### Step 4 — tmux auto-pane(s) (Round 1 only; best-effort, never fatal)
-
-Only on the round that first obtains a `THREAD_ID` for a given group (in practice, usually that
-group's round 1 — round 2+ resumes the same thread and therefore the same rollout file, so the
-pane already open from round 1 keeps tailing it with no action needed). Track "did I already open
-a pane for this group this session" the same way `SESSION_ID` is tracked — a fact Claude itself
-remembers per group, not a live shell variable. `PANE_IDS` is the per-group set of opened pane
-ids, parallel to `GROUP_THREADS`.
-
-**Retry case — retarget the existing pane, don't open a second one and don't leave it stale.** A
-round-1 retry after a post-`thread.started` failure (see "Per-group retry-leaks-a-thread case"
-above) obtains a genuinely NEW `THREAD_ID` for that same group, while that group's pane (if one was
-already opened for the now-abandoned first attempt) is still tailing the OLD thread's rollout file
-— left alone, it would keep showing stale/dead progress for a thread that was already abandoned.
-If that group already has a `PANE_ID` in `PANE_IDS` when its retry succeeds, do not open a new pane
-for it — interrupt the pane's current `watch-rollout.sh` foreground process first
-(`tmux send-keys -t "$PANE_ID" C-c` then `Enter`, since typing a new command into a pane whose
-shell is still occupied by a running foreground process just becomes that process's stdin, not a
-new shell command) and then re-run the same rollout-lookup-and-tail command shown below with the
-retry's new `THREAD_ID` substituted in. The pane's identity (`PANE_ID`) does not change — only
-which rollout file it tails.
-
-**N panes, one per dispatched group.** Create the first group's pane with the existing
-`tmux split-window -h -P -F '#{pane_id}'` (no `-t`, splitting the current window) and remember its
-printed pane id as `FIRST_PANE_ID`. For every additional group (parallel mode only), target that
-same pane id — `tmux -t` accepts a pane id as a target and splits the WINDOW that pane belongs to,
-which is exactly "the same window" every additional split needs, with no separate window-capture
-step required: `tmux split-window -h -t "$FIRST_PANE_ID" -P -F '#{pane_id}'`. Once ALL panes for
-this round's groups exist, run `tmux select-layout tiled 2>/dev/null || true` **once** — tmux's own
-auto-balancing grid layout, no hand-computed split geometry needed per N. A single-reviewer round
-(N=1) creates exactly one pane and skips `select-layout` (nothing to tile).
-
-Before ever creating a pane, guard — **per group** — against either value containing anything
-outside a strict path-safe charset — `$INSTALL_PATH` and that group's own `$THREAD_ID` are
-interpolated directly into a string that the *pane's own separate shell* re-parses as its command
-line, which is a different trust boundary than the sentinel-file idiom above (that idiom only
-protects a value passed as one already-quoted shell argument, not a value re-interpolated into a
-second string a different shell re-parses). A quote-only check is not enough here: a value
-containing `$(...)` or a backtick needs no quote character to run a command when the pane's shell
-parses the double-quoted segment it ends up inside — so the guard denies everything except
-letters, digits, `_./-`, and a literal space (a real install path can live under a directory whose
-name contains one, e.g. a macOS home directory like `/Users/John Doe/...` — a space is inert
-inside the double-quoted segment both values land in, so allowing it costs nothing while widening
-legitimate coverage), checked *before* that group's pane exists so a rejected value never leaves
-an orphaned blank pane behind:
-
-```bash
-GROUP="<literal from step 0 — e.g. main or g1>"
-THIS_IS_FIRST_PANE_THIS_ROUND="<true for the first group whose pane is opened this round, else false>"
-GROUP_COUNT="<the number of groups dispatched this round — 1 for single-reviewer, N for parallel>"
-# Separately-dispatched call -- rehydrate INSTALL_PATH/THREAD_ID by hand (see Phase 0's opening
-# note). THREAD_ID is a Codex-generated UUID (safe as a direct literal, per the safe-charset guard
-# above); INSTALL_PATH is externally resolved `jq` output and MUST go through the sentinel-file
-# safe-read idiom, never a hand-typed `VAR="<value>"` literal:
-INSTALL_PATH_FILE="<literal INSTALL_PATH_FILE path resolved once in Phase 0>"
-INSTALL_PATH="$(cat "$INSTALL_PATH_FILE")"; INSTALL_PATH="${INSTALL_PATH%x}"
-THREAD_ID="<this group's own literal THREAD_ID, already captured into GROUP_THREADS by Step 3
-above before Step 4 ever runs>"
-PANE_ID=""
-case "$INSTALL_PATH$THREAD_ID" in
-  *[!-A-Za-z0-9_./\ ]*)
-    :  # unsafe to interpolate into the pane's send-keys command; skip this group's pane
-       # without ever creating one
-    ;;
-  *)
-    if [ -n "${TMUX:-}" ]; then
-      if [ "$THIS_IS_FIRST_PANE_THIS_ROUND" = "true" ]; then
-        PANE_ID=$(tmux split-window -h -P -F '#{pane_id}' 2>/dev/null)
-        # Remember this printed PANE_ID as the literal fact "FIRST_PANE_ID" for the rest of the
-        # round (added to PANE_IDS below) -- every later branch rehydrates it from that literal,
-        # never from a live "$FIRST_PANE_ID" shell variable.
-      else
-        # FIRST_PANE_ID is rehydrated the same way -- substitute that group's own remembered
-        # literal pane id directly:
-        FIRST_PANE_ID="<the literal PANE_ID printed by the first group's own split above, already
-        remembered by Claude in PANE_IDS>"
-        PANE_ID=$(tmux split-window -h -t "$FIRST_PANE_ID" -P -F '#{pane_id}' 2>/dev/null)
-      fi
-    fi
-    ;;
-esac
-```
-
-After every group this round has attempted its split (the block above runs once per group), run
-this as a separate, final step — never inline inside the per-group loop, since it needs every
-group's own outcome first:
-
-```bash
-# CREATED_PANE_COUNT is likewise a literal Claude computes by hand from PANE_IDS (the per-group set
-# of opened pane ids, one entry per group whose split above actually returned a non-empty PANE_ID).
-# Only retile when this was actually a
-# parallel round (GROUP_COUNT > 1) AND more than one pane was actually created (a per-group
-# unsafe-charset skip, or TMUX being unset partway through, can leave fewer real panes than
-# GROUP_COUNT would suggest) — never for a single-reviewer round (nothing to tile), and never off
-# a bare $TMUX check alone, which would fire even with zero or one real pane and could retile
-# unrelated panes already in the user's window.
-GROUP_COUNT="<the same literal from the per-group block above>"
-CREATED_PANE_COUNT="<count of non-empty PANE_ID entries in PANE_IDS after every group's split attempt this round>"
-if [ "$GROUP_COUNT" -gt 1 ] && [ "$CREATED_PANE_COUNT" -gt 1 ]; then
-  tmux select-layout tiled 2>/dev/null || true
-fi
-```
-
-`tmux split-window -h` with **no command argument** spawns the pane's normal interactive shell —
-this is the load-bearing detail: a pane whose command argument directly runs a foreground
-process (e.g. `tmux split-window -h "codex ..."`) closes the instant that process exits, which is
-exactly the real, live-learned lesson this session's own design doc records. Typing a command
-into an already-running shell via `send-keys` instead means the shell survives even if the typed
-command (or the `tail -F` inside `watch-rollout.sh`) ever exits.
-
-If a group's `PANE_ID` is non-empty, resolve that group's round-1 rollout file and start watching
-it, all inside that pane's own shell. The rollout file can genuinely not exist on disk yet at the
-instant this runs — the `THREAD_ID` stderr signal (Step 3) fires before Codex is guaranteed to
-have created the file — so the pane's own command retries the lookup itself for up to ~10s rather
-than passing a possibly-empty path straight to `watch-rollout.sh`, which would otherwise exit
-immediately on its own required-argument check and never reach its unrelated file-wait loop:
-
-```bash
-tmux send-keys -t "$PANE_ID" 'R=""; for _i in $(seq 1 20); do R=$(find "$HOME/.codex/sessions/'"$(date +%Y/%m/%d)"'" -maxdepth 1 -name "rollout-*-'"$THREAD_ID"'.jsonl" 2>/dev/null | head -1); [ -z "$R" ] && R=$(find "$HOME/.codex/sessions" -name "rollout-*-'"$THREAD_ID"'.jsonl" 2>/dev/null | head -1); [ -n "$R" ] && break; sleep 0.5; done; "'"$INSTALL_PATH"'/scripts/watch-rollout.sh" "$R"' Enter
-```
-
-This directly interpolates that group's `$THREAD_ID` and `$INSTALL_PATH` rather than going through
-the sentinel-file idiom above — deliberately: `THREAD_ID` is a UUID Codex itself generated (not
-attacker-influenced) and, per the guard above, neither value reaching this point contains
-anything outside the safe charset. `INSTALL_PATH` was already safely resolved through the
-sentinel idiom earlier for its own purpose (passing it as one shell argument), and this command
-is a best-effort convenience typed into a pane for a human to watch, not an argument to the
-review wrapper itself — a malformed or skipped pane command only costs the live view for that
-group, never the round's correctness.
-
-`watch-rollout.sh` narrates `investigating: <command>` (from `custom_tool_call` events) and
-`round complete` (from `task_complete`) reliably; it may also print `reasoning: ...` lines
-depending on the provider/model configuration — don't rely on those appearing.
-
-If `TMUX` is unset, or `split-window`/`send-keys` fail for any reason (for one group or all), that
-group proceeds without a pane — narrate its progress through ordinary English text updates only.
-One group's pane failure never blocks another group's pane from being created.
-
-**UX note (not a hard limit):** past roughly 3–4 simultaneous panes, N concurrent narration
-streams get harder to usefully watch than one. This skill does not enforce a hard cap on live-pane
-creation — every dispatched group still gets a pane attempt regardless of N — but treat this as a
-known, human-watchability tradeoff of a large parallel run, not a defect.
-
----
 
 ## Phase 2 — Converge loop (R = 1 … 20)
 
@@ -1812,16 +1612,7 @@ caller-owns-cleanup contract (see "Mode 2 — cleanup" above).
    (naming which group it belonged to), never hide it, and **a `cleanup_failed` on one pair never
    skips cleaning up any other pair still in the set**.
 
-3. **Close every group's tmux pane**, for every `PANE_ID` opened in Phase 1 step 4 (one pane for
-   the common single-reviewer case, N panes for a parallel run):
-   ```bash
-   tmux kill-pane -t "<that group's literal PANE_ID>" 2>/dev/null || true
-   ```
-   Loop over every group's `PANE_ID` — best-effort per pane, same as today; a failure closing one
-   group's pane never skips closing any other group's pane, and no pane-close failure here is ever
-   worth surfacing to the user.
-
-4. **Clean up session-level temp files:**
+3. **Clean up session-level temp files:**
    ```bash
    rm -f "<literal REPO_ROOT_FILE>" "<literal INSTALL_PATH_FILE>"
    # only if this session ever actually allocated them (most sessions never do — see Phase 0 step 4):
