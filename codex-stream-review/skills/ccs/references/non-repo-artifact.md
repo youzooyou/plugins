@@ -37,8 +37,9 @@
 
      `FAKE_GIT_HOME` is session-scoped exactly like `CLEAN_REPO_DIR` — allocated once, lazily, the
      first time this session needs it, remembered as an exact literal for the rest of the run, and
-     cleaned up in Phase 3 alongside `CLEAN_REPO_DIR` (`rm -rf`, not just `CLEAN_REPO_DIR`'s own
-     cleanup — see Phase 3 below). It must be a genuinely SEPARATE directory from `CLEAN_REPO_DIR`
+     cleaned up in `codex-stream-review/skills/ccs/SKILL.md`'s own Phase 3 alongside
+     `CLEAN_REPO_DIR` (`rm -rf`, not just `CLEAN_REPO_DIR`'s own
+     cleanup). It must be a genuinely SEPARATE directory from `CLEAN_REPO_DIR`
      itself (never reuse one for the other) — `HOME` and the git worktree being initialized are
      different concerns, and collapsing them risks `git init` writing `.gitconfig`-adjacent state
      into the same directory whose content is supposed to be exactly what `CLEAN_REPO_DIR` isolates.
@@ -71,14 +72,16 @@
      the exact "guaranteed empty diff" property this mechanism exists to provide. Removing the
      seed commit removes this failure mode entirely: there is no `git commit` call left that
      could fail, and no placeholder file left to go stray. Like `PID_FILE`/`OUT_FILE`/`FOCUS_FILE`
-     (see Phase 1 step 0 below), `CLEAN_REPO_DIR` is `mktemp -d`'s own output — a path Claude
+     (see `codex-stream-review/skills/ccs/SKILL.md`'s own Phase 1 Step 0), `CLEAN_REPO_DIR` is
+     `mktemp -d`'s own output — a path Claude
      fully controls the template of, guaranteed free of shell metacharacters — so it is simply
      printed and remembered as an exact literal string for the rest of the session, with no
      file-plus-sentinel indirection needed (unlike `REPO_ROOT_FILE`/`INSTALL_PATH_FILE`, which
      hold externally-resolved values Claude does not fully control character-by-character).
 
      **A non-repo-artifact round is always single-group `main`, never parallel — full stop.**
-     Phase 1's sizing/mode-selection logic (below) measures review scope by counting files in a
+     `codex-stream-review/skills/ccs/SKILL.md`'s own Phase 1 sizing/mode-selection logic
+     ("Determine review mode") measures review scope by counting files in a
      real diff; run against a freshly-`git init`'d, zero-file `CLEAN_REPO_DIR` it would trivially
      return `0` and there is nothing to partition by file count in the first place, so the
      parallel-mode machinery simply does not apply to this case — skip it entirely and dispatch
@@ -92,8 +95,9 @@
      uses `--resume` exactly as normal (the resumed thread already has the pasted artifact
      content in its own context, same as any other round 2+).
 
-     **Cleanup:** `CLEAN_REPO_DIR` (when created this session) is removed in Phase 3 alongside
-     `REPO_ROOT_FILE`/`INSTALL_PATH_FILE` — see Phase 3 below. It is created lazily (only if this
+     **Cleanup:** `CLEAN_REPO_DIR` (when created this session) is removed in
+     `codex-stream-review/skills/ccs/SKILL.md`'s own Phase 3 alongside
+     `REPO_ROOT_FILE`/`INSTALL_PATH_FILE`. It is created lazily (only if this
      session ever actually needs it, i.e. only in the genuine-non-repo-artifact branch above, never
      in the still-nothing-concrete-at-all branch), so Phase 3's cleanup only runs when one was
      actually allocated. (The still-nothing-concrete-at-all early exit's own `rm -f` for
@@ -134,4 +138,5 @@ tree for that round, defeating the whole point of the isolation `CLEAN_REPO_DIR`
 guarantee. Only the diff-collection scope flag changes between round 1 (`--uncommitted`) and round
 2+ (`--resume <threadId>`) — `--cwd "$CLEAN_REPO_DIR"` stays constant across every round of the
 session. (A non-repo-artifact round is always single-group `main` — see Phase 0 step 4 and
-"Determine review mode" above — so this substitution never applies to more than one group.)
+`codex-stream-review/skills/ccs/SKILL.md`'s own "Determine review mode" section — so this
+substitution never applies to more than one group.)
