@@ -842,7 +842,9 @@ For each round, after Phase 1 delivers a result:
    for a parallel round). **Construct this round's `groups[]` field** (parallel round only — see
    "Review history log" below) from each dispatched group's own `--focus` text, `codex_review`
    result, and `thread_id` kept from Phase 2 step 1 above (each group's JSON response carries its own
-   `threadId`, the sole source `GROUP_THREADS` is now established from); a single-reviewer round has only one group's
+   `threadId` whenever one exists — the reason table above shows exactly which failure reasons don't —
+   the sole non-empty source `GROUP_THREADS` is established from; a failed group with no threadId in its
+   response is instead represented and handled by the Guards flow below); a single-reviewer round has only one group's
    result to carry forward, which becomes the round's own `target.focus`/`codex_review` directly,
    unchanged, with `groups[]` omitted entirely. **If capture-evidence is ON for this session**,
    also run `references/capture-evidence.md`'s steps 2-4 now, per dispatched group (extract via
