@@ -31,24 +31,6 @@ kill_process_group() {
   sleep 1
   kill -KILL -"$pid" 2>/dev/null
 }
-# resolve_rollout <threadId> -- rollout files live under
-# ~/.codex/sessions/<Y>/<M>/<D>/, so a thread started "now" almost always
-# resolves under today's date directory. Try that narrow, cheap lookup
-# first; only fall back to a full recursive scan of the whole sessions
-# tree (unbounded, grows with every session ever run) if today's
-# directory doesn't have it yet -- e.g. a call right at a midnight
-# rollover, or before the file has been created on disk. Always correct
-# (the fallback covers every case the narrow path could miss), just
-# cheaper in the common case.
-resolve_rollout() {
-  local tid="$1" f
-  f="$(find "$HOME/.codex/sessions/$(date +%Y/%m/%d 2>/dev/null)" -maxdepth 1 -name "rollout-*-${tid}.jsonl" 2>/dev/null | head -1)"
-  if [ -n "$f" ]; then
-    printf '%s' "$f"
-    return 0
-  fi
-  find "$HOME/.codex/sessions" -name "rollout-*-${tid}.jsonl" 2>/dev/null | head -1
-}
 on_signal() {
   kill_process_group "${CODEX_PID:-}"
   local job_pid
@@ -137,28 +119,31 @@ trap cleanup_temp_files EXIT
 trap on_signal INT TERM
 set -m
 
-# For --resume, the thread already exists: resolve its rollout file and
-# snapshot how many task_complete events it already has BEFORE dispatching
-# this round, so the completion check below can wait for a NEW one instead
-# of matching a prior round's. For a fresh round the thread doesn't exist
-# yet -- threadId (and therefore the rollout path) is only knowable once the
+# For --resume, the thread already exists -- nothing to pre-check: unlike
+# the removed rollout-file preflight, a genuinely dead/unknown threadId now
+# simply surfaces as a `nonzero_exit` from the actual dispatch below (never
+# `no_thread_started` -- that reason's only branch below is gated on a
+# FRESH dispatch's empty THREAD_ID, structurally unreachable once
+# RESUME_THREAD_ID has already been assigned to it), the same as any other
+# dispatch failure. For a fresh round
+# the thread doesn't exist yet -- threadId is only knowable once the
 # process's own --json stdout emits thread.started (Step 5).
 THREAD_ID=""
-ROLLOUT=""
-BASELINE_TASK_COMPLETE=0
 if [ -n "$RESUME_THREAD_ID" ]; then
   THREAD_ID="$RESUME_THREAD_ID"
   THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
   echo "THREAD_ID=$THREAD_ID" >&2
-  ROLLOUT="$(resolve_rollout "$THREAD_ID")"
-  if [ -z "$ROLLOUT" ] || [ ! -f "$ROLLOUT" ]; then
-    printf '{"ok":false,"reason":"resume_thread_not_found","threadId":%s,"detail":"no rollout file found for this threadId"}\n' "$THREAD_ID_JSON"
-    exit 1
-  fi
-  BASELINE_TASK_COMPLETE="$(jq -c 'select(.type=="event_msg" and .payload.type=="task_complete")' "$ROLLOUT" 2>/dev/null | wc -l | tr -d ' ')"
 fi
 
 mktemp_registered EVENTLOG
+# LAST_MESSAGE_FILE: codex exec's own `-o/--output-last-message` writes the
+# agent's final message text directly to this file -- the CLI's documented,
+# process-owned output channel, used here INSTEAD OF locating and parsing
+# this thread's rollout file under ~/.codex/sessions (removed: that
+# subsystem's on-disk format/compression is not a documented stable public
+# contract, and is unrelated to what this wrapper actually needs -- the
+# final answer text this same process already produced).
+mktemp_registered LAST_MESSAGE_FILE
 
 # Round dispatch (Step 4, finalized flags -- do not add --sandbox or
 # model_reasoning_effort to resume: `codex exec resume --help` has no
@@ -168,10 +153,10 @@ mktemp_registered EVENTLOG
 (
   cd "$CWD" || exit 127
   if [ -n "$RESUME_THREAD_ID" ]; then
-    codex exec resume "$RESUME_THREAD_ID" --json \
+    codex exec resume "$RESUME_THREAD_ID" --json -o "$LAST_MESSAGE_FILE" \
       ${SCHEMA:+--output-schema "$SCHEMA"} -- "$FOCUS" < /dev/null
   else
-    codex exec --json --sandbox read-only \
+    codex exec --json --sandbox read-only -o "$LAST_MESSAGE_FILE" \
       -c model_reasoning_effort=xhigh ${SCHEMA:+--output-schema "$SCHEMA"} \
       -- "$FOCUS" < /dev/null
   fi
@@ -202,23 +187,24 @@ if [ -z "$THREAD_ID" ]; then
   echo "THREAD_ID=$THREAD_ID" >&2
 fi
 
-# Step 6: resolve (fresh round) and tail the rollout file until a NEW
-# task_complete appears, bounded by the same wall-clock timeout + PID
-# liveness watchdog run-codex-review.sh already uses for its own codex exec
-# call -- process-group TERM then KILL on timeout.
+# Step 6: wait for THIS dispatch's own `turn.completed` event in $EVENTLOG
+# (the --json stdout stream this attempt itself produced -- confirmed
+# directly, live, to emit exactly one `turn.completed` per dispatch,
+# distinct from the OLDER `event_msg`/`task_complete` shape rollout files
+# use, which this stdout stream does NOT share), bounded by the same
+# wall-clock timeout + PID liveness watchdog run-ccs-review.sh already uses
+# for its own codex exec call -- process-group TERM then KILL on timeout.
+# No baseline/counter needed (unlike the removed rollout-based check): this
+# $EVENTLOG is a fresh file for this one dispatch attempt only, fresh or
+# resumed, never a shared growing history across rounds -- a single match
+# always means THIS attempt's own turn, never a prior round's.
 DEADLINE=$((SECONDS + DEFAULT_TIMEOUT_SECS))
 TIMED_OUT=0
 TASK_COMPLETE_SEEN=0
 while kill -0 "$CODEX_PID" 2>/dev/null; do
-  if [ -z "$ROLLOUT" ]; then
-    ROLLOUT="$(resolve_rollout "$THREAD_ID")"
-  fi
-  if [ -n "$ROLLOUT" ] && [ -f "$ROLLOUT" ]; then
-    CUR_COUNT="$(jq -c 'select(.type=="event_msg" and .payload.type=="task_complete")' "$ROLLOUT" 2>/dev/null | wc -l | tr -d ' ')"
-    if [ "${CUR_COUNT:-0}" -gt "$BASELINE_TASK_COMPLETE" ]; then
-      TASK_COMPLETE_SEEN=1
-      break
-    fi
+  if grep -q '"type":"turn.completed"' "$EVENTLOG" 2>/dev/null; then
+    TASK_COMPLETE_SEEN=1
+    break
   fi
   if [ "$SECONDS" -ge "$DEADLINE" ]; then
     TIMED_OUT=1
@@ -229,49 +215,65 @@ while kill -0 "$CODEX_PID" 2>/dev/null; do
   fi
   sleep 1
 done
+if [ "$TASK_COMPLETE_SEEN" -eq 1 ]; then
+  # turn.completed is written to this process's own stdout, but observing it
+  # says nothing about whether the process is actually about to exit. Give
+  # it a bounded grace period to exit on its own before falling back to the
+  # same kill sequence the deadline branch above uses; without this, a
+  # process that emits turn.completed but then hangs turns the unconditional
+  # `wait` below into an unbounded block, defeating this round's own
+  # DEFAULT_TIMEOUT_SECS guarantee entirely (mirrors run-ccs-review.sh's
+  # identical grace-period handling for the same underlying race).
+  GRACE_DEADLINE=$((SECONDS + 10))
+  while kill -0 "$CODEX_PID" 2>/dev/null && [ "$SECONDS" -lt "$GRACE_DEADLINE" ]; do
+    sleep 0.5
+  done
+  if kill -0 "$CODEX_PID" 2>/dev/null; then
+    TIMED_OUT=1
+    kill -TERM -"$CODEX_PID" 2>/dev/null
+    sleep 2
+    kill -KILL -"$CODEX_PID" 2>/dev/null
+  fi
+fi
 wait "$CODEX_PID" 2>/dev/null
 EXIT_CODE=$?
 CODEX_PID=""
 
-# task_complete can land ~250-330ms before the process itself exits (per the
-# knowledge base's live measurement) -- the kill -0 loop above can exit the
-# instant the process dies without one more poll ever running, so re-check
-# once more now that the process is confirmed gone.
-if [ "$TASK_COMPLETE_SEEN" -eq 0 ] && [ "$TIMED_OUT" -eq 0 ] && [ -n "$ROLLOUT" ] && [ -f "$ROLLOUT" ]; then
-  CUR_COUNT="$(jq -c 'select(.type=="event_msg" and .payload.type=="task_complete")' "$ROLLOUT" 2>/dev/null | wc -l | tr -d ' ')"
-  [ "${CUR_COUNT:-0}" -gt "$BASELINE_TASK_COMPLETE" ] && TASK_COMPLETE_SEEN=1
+# turn.completed can land shortly before the process itself exits -- the
+# kill -0 loop above can exit the instant the process dies without one more
+# poll ever running, so re-check once more now that the process is
+# confirmed gone.
+if [ "$TASK_COMPLETE_SEEN" -eq 0 ] && [ "$TIMED_OUT" -eq 0 ]; then
+  grep -q '"type":"turn.completed"' "$EVENTLOG" 2>/dev/null && TASK_COMPLETE_SEEN=1
 fi
 
 rm -f "$EVENTLOG"
 
 if [ "$TIMED_OUT" -eq 1 ]; then
+  rm -f "$LAST_MESSAGE_FILE"
   printf '{"ok":false,"reason":"timeout","threadId":%s,"detail":"round exceeded %ss"}\n' "$THREAD_ID_JSON" "$DEFAULT_TIMEOUT_SECS"
   exit 1
 fi
 if [ "$EXIT_CODE" -ne 0 ]; then
+  rm -f "$LAST_MESSAGE_FILE"
   printf '{"ok":false,"reason":"nonzero_exit","threadId":%s,"detail":"codex exec exited %s"}\n' "$THREAD_ID_JSON" "$EXIT_CODE"
   exit 1
 fi
 if [ "$TASK_COMPLETE_SEEN" -eq 0 ]; then
-  printf '{"ok":false,"reason":"missing_task_complete","threadId":%s,"detail":"no task_complete event found in rollout file"}\n' "$THREAD_ID_JSON"
-  exit 1
-fi
-if [ -z "$ROLLOUT" ] || [ ! -f "$ROLLOUT" ]; then
-  printf '{"ok":false,"reason":"rollout_not_found","threadId":%s,"detail":"could not resolve rollout file for this threadId"}\n' "$THREAD_ID_JSON"
+  rm -f "$LAST_MESSAGE_FILE"
+  printf '{"ok":false,"reason":"missing_task_complete","threadId":%s,"detail":"no turn.completed event found in this dispatch'"'"'s own event stream"}\n' "$THREAD_ID_JSON"
   exit 1
 fi
 
-# Step 7: last response_item with payload.type=="message" and
-# payload.phase=="final_answer" (never "commentary" -- that is intermediate
-# narration). Text lives at payload.content[].text (output_text items).
-FINAL_TEXT="$(jq -n -r '
-    [inputs | select(.type=="response_item" and .payload.type=="message" and .payload.phase=="final_answer")]
-    | last
-    | if . == null then empty else (.payload.content // [] | map(select(.type=="output_text") | .text) | join("")) end
-  ' "$ROLLOUT" 2>/dev/null)"
+# Step 7: read the final answer directly from codex exec's own -o file --
+# no parsing of a rollout's response_item/final_answer structure needed,
+# since -o already contains exactly that text.
+FINAL_TEXT="$(cat "$LAST_MESSAGE_FILE" 2>/dev/null; printf 'x')"
+FINAL_TEXT="${FINAL_TEXT%x}"
+rm -f "$LAST_MESSAGE_FILE"
 
 if [ -z "$FINAL_TEXT" ]; then
-  printf '{"ok":false,"reason":"no_final_answer","threadId":%s,"detail":"no final_answer message found in rollout file"}\n' "$THREAD_ID_JSON"
+  printf '{"ok":false,"reason":"no_final_answer","threadId":%s,"detail":"codex exec exited 0 with turn.completed but -o produced no final message"}\n' "$THREAD_ID_JSON"
   exit 1
 fi
 

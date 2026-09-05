@@ -357,24 +357,6 @@ kill_process_group() {
   sleep 1
   kill -KILL -"$pid" 2>/dev/null
 }
-# resolve_rollout <threadId> -- rollout files live under
-# ~/.codex/sessions/<Y>/<M>/<D>/, so a thread started "now" almost always
-# resolves under today's date directory. Try that narrow, cheap lookup
-# first; only fall back to a full recursive scan of the whole sessions
-# tree (unbounded, grows with every session ever run) if today's
-# directory doesn't have it yet -- e.g. a call right at a midnight
-# rollover, or before the file has been created on disk. Always correct
-# (the fallback covers every case the narrow path could miss), just
-# cheaper in the common case.
-resolve_rollout() {
-  local tid="$1" f
-  f="$(find "$HOME/.codex/sessions/$(date +%Y/%m/%d 2>/dev/null)" -maxdepth 1 -name "rollout-*-${tid}.jsonl" 2>/dev/null | head -1)"
-  if [ -n "$f" ]; then
-    printf '%s' "$f"
-    return 0
-  fi
-  find "$HOME/.codex/sessions" -name "rollout-*-${tid}.jsonl" 2>/dev/null | head -1
-}
 on_signal() {
   kill_process_group "${CODEX_PID:-}"
   local job_pid
@@ -600,18 +582,17 @@ if [ -z "$DIFF_TEXT" ] && _focus_is_empty; then
 fi
 
 THREAD_ID=""
-ROLLOUT=""
-BASELINE_TASK_COMPLETE=0
+# Unlike the removed rollout-file preflight, there is nothing to pre-check
+# for a --resume dispatch: a genuinely dead/unknown threadId now simply
+# surfaces as a `nonzero_exit` from the actual dispatch below (never
+# `no_thread_started` -- that reason's only branch below is gated on a
+# FRESH dispatch's empty THREAD_ID, structurally unreachable once
+# RESUME_THREAD_ID has already been assigned to it), the same as any other
+# dispatch failure.
 if [ -n "$RESUME_THREAD_ID" ]; then
   THREAD_ID="$RESUME_THREAD_ID"
   THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
   echo "THREAD_ID=$THREAD_ID" >&2
-  ROLLOUT="$(resolve_rollout "$THREAD_ID")"
-  if [ -z "$ROLLOUT" ] || [ ! -f "$ROLLOUT" ]; then
-    printf '{"ok":false,"reason":"resume_thread_not_found","threadId":%s,"detail":"no rollout file found for this threadId"}\n' "$THREAD_ID_JSON"
-    exit 1
-  fi
-  BASELINE_TASK_COMPLETE="$(jq -c 'select(.type=="event_msg" and .payload.type=="task_complete")' "$ROLLOUT" 2>/dev/null | wc -l | tr -d ' ')"
 fi
 
 # Random per-run boundary token, unpredictable to whoever authored the diff
@@ -625,14 +606,22 @@ mktemp_registered PROMPT_FILE
 build_review_prompt > "$PROMPT_FILE"
 
 mktemp_registered EVENTLOG
+# LAST_MESSAGE_FILE: codex exec's own `-o/--output-last-message` writes the
+# agent's final message text directly to this file -- the CLI's documented,
+# process-owned output channel, used here INSTEAD OF locating and parsing
+# this thread's rollout file under ~/.codex/sessions (removed: that
+# subsystem's on-disk format/compression is not a documented stable public
+# contract, and is unrelated to what this wrapper actually needs -- the
+# final answer text this same process already produced).
+mktemp_registered LAST_MESSAGE_FILE
 
 (
   cd "$CWD" || exit 127
   if [ -n "$RESUME_THREAD_ID" ]; then
-    codex exec resume "$RESUME_THREAD_ID" --json \
+    codex exec resume "$RESUME_THREAD_ID" --json -o "$LAST_MESSAGE_FILE" \
       ${SCHEMA:+--output-schema "$SCHEMA"} < "$PROMPT_FILE"
   else
-    codex exec --json --sandbox read-only \
+    codex exec --json --sandbox read-only -o "$LAST_MESSAGE_FILE" \
       -c model_reasoning_effort=xhigh ${SCHEMA:+--output-schema "$SCHEMA"} \
       < "$PROMPT_FILE"
   fi
@@ -677,19 +666,21 @@ if [ -z "$THREAD_ID" ]; then
   echo "THREAD_ID=$THREAD_ID" >&2
 fi
 
+# Wait for THIS dispatch's own `turn.completed` event in $EVENTLOG (the
+# --json stdout stream this attempt itself produced -- confirmed directly,
+# live, to emit exactly one `turn.completed` per dispatch, distinct from
+# the OLDER `event_msg`/`task_complete` shape rollout files use, which this
+# stdout stream does NOT share). No baseline/counter needed (unlike the
+# removed rollout-based check): this $EVENTLOG is a fresh file for this one
+# dispatch attempt only, fresh or resumed, never a shared growing history
+# across rounds -- a single match always means THIS attempt's own turn.
 DEADLINE=$((SECONDS + 10#$TIMEOUT_SECS))
 TIMED_OUT=0
 TASK_COMPLETE_SEEN=0
 while kill -0 "$CODEX_PID" 2>/dev/null; do
-  if [ -z "$ROLLOUT" ]; then
-    ROLLOUT="$(resolve_rollout "$THREAD_ID")"
-  fi
-  if [ -n "$ROLLOUT" ] && [ -f "$ROLLOUT" ]; then
-    CUR_COUNT="$(jq -c 'select(.type=="event_msg" and .payload.type=="task_complete")' "$ROLLOUT" 2>/dev/null | wc -l | tr -d ' ')"
-    if [ "${CUR_COUNT:-0}" -gt "$BASELINE_TASK_COMPLETE" ]; then
-      TASK_COMPLETE_SEEN=1
-      break
-    fi
+  if grep -q '"type":"turn.completed"' "$EVENTLOG" 2>/dev/null; then
+    TASK_COMPLETE_SEEN=1
+    break
   fi
   if [ "$SECONDS" -ge "$DEADLINE" ]; then
     TIMED_OUT=1
@@ -701,13 +692,13 @@ while kill -0 "$CODEX_PID" 2>/dev/null; do
   sleep 1
 done
 if [ "$TASK_COMPLETE_SEEN" -eq 1 ]; then
-  # task_complete lands in the rollout file -- a side channel independent of
-  # the dispatched process's own exit -- so observing it says nothing about
-  # whether the process is actually about to exit. Give it a bounded grace
-  # period to exit on its own before falling back to the same kill sequence
-  # the deadline branch above uses; without this, a process that emits
-  # task_complete but then hangs turns the unconditional `wait` below into
-  # an unbounded block, defeating the round's own --timeout guarantee.
+  # turn.completed is written to this process's own stdout, but observing it
+  # says nothing about whether the process (and its -o file write) is
+  # actually about to finish. Give it a bounded grace period to exit on its
+  # own before falling back to the same kill sequence the deadline branch
+  # above uses; without this, a process that emits turn.completed but then
+  # hangs turns the unconditional `wait` below into an unbounded block,
+  # defeating the round's own --timeout guarantee.
   GRACE_DEADLINE=$((SECONDS + 10))
   while kill -0 "$CODEX_PID" 2>/dev/null && [ "$SECONDS" -lt "$GRACE_DEADLINE" ]; do
     sleep 0.5
@@ -722,9 +713,8 @@ fi
 wait "$CODEX_PID" 2>/dev/null
 EXIT_CODE=$?
 CODEX_PID=""
-if [ "$TASK_COMPLETE_SEEN" -eq 0 ] && [ "$TIMED_OUT" -eq 0 ] && [ -n "$ROLLOUT" ] && [ -f "$ROLLOUT" ]; then
-  CUR_COUNT="$(jq -c 'select(.type=="event_msg" and .payload.type=="task_complete")' "$ROLLOUT" 2>/dev/null | wc -l | tr -d ' ')"
-  [ "${CUR_COUNT:-0}" -gt "$BASELINE_TASK_COMPLETE" ] && TASK_COMPLETE_SEEN=1
+if [ "$TASK_COMPLETE_SEEN" -eq 0 ] && [ "$TIMED_OUT" -eq 0 ]; then
+  grep -q '"type":"turn.completed"' "$EVENTLOG" 2>/dev/null && TASK_COMPLETE_SEEN=1
 fi
 
 if [ "$TIMED_OUT" -eq 1 ]; then
@@ -734,19 +724,16 @@ elif [ "$EXIT_CODE" -ne 0 ]; then
   JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"nonzero_exit","threadId":%s,"detail":"codex exec exited %s"}\n' "$THREAD_ID_JSON" "$EXIT_CODE")"
   RESULT=1
 elif [ "$TASK_COMPLETE_SEEN" -eq 0 ]; then
-  JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"missing_task_complete","threadId":%s,"detail":"no task_complete event found in rollout file"}\n' "$THREAD_ID_JSON")"
-  RESULT=1
-elif [ -z "$ROLLOUT" ] || [ ! -f "$ROLLOUT" ]; then
-  JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"rollout_not_found","threadId":%s,"detail":"could not resolve rollout file for this threadId"}\n' "$THREAD_ID_JSON")"
+  JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"missing_task_complete","threadId":%s,"detail":"no turn.completed event found in this dispatch'"'"'s own event stream"}\n' "$THREAD_ID_JSON")"
   RESULT=1
 else
-  FINAL_TEXT="$(jq -n -r '
-      [inputs | select(.type=="response_item" and .payload.type=="message" and .payload.phase=="final_answer")]
-      | last
-      | if . == null then empty else (.payload.content // [] | map(select(.type=="output_text") | .text) | join("")) end
-    ' "$ROLLOUT" 2>/dev/null)"
+  # Read the final answer directly from codex exec's own -o file -- no
+  # parsing of a rollout's response_item/final_answer structure needed,
+  # since -o already contains exactly that text.
+  FINAL_TEXT="$(cat "$LAST_MESSAGE_FILE" 2>/dev/null; printf 'x')"
+  FINAL_TEXT="${FINAL_TEXT%x}"
   if [ -z "$FINAL_TEXT" ]; then
-    JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"no_final_answer","threadId":%s,"detail":"no final_answer message found in rollout file"}\n' "$THREAD_ID_JSON")"
+    JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"no_final_answer","threadId":%s,"detail":"codex exec exited 0 with turn.completed but -o produced no final message"}\n' "$THREAD_ID_JSON")"
     RESULT=1
   elif [ -n "$SCHEMA" ] && ! printf '%s' "$FINAL_TEXT" | jq -e . >/dev/null 2>&1; then
     JUDGE_OUTPUT="$(printf '{"ok":false,"reason":"invalid_json","threadId":%s,"detail":"final answer is not valid JSON despite --output-schema"}\n' "$THREAD_ID_JSON")"
@@ -800,6 +787,7 @@ if [ -n "$CAPTURE_EVENTLOG_PATH" ]; then
   cp "$EVENTLOG" "$CAPTURE_EVENTLOG_PATH" 2>/dev/null || true
 fi
 rm -f "$EVENTLOG"
+rm -f "$LAST_MESSAGE_FILE"
 # Safe only now: `wait "$CODEX_PID"` above has returned, so the dispatched
 # subshell is fully done and its one read of $PROMPT_FILE (the `<
 # "$PROMPT_FILE"` stdin redirect at dispatch time) has definitely happened.

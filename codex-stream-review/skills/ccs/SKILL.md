@@ -136,16 +136,16 @@ run-ccs-review.sh --cwd <dir> --resume <threadId> --focus <text> [--timeout <sec
 `dimensions`) — do not re-derive it.
 
 **Coverage:** both the `ok:true` success response above AND a failure response below whose
-`reason` is one of the 8 post-dispatch reasons (`timeout`, `nonzero_exit`,
-`missing_task_complete`, `rollout_not_found`, `no_final_answer`, `invalid_json`,
+`reason` is one of the 7 post-dispatch reasons (`timeout`, `nonzero_exit`,
+`missing_task_complete`, `no_final_answer`, `invalid_json`,
 `schema_mismatch`, `no_thread_started` — see the reason table immediately below) can carry an
 additional spliced-in `"coverage":{"source":{...}}` object. **Present whenever this round's
 dispatch was a fresh `--uncommitted` dispatch that got far enough to collect the diff —
-regardless of whether that dispatch attempt ultimately succeeded or hit one of those 8
-post-dispatch failures.** All 8 are structurally guaranteed to occur only after a fresh
+regardless of whether that dispatch attempt ultimately succeeded or hit one of those 7
+post-dispatch failures.** All 7 are structurally guaranteed to occur only after a fresh
 dispatch's diff collection has already completed and `codex exec` has already been launched
 (`no_thread_started` fires while polling for a `thread.started` event, itself a step that only
-happens after that same launch) — so all 8 are unconditionally eligible for `coverage.source`
+happens after that same launch) — so all 7 are unconditionally eligible for `coverage.source`
 whenever this was a fresh `--uncommitted` dispatch, regardless of whether that attempt ultimately
 succeeded.
 
@@ -153,7 +153,7 @@ succeeded.
 wrapper's own SIGINT/SIGTERM trap handler also splices in `coverage.source` when it can, but a
 signal can land at ANY point in the wrapper's execution — before collection ever starts,
 mid-collection, or after collection but before `codex exec` is ever launched — not only after
-collection has finished the way the 8 reasons above are guaranteed to. So `interrupted` carries
+collection has finished the way the 7 reasons above are guaranteed to. So `interrupted` carries
 `coverage.source` only CONDITIONALLY, depending on whether the signal happened to land after
 collection had already populated `SOURCE_COVERAGE_JSON`. This is a real, permanent,
 timing-dependent property of this one reason, not a bug and not further fixable — `/ccs` cannot
@@ -161,19 +161,20 @@ know in advance whether a given `interrupted` failure will carry it and must che
 response.
 
 It is absent for `--base`/`--commit` scope, absent for every `--resume` round (success or failure
-alike), and absent for `bad_args`/`git_error`/`incomplete_collection`/`resume_thread_not_found` —
+alike), and absent for `bad_args`/`git_error`/`incomplete_collection` —
 confirmed directly by reading the wrapper: `SOURCE_COVERAGE_JSON` is only ever populated inside
 the `--uncommitted` diff-collection branch (which a `--resume` call and a `--base`/`--commit`
-call both skip entirely), and these four reasons each `printf`s its own JSON directly and exits
+call both skip entirely), and these three reasons each `printf`s its own JSON directly and exits
 without ever reaching the shared `emit_final_output` helper that splices `coverage` into the
-final JSON whenever `SOURCE_COVERAGE_JSON` is well-typed — `bad_args`/`git_error`/
-`incomplete_collection` occur before or during collection itself, `resume_thread_not_found` on a
-`--resume` call that skips the `--uncommitted` branch entirely — so none of these four can ever
+final JSON whenever `SOURCE_COVERAGE_JSON` is well-typed — `bad_args` occurs during argument
+parsing itself (before any scope-specific branch ever runs), `git_error`/`incomplete_collection`
+occur only inside the `--uncommitted` collection branch (a `--resume` call skips that branch
+entirely, so neither can ever fire on a `--resume` round) — so none of these three can ever
 carry `coverage` regardless of scope — see "Coverage is a Round-1-only property" below for what
 this means for `/ccs`'s multi-round convergence check.
 
 **Failure:** `{"ok":false,"reason":"<reason>","threadId":"<uuid or absent>","detail":"..."}`
-— see "Coverage" just above for the 8 reasons among these that unconditionally can carry a
+— see "Coverage" just above for the 7 reasons among these that unconditionally can carry a
 spliced-in `coverage.source` object, plus `interrupted`, which can carry one conditionally. Every
 distinct `reason` this wrapper can emit, and whether `threadId`
 is present (capture it whenever it is — it is what makes cleanup of a partially-started thread
@@ -185,15 +186,23 @@ possible even after a failed round):
 | `git_error` | The `git diff`/`git show` call for a scope flag failed, or the untracked-file collector exited with a non-2 nonzero status | No |
 | `incomplete_collection` | The untracked-file collector exited status 2 | No |
 | `no_thread_started` | No `thread.started` event within 10s of a fresh dispatch | No |
-| `resume_thread_not_found` | No rollout file exists for the given `--resume` threadId (already cleaned up, or never valid) | Yes (the id given) |
 | `interrupted` | The wrapper itself received SIGINT/SIGTERM mid-round | Yes, if a thread had already started |
 | `timeout` | The round exceeded `--timeout` (default 1800s) | Yes |
 | `nonzero_exit` | The underlying `codex exec`/`codex exec resume` process exited nonzero | Yes |
-| `missing_task_complete` | No `task_complete` event ever appeared in the rollout | Yes |
-| `rollout_not_found` | Could not resolve `~/.codex/sessions/**/rollout-*-<threadId>.jsonl` | Yes |
-| `no_final_answer` | No `final_answer` message found in the rollout | Yes |
+| `missing_task_complete` | No `turn.completed` event ever appeared in this dispatch's own event stream | Yes |
+| `no_final_answer` | `codex exec` exited 0 with `turn.completed` seen, but its `-o/--output-last-message` file was never written (or written empty) | Yes |
 | `invalid_json` | The final answer wasn't valid JSON despite the schema | Yes |
 | `schema_mismatch` | The final answer was valid JSON but failed the semantic verdict rules (CLEAN/findings cross-field consistency, nonblank evidence, complete dimension set) | Yes |
+
+Note there is no longer any reason meaning "the `--resume` threadId itself could not be resolved"
+— the wrapper no longer looks up a thread's on-disk rollout file at all (round completion is
+instead detected by grepping the round's own captured `codex exec --json` stdout for
+`"type":"turn.completed"`, and the final answer is read from the file `codex exec`'s own
+`-o/--output-last-message` flag wrote it to), so there is no rollout lookup left that could ever
+fail on its own. A genuinely dead/unknown `--resume` threadId now simply surfaces as whatever the
+real dispatch attempt produces — `nonzero_exit`, never `no_thread_started` (that reason's only
+branch requires a FRESH dispatch's empty `THREAD_ID`, structurally unreachable once a `--resume`
+call has already assigned it from the given threadId).
 
 An `ok:false` round is a **failed round, never a clean sign-off** — see Guards below.
 
@@ -209,8 +218,26 @@ still has a thread to resume when a specific failure carries none.
 | `reason` | Resume-safe? (when a `threadId` was actually captured for this occurrence) | Basis |
 |---|---|---|
 | `bad_args`, `git_error`, `incomplete_collection`, `no_thread_started` | N/A — never carries a `threadId` at all, nothing to resume | Table above: `threadId` never present |
-| `resume_thread_not_found`, `rollout_not_found` | **No** — the thread/rollout itself is confirmed or likely gone; resuming the same id will fail the same way again | The failure IS the absence of the very artifact `--resume` needs |
-| `interrupted`, `timeout`, `nonzero_exit`, `missing_task_complete`, `no_final_answer`, `invalid_json`, `schema_mismatch` | **Yes** — the underlying Codex thread's own conversational state survives; only THIS wrapper invocation failed to extract a valid final answer from it | `nonzero_exit` empirically confirmed live (crash simulation + 4 real production occurrences, see above); the other six reasons in this row share the same property (a thread that genuinely started and has an intact rollout, or exited zero but the wrapper couldn't parse a valid final answer from it) and are inferred safe by the identical reasoning, not separately live-tested one by one |
+| `interrupted`, `timeout`, `nonzero_exit`, `missing_task_complete`, `no_final_answer`, `invalid_json`, `schema_mismatch` | **Yes** — the underlying Codex thread's own conversational state survives; only THIS wrapper invocation failed to extract a valid final answer from it | `nonzero_exit` empirically confirmed live (crash simulation + 4 real production occurrences, see above); the other six reasons in this row share the same property (a thread that genuinely started, or exited zero, but the wrapper couldn't confirm/extract a valid final answer from it) and are inferred safe by the identical reasoning, not separately live-tested one by one |
+
+Every `reason` that can ever carry a `threadId` falls in the "Yes" row above — there is no longer
+a `reason` meaning "the thread/rollout itself is confirmed gone" (that used to be
+`resume_thread_not_found`/`rollout_not_found`; see the note at the end of the reason table above
+for why neither exists anymore), so a threadId-carrying failure is unconditionally worth a
+`--resume` retry.
+
+**Accepted tradeoff, stated plainly rather than glossed over:** a genuinely dead/unknown
+`--resume` threadId (e.g. one whose thread was already deleted) is no longer distinguishable, by
+`reason` alone, from a transient backend blip — both surface as `nonzero_exit` (never
+`no_thread_started`, whose only branch is unreachable on a `--resume` call — see the reason
+table's note above). Where the old `resume_thread_not_found` reason let this case fail instantly
+(no thread to resume, so no retry attempted), it now goes through the same bounded, `--timeout 300`
+retry-with-backoff sequence as a genuinely transient failure — costing up to two wasted 300s-capped
+attempts (worst case ~10 extra minutes) before reaching the same eventual `⚠️ COULD NOT VERIFY`
+outcome. This is a real, deliberate cost of removing the rollout-based preflight check, not an
+oversight — accepted because the alternative (keeping any form of rollout lookup just to
+distinguish this one case) reintroduces the exact fragile dependency this design removes, for a
+failure mode (retrying a dead resume target) that is bounded and rare, not unbounded or silent.
 
 **What this changes for retry logic (see Guards below):** a failure in the "Yes" row is worth a
 bounded `--resume` retry with a short backoff BEFORE falling back to a fresh restart (round 1) or
@@ -869,7 +896,7 @@ For each round, after Phase 1 delivers a result:
 ### Coverage is a Round-1-only property
 
 Since only a fresh `--uncommitted` dispatch ever reports `coverage.source` — regardless of
-whether that particular dispatch attempt resulted in `ok:true`, one of the 8 unconditionally-
+whether that particular dispatch attempt resulted in `ok:true`, one of the 7 unconditionally-
 eligible post-dispatch failure reasons, or a conditionally-eligible `interrupted` (see "Coverage"
 in the interface reference above) — and only round 1 is ever a
 fresh round in `/ccs` (round 2+ is always `--resume`, which never reports it either way), the
@@ -1017,9 +1044,9 @@ meaning.
     abandoning the thread.
     **Round 1 only — capture coverage from the failing attempt BEFORE retrying.** If this failure
     is for a group's round-1 attempt (the one dispatched with `--uncommitted`/`--base`/`--commit`,
-    not an already-resumed round 2+ attempt) and the reason is one of the 8 post-dispatch reasons
+    not an already-resumed round 2+ attempt) and the reason is one of the 7 post-dispatch reasons
     that unconditionally carry `coverage.source` whenever it was a fresh `--uncommitted` dispatch
-    (`timeout`, `nonzero_exit`, `missing_task_complete`, `rollout_not_found`, `no_final_answer`,
+    (`timeout`, `nonzero_exit`, `missing_task_complete`, `no_final_answer`,
     `invalid_json`, `schema_mismatch`, `no_thread_started` — see "Coverage" in the interface
     reference above), or the reason is `interrupted` (which carries it only conditionally,
     depending on signal timing — see that same section), check this failed response for a
@@ -1099,18 +1126,11 @@ meaning.
       to fall back to on an already-resumed group — stop directly, report
       **⚠️ COULD NOT VERIFY** for that group. No new threadId was ever created by either
       resume-retry, so nothing is added to `LEAKED_THREAD_IDS` on this path.
-  - **A `threadId` WAS captured, but the reason is NOT resume-safe** (`resume_thread_not_found`,
-    `rollout_not_found` — the thread/rollout itself is confirmed or likely gone; a `--resume`
-    attempt would just fail the same way again, wasting up to a full timeout for a result already
-    known in advance): skip the resume-retry step entirely.
-    - **Round 1:** retry the original scope flag fresh, exactly once, for that group (its own new
-      `--capture-eventlog`/`EVENTLOG_FILE` too, when capture is ON — see
-      `references/capture-evidence.md`) — append the now-confirmed-dead `(GROUP, threadId)` to `LEAKED_THREAD_IDS`
-      (its rollout is already gone or unreachable, but the thread record itself may still need
-      explicit `--cleanup` at the terminal path). If the fresh retry also fails, stop — report
-      **⚠️ COULD NOT VERIFY**.
-    - **Round 2+:** there is no fresh scope to fall back to — stop directly, report
-      **⚠️ COULD NOT VERIFY** for that group.
+  - There is no third, "`threadId` was captured but the reason is NOT resume-safe" branch anymore
+    — see "Resume-safety by failure reason" above: every reason that can ever carry a `threadId`
+    is resume-safe now that `resume_thread_not_found`/`rollout_not_found` no longer exist as
+    possible outcomes at all. The two bullets above (no `threadId`, and `threadId` + resume-safe)
+    are exhaustive.
   - Whenever a group ends in **⚠️ COULD NOT VERIFY**, the round-level status is
     **⚠️ COULD NOT VERIFY**, regardless of how clean every other group's own findings turned out to
     be — never fold this into `⚠️ NOT CONVERGED`/`⚠️ PARTIAL COVERAGE` instead (those cover a
