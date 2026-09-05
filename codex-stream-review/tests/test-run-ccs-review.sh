@@ -276,7 +276,11 @@ pd_test_interrupted() {
   # "unbound variable" under `set -u` when expanding "${ARR[@]}" on an
   # array that was ever assigned empty (see run-ccs-review.sh's own note
   # on TRACKED_BINARY_PATHS for the identical constraint).
-  local mode="$1" tid="${2:-}" capture_path="${3:-}"
+  # check_coverage (4th, optional): when non-empty, also asserts the
+  # captured output's .coverage.source.status is a real value -- the
+  # on_signal coverage regression check. Off by default so the 3 existing
+  # call sites below keep their original, unchanged assertions.
+  local mode="$1" tid="${2:-}" capture_path="${3:-}" check_coverage="${4:-}"
   local label="$mode"
   local marker outfile wrapper_pid
   marker="$(mktemp -u)"
@@ -331,12 +335,31 @@ pd_test_interrupted() {
   OUT="$(cat "$outfile")"
   pd_assert_reason "$OUT" "interrupted" "interrupted ($label)"
   pd_assert_threadid_present "$OUT" "interrupted ($label)"
+  if [ -n "$check_coverage" ]; then
+    local cov_status
+    cov_status="$(printf '%s' "$OUT" | tail -1 | jq -r '.coverage.source.status // empty')"
+    if [ "$cov_status" = "complete" ] || [ "$cov_status" = "partial" ]; then
+      pass "interrupted ($label): coverage.source is spliced in on this signal path (status=$cov_status)"
+    else
+      fail "interrupted ($label): expected a real coverage.source.status, got: $OUT"
+    fi
+  fi
   rm -f "$marker" "$outfile"
   unset FAKE_CODEX_SCENARIO FAKE_CODEX_SLEEP_SECS FAKE_CODEX_MARKER_FILE
 }
 pd_test_interrupted fresh
 TID="$(pd_new_tid)"; pd_seed_resume_rollout "$TID"
 pd_test_interrupted resume "$TID"
+
+# --- interrupted coverage regression: a fresh dispatch interrupted AFTER
+# thread.started has already fired (proven by the wrapper's own
+# "THREAD_ID=..." wait inside pd_test_interrupted, which only happens once
+# diff collection -- and therefore $SOURCE_COVERAGE_JSON -- is already
+# populated, since collection runs before `codex exec` is even launched)
+# must still carry coverage.source. on_signal() used to build its JSON with
+# a bare `printf` instead of routing through emit_final_output, silently
+# dropping already-collected coverage data on every SIGINT/SIGTERM.
+pd_test_interrupted fresh "" "" check_coverage
 
 # on_signal() exits before ever reaching the --capture-eventlog copy step
 # that the normal (non-signal) code path uses -- so a signal-interrupted
@@ -362,6 +385,27 @@ OUT="$(pd_run resume "$TID" --timeout 1)"
 pd_assert_reason "$OUT" "timeout" "timeout (resume)"
 pd_assert_threadid_present "$OUT" "timeout (resume)"
 unset FAKE_CODEX_SCENARIO FAKE_CODEX_SLEEP_SECS
+
+# --- no_thread_started: fresh dispatch only (--resume has no thread.started
+# concept) -- fake-codex never emits thread.started, forcing the wrapper's
+# own real (hardcoded) THREAD_WAIT_SECS=10s poll to genuinely time out. This
+# is also a coverage regression check: diff collection (which populates
+# $SOURCE_COVERAGE_JSON) happens BEFORE `codex exec` is ever launched, so by
+# the time this branch fires, real coverage data is already available -- the
+# fix (scripts/run-ccs-review.sh's no_thread_started branch) must route
+# through emit_final_output rather than a bare printf for that data to
+# survive into the response. Real wall-clock cost: this case takes slightly
+# over 10s, same as the timeout fixture above.
+export FAKE_CODEX_NO_THREAD_STARTED=1
+OUT="$(pd_run fresh)"
+pd_assert_reason "$OUT" "no_thread_started" "no_thread_started (fresh)"
+COV_STATUS="$(printf '%s' "$OUT" | tail -1 | jq -r '.coverage.source.status // empty')"
+if [ "$COV_STATUS" = "complete" ] || [ "$COV_STATUS" = "partial" ]; then
+  pass "no_thread_started (fresh): coverage.source is spliced in on this post-dispatch failure (status=$COV_STATUS)"
+else
+  fail "no_thread_started (fresh): expected a real coverage.source.status, got: $OUT"
+fi
+unset FAKE_CODEX_NO_THREAD_STARTED
 
 # --- nonzero_exit: codex exec/exec resume itself exits nonzero.
 for CODE in 1 3; do
@@ -518,6 +562,29 @@ else
   fail "schema_mismatch: --capture-eventlog should contain thread.started, file: $([ -f "$CAPTURE_PATH" ] && cat "$CAPTURE_PATH" || echo MISSING)"
 fi
 rm -rf "$CAPTURE_DIR"
+unset FAKE_CODEX_SCENARIO FAKE_CODEX_FINAL_ANSWER
+
+# --- coverage regression: a post-dispatch failure on a fresh --uncommitted
+# round must still carry coverage.source, exactly like an ok:true round on
+# the identical scope. emit_final_output's own header comment claims it is
+# "shared by both the empty-diff fast path and the normal result path so
+# both always get a coverage object" -- but the dispatch epilogue used to
+# call emit_final_output only when RESULT was 0, falling through to a bare
+# `printf` for every one of the 7 post-dispatch failure reasons instead,
+# silently dropping already-collected coverage data on all of them. Picking
+# schema_mismatch here (not nonzero_exit/etc.) is arbitrary -- the fix lives
+# in the shared epilogue after JUDGE_OUTPUT is set, not in any
+# reason-specific branch, so one representative post-dispatch failure
+# reason is sufficient to catch a regression in that shared code path.
+export FAKE_CODEX_SCENARIO=schema_mismatch FAKE_CODEX_FINAL_ANSWER="${PD_SCHEMA_MISMATCH_JSON[0]}"
+OUT="$(pd_run fresh)"
+pd_assert_reason "$OUT" "schema_mismatch" "schema_mismatch coverage regression: reason"
+COV_STATUS="$(printf '%s' "$OUT" | tail -1 | jq -r '.coverage.source.status // empty')"
+if [ "$COV_STATUS" = "complete" ] || [ "$COV_STATUS" = "partial" ]; then
+  pass "schema_mismatch (fresh, --uncommitted): coverage.source is still spliced in on a post-dispatch failure (status=$COV_STATUS)"
+else
+  fail "schema_mismatch (fresh, --uncommitted): expected a real coverage.source.status, got: $OUT"
+fi
 unset FAKE_CODEX_SCENARIO FAKE_CODEX_FINAL_ANSWER
 
 # --- investigation_evidence extraction fixtures (capture-evidence, no real API calls) ---

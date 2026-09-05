@@ -374,13 +374,15 @@ on_signal() {
   for job_pid in $(jobs -p 2>/dev/null); do
     kill -KILL -"$job_pid" 2>/dev/null
   done
+  local out_json
   if [ -n "${THREAD_ID:-}" ]; then
     local tid_json
     tid_json="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
-    printf '{"ok":false,"reason":"interrupted","threadId":%s,"detail":"wrapper received a termination signal"}\n' "$tid_json"
+    out_json="$(printf '{"ok":false,"reason":"interrupted","threadId":%s,"detail":"wrapper received a termination signal"}\n' "$tid_json")"
   else
-    printf '{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}\n'
+    out_json='{"ok":false,"reason":"interrupted","detail":"wrapper received a termination signal"}'
   fi
+  emit_final_output "$out_json"
   exit 1
 }
 cleanup_temp_files() {
@@ -661,7 +663,7 @@ if [ -z "$THREAD_ID" ]; then
     kill_process_group "$CODEX_PID"
     wait "$CODEX_PID" 2>/dev/null
     CODEX_PID=""
-    printf '{"ok":false,"reason":"no_thread_started","detail":"no thread.started event within %ss"}\n' "$THREAD_WAIT_SECS"
+    emit_final_output "$(printf '{"ok":false,"reason":"no_thread_started","detail":"no thread.started event within %ss"}\n' "$THREAD_WAIT_SECS")"
     exit 1
   fi
   THREAD_ID_JSON="$(printf '%s' "$THREAD_ID" | jq -Rs '.')"
@@ -795,9 +797,5 @@ rm -f "$EVENTLOG"
 # subshell is fully done and its one read of $PROMPT_FILE (the `<
 # "$PROMPT_FILE"` stdin redirect at dispatch time) has definitely happened.
 rm -f "$PROMPT_FILE"
-if [ "$RESULT" -eq 0 ]; then
-  emit_final_output "$JUDGE_OUTPUT"
-else
-  printf '%s\n' "$JUDGE_OUTPUT"
-fi
+emit_final_output "$JUDGE_OUTPUT"
 exit "$RESULT"

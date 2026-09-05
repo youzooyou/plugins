@@ -123,20 +123,53 @@ run-ccs-review.sh --cwd <dir> --resume <threadId> --focus <text> [--timeout <sec
 - A `--base`/`--commit` value starting with `-` is rejected (`bad_args`) as a git-option-
   injection guard; a `--resume` threadId starting with `-` is rejected the same way.
 
-**Success:** `{"ok":true,"threadId":"<uuid>","verdict":{...}}`, optionally with a spliced-in
-`"coverage":{"source":{...}}` object — **present only when this round was a fresh `--uncommitted`
-round**, absent for `--base`/`--commit` and absent for every `--resume` round (confirmed directly
-by reading the wrapper: `SOURCE_COVERAGE_JSON` is only ever populated inside the `--uncommitted`
-diff-collection branch, which a `--resume` call and a `--base`/`--commit` call both skip
-entirely) — see "Coverage is a Round-1-only property" below for what this means for `/ccs`'s
-multi-round convergence check.
+**Success:** `{"ok":true,"threadId":"<uuid>","verdict":{...}}`.
 `verdict` matches the shared review-verdict schema (`verdict`/`findings[]`/`summary`/
 `dimensions`) — do not re-derive it.
 
-**Failure:** `{"ok":false,"reason":"<reason>","threadId":"<uuid or absent>","detail":"..."}`.
-Every distinct `reason` this wrapper can emit, and whether `threadId` is present (capture it
-whenever it is — it is what makes cleanup of a partially-started thread possible even after a
-failed round):
+**Coverage:** both the `ok:true` success response above AND a failure response below whose
+`reason` is one of the 8 post-dispatch reasons (`timeout`, `nonzero_exit`,
+`missing_task_complete`, `rollout_not_found`, `no_final_answer`, `invalid_json`,
+`schema_mismatch`, `no_thread_started` — see the reason table immediately below) can carry an
+additional spliced-in `"coverage":{"source":{...}}` object. **Present whenever this round's
+dispatch was a fresh `--uncommitted` dispatch that got far enough to collect the diff —
+regardless of whether that dispatch attempt ultimately succeeded or hit one of those 8
+post-dispatch failures.** All 8 are structurally guaranteed to occur only after a fresh
+dispatch's diff collection has already completed and `codex exec` has already been launched
+(`no_thread_started` fires while polling for a `thread.started` event, itself a step that only
+happens after that same launch) — so all 8 are unconditionally eligible for `coverage.source`
+whenever this was a fresh `--uncommitted` dispatch, regardless of whether that attempt ultimately
+succeeded.
+
+`interrupted` is different, and deliberately not part of that unconditionally-eligible set: the
+wrapper's own SIGINT/SIGTERM trap handler also splices in `coverage.source` when it can, but a
+signal can land at ANY point in the wrapper's execution — before collection ever starts,
+mid-collection, or after collection but before `codex exec` is ever launched — not only after
+collection has finished the way the 8 reasons above are guaranteed to. So `interrupted` carries
+`coverage.source` only CONDITIONALLY, depending on whether the signal happened to land after
+collection had already populated `SOURCE_COVERAGE_JSON`. This is a real, permanent,
+timing-dependent property of this one reason, not a bug and not further fixable — `/ccs` cannot
+know in advance whether a given `interrupted` failure will carry it and must check the actual
+response.
+
+It is absent for `--base`/`--commit` scope, absent for every `--resume` round (success or failure
+alike), and absent for `bad_args`/`git_error`/`incomplete_collection`/`resume_thread_not_found` —
+confirmed directly by reading the wrapper: `SOURCE_COVERAGE_JSON` is only ever populated inside
+the `--uncommitted` diff-collection branch (which a `--resume` call and a `--base`/`--commit`
+call both skip entirely), and these four reasons each `printf`s its own JSON directly and exits
+without ever reaching the shared `emit_final_output` helper that splices `coverage` into the
+final JSON whenever `SOURCE_COVERAGE_JSON` is well-typed — `bad_args`/`git_error`/
+`incomplete_collection` occur before or during collection itself, `resume_thread_not_found` on a
+`--resume` call that skips the `--uncommitted` branch entirely — so none of these four can ever
+carry `coverage` regardless of scope — see "Coverage is a Round-1-only property" below for what
+this means for `/ccs`'s multi-round convergence check.
+
+**Failure:** `{"ok":false,"reason":"<reason>","threadId":"<uuid or absent>","detail":"..."}`
+— see "Coverage" just above for the 8 reasons among these that unconditionally can carry a
+spliced-in `coverage.source` object, plus `interrupted`, which can carry one conditionally. Every
+distinct `reason` this wrapper can emit, and whether `threadId`
+is present (capture it whenever it is — it is what makes cleanup of a partially-started thread
+possible even after a failed round):
 
 | `reason` | When | `threadId` present? |
 |---|---|---|
@@ -1330,11 +1363,17 @@ For each round, after Phase 1 delivers a result:
 
 ### Coverage is a Round-1-only property
 
-Since only a fresh `--uncommitted` round ever reports `coverage.source` (see the interface
-reference above), and only round 1 is ever a fresh round in `/ccs` (round 2+ is always
-`--resume`), the coverage-completeness gate below is a property of **round 1's own log line**,
-not "the latest round's." Record round 1's `coverage_source` once and carry that determination
-forward through the rest of the loop — it is never re-collected on a resumed round.
+Since only a fresh `--uncommitted` dispatch ever reports `coverage.source` — regardless of
+whether that particular dispatch attempt resulted in `ok:true`, one of the 8 unconditionally-
+eligible post-dispatch failure reasons, or a conditionally-eligible `interrupted` (see "Coverage"
+in the interface reference above) — and only round 1 is ever a
+fresh round in `/ccs` (round 2+ is always `--resume`, which never reports it either way), the
+coverage-completeness gate below is a property of **round 1's own log line**, not "the latest
+round's." Record round 1's `coverage_source` once — captured from whichever of round 1's dispatch
+attempts for that group actually carried it (ordinarily its one successful attempt, but see the
+Guards' resume-safe-retry capture note below for the case where an earlier FAILED attempt is the
+one that carried it) — and carry that determination forward through the rest of the loop; it is
+never re-collected on a resumed round.
 
 **A round-1 `CLEAN_REPO_DIR` round needs no special-casing here.** Reasoning from the wrapper's
 own source (`run-ccs-review.sh`'s `--uncommitted` branch): even against a freshly-`git init`'d,
@@ -1349,7 +1388,8 @@ review mode" above — so this case never interacts with the N-group merge immed
 
 **Round-1 N-group merge (parallel mode) — worst-case-wins, computed once.** When round 1 dispatches
 more than one group (see "Determine review mode" above), each group runs its own separate
-`--uncommitted` call and reports its own separate `coverage.source` outcome. Combine every
+`--uncommitted` call and reports its own separate `coverage.source` outcome — from whichever of
+that group's round-1 attempts actually carried it, per the capture note above. Combine every
 dispatched group's own outcome: the round's overall `coverage_source.status` is `"complete"`
 **only if every dispatched
 group's own status was `"complete"`** — else `"partial"` (with `omitted` set to the union of every
@@ -1380,10 +1420,13 @@ described above.
   why an individually-clean group does not exit the loop on its own cadence. **AND**
 - **If round 1's scope was `--uncommitted`:** round 1's `coverage_source.status` (the ROUND-1
   N-group merged value when round 1 dispatched more than one group — see "Coverage is a
-  Round-1-only property" above) — the wrapper's own `coverage.source` object verbatim, or the
-  sentinel `{"status":"unknown","omitted":[]}` when the wrapper's `ok:true` response omitted
-  `coverage.source` entirely — is explicitly `"complete"`, never assumed. `"partial"` (real
-  omitted files) or `"unknown"` fail this condition unless every omitted path has since been
+  Round-1-only property" above) — the wrapper's own `coverage.source` object verbatim, captured
+  from whichever of round 1's dispatch attempts for that group actually carried it (ordinarily its
+  `ok:true` response, but see the Guards' resume-safe-retry capture note below for the case where
+  an earlier failed attempt is the one that carried it), or the sentinel
+  `{"status":"unknown","omitted":[]}` only when NONE of round 1's dispatch attempts for that group
+  ever carried `coverage.source` at all — is explicitly `"complete"`, never assumed. `"partial"`
+  (real omitted files) or `"unknown"` fail this condition unless every omitted path has since been
   explicitly reviewed another way or explicitly accepted as out-of-scope by the user. For round 1
   scoped `--base`/`--commit`, this condition is automatically satisfied — those scopes never
   report coverage at all.
@@ -1445,8 +1488,12 @@ meaning.
       possible on round 1, before that round's own first dispatch has ever returned a `threadId`):
       nothing exists to resume — retry the same scope flag fresh, exactly once (include
       `--capture-eventlog` with its own fresh `EVENTLOG_FILE` when capture is ON, same as every
-      dispatch — see "Investigation evidence capture" above). If it fails again, stop — report
-      **⚠️ COULD NOT VERIFY**.
+      dispatch — see "Investigation evidence capture" above). **If this is round 1 and the reason
+      is `no_thread_started`, capture coverage from the failing attempt BEFORE dispatching that
+      retry** — see the "Round 1 only — capture coverage from the failing attempt BEFORE
+      retrying" note below; it applies here identically, even though `no_thread_started` never
+      carries a `threadId` and so is always handled by this bullet rather than the
+      threadId-captured one below it. If it fails again, stop — report **⚠️ COULD NOT VERIFY**.
     - **This group ALREADY has an entry in `GROUP_THREADS`** (a real, persistent thread from an
       earlier successful dispatch — whether that was this same round's own original attempt,
       before a subsequent resume-retry hit a no-`threadId` failure, or an earlier round entirely):
@@ -1462,7 +1509,31 @@ meaning.
   - **A `threadId` WAS captured, and the reason is resume-safe** (`interrupted`, `timeout`,
     `nonzero_exit`, `missing_task_complete`, `no_final_answer`, `invalid_json`, `schema_mismatch`
     — see "Resume-safety by failure reason" above): prefer a bounded `--resume` retry over
-    abandoning the thread. Wait 5s, then — using the SAME sentinel-file `--focus` idiom every other
+    abandoning the thread.
+    **Round 1 only — capture coverage from the failing attempt BEFORE retrying.** If this failure
+    is for a group's round-1 attempt (the one dispatched with `--uncommitted`/`--base`/`--commit`,
+    not an already-resumed round 2+ attempt) and the reason is one of the 8 post-dispatch reasons
+    that unconditionally carry `coverage.source` whenever it was a fresh `--uncommitted` dispatch
+    (`timeout`, `nonzero_exit`, `missing_task_complete`, `rollout_not_found`, `no_final_answer`,
+    `invalid_json`, `schema_mismatch`, `no_thread_started` — see "Coverage" in the interface
+    reference above), or the reason is `interrupted` (which carries it only conditionally,
+    depending on signal timing — see that same section), check this failed response for a
+    `coverage.source` object now, before dispatching the retry below. If present, capture that
+    value as this group's round-1 `coverage_source` determination (per "Coverage is a
+    Round-1-only property" above) and keep it — the `--resume` retry that follows never reports
+    `coverage.source` itself (no `--resume` call ever does), so this failed response is the ONLY
+    place this round's real coverage data can come from once a retry is needed. For `interrupted`
+    specifically, `coverage.source` may genuinely be absent — if so, there is nothing to capture;
+    proceed to the retry below and let the round-1 `coverage_source` determination fall back to
+    the `{"status":"unknown","omitted":[]}` sentinel exactly as it would for any other
+    coverage-absent round 1 (see "Coverage is a Round-1-only property" above). Skipping this
+    capture for a failure that DID carry it would force the convergence gate to fall back to that
+    same sentinel and block a clean `✅ CLEAN` verdict (see "Partial or unknown source coverage ≠
+    CLEAN" below) even though the diff was, in fact, already fully collected on this first
+    attempt — the eventual `ok:true` result coming from the `--resume` retry does not change that.
+    (For a round-2+ resume-safe failure, there is nothing to capture here: that attempt was itself
+    already a `--resume` call, so it never carried `coverage.source` in the first place.)
+    Wait 5s, then — using the SAME sentinel-file `--focus` idiom every other
     dispatch in this file already uses, never a value interpolated directly:
     ```
     FOCUS_FILE="<a fresh mktemp'd path, written via the Write tool exactly like Phase 1 Step 0 --
