@@ -40,6 +40,19 @@
 #                         deliberately non-JSON text to stdout, to test that
 #                         extraction's `fromjson?` tolerates a malformed
 #                         line. Unset (default): no such line.
+#   FAKE_CODEX_NO_THREAD_STARTED  when set (any value), for a FRESH dispatch
+#                         only (--resume already has no thread.started
+#                         concept, so this never affects it): skip emitting
+#                         the thread.started line and skip creating the
+#                         rollout file, then sleep (honors
+#                         FAKE_CODEX_SLEEP_SECS, default 11s) before exiting,
+#                         so the wrapper's own real THREAD_WAIT_SECS=10s poll
+#                         genuinely times out. Simulates the no_thread_started
+#                         condition, which is otherwise unreachable from this
+#                         fixture (a fresh dispatch always emits
+#                         thread.started unconditionally, before ever
+#                         looking at $FAKE_CODEX_SCENARIO). Unset (default):
+#                         stdout unchanged, byte-for-byte.
 set -u
 
 # `codex delete --force -- <threadId>` (run-ccs-review.sh's --cleanup mode)
@@ -88,6 +101,13 @@ if [ "$MODE" = "resume" ]; then
   # output.
   echo "FAKE_CODEX_RESUME_MODE thread_id=$THREAD_ID"
 else
+  if [ -n "${FAKE_CODEX_NO_THREAD_STARTED:-}" ]; then
+    # No thread.started line, no rollout file -- just outlive the wrapper's
+    # real (hardcoded, not configurable) THREAD_WAIT_SECS=10s poll so its
+    # wait loop genuinely times out rather than exiting early.
+    sleep "${FAKE_CODEX_SLEEP_SECS:-11}"
+    exit 0
+  fi
   THREAD_ID="$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null)"
   [ -n "$THREAD_ID" ] || THREAD_ID="fake-$$-${RANDOM}"
   jq -nc --arg tid "$THREAD_ID" '{type: "thread.started", thread_id: $tid}'
