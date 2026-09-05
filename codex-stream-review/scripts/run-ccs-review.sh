@@ -747,11 +747,10 @@ else
   # evidence -- review-verdict.schema.json's plain type/enum/required checks
   # can't express those cross-field rules (the backend's strict-structured-
   # output mode rejects allOf/if-then outright), so this is the only
-  # enforcement point, mirroring codex-direct-review's own judge_result
-  # validator. This wrapper requires --focus unconditionally (checked in
-  # argument parsing above), so that validator's conditional "code-only
-  # review, no context given" summary-marker requirement never applies here
-  # and is omitted.
+  # enforcement point for these cross-field rules. This wrapper requires
+  # --focus unconditionally (checked in argument parsing above), so a
+  # conditional "code-only review, no context given" summary-marker
+  # requirement never applies here and is omitted.
   elif [ -n "$SCHEMA" ] && ! printf '%s' "$FINAL_TEXT" | jq -e '
         (.verdict == "CLEAN" or .verdict == "ISSUES") and
         has("summary") and (.summary == null or (.summary | type) == "string") and

@@ -1,5 +1,10 @@
 # Codex Direct Review Implementation Plan
 
+**Superseded (2026-09-04):** the `codex-direct-review` plugin this plan built has been removed
+from this repository. `codex-stream-review:ccs` has matured past it and is now the sole
+Claude+Codex cross-review path. Kept as a historical record of the original implementation
+plan — not current instructions.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace `/cc`'s Codex invocation (currently `Agent(codex:codex-rescue)` → the `openai-codex` plugin's shared app-server broker) with a new, independently-shareable `codex-direct-review` plugin that runs generic `codex exec` with a hand-built prompt as a one-shot, ephemeral process per call — eliminating the broker's silent-failure, premature-completion, and idle-stall failure modes.

@@ -2,6 +2,11 @@
 
 Date: 2026-08-28
 Status: approved (Claude + user + Codex technical validation), pending implementation plan
+**Superseded (2026-09-04):** the `codex-direct-review` plugin this document designed has been
+removed from this repository. `codex-stream-review:ccs` (see
+`docs/2026-09-03-ccs-design.md`) has matured past it and is now the sole Claude+Codex
+cross-review path. Kept as a historical record of the original design reasoning — not
+current instructions.
 
 ## Problem
 
