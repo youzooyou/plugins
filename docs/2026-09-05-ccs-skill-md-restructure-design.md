@@ -3,6 +3,29 @@
 > Status: approved by plugin author (2026-09-05), reviewed by Codex as a non-repo-artifact `/ccs`
 > round (single round, converged with 3 findings accepted — see "Codex review" below), not yet
 > implemented.
+> **Update (2026-09-05, during plan-writing):** precise line-boundary verification against the
+> actual file (required to write an unambiguous implementation plan) found that Phase 1 Step 4
+> (tmux pane logic) is written as ONE unified single/N-pane procedure, not cleanly splittable
+> without duplicating logic across two files — the same risk Codex's own review already flagged
+> for Phase 2's Guards section. Step 4 stays in core, unsplit. The real achievable core size is
+> **~1,536 lines (19% reduction)**, not the ~1,100–1,200-line (35–40%) target below. Plugin author
+> reviewed this tradeoff and approved proceeding at the smaller, lower-risk scope rather than
+> forcing further splits. The content map, trigger mechanism, and validation plan below are
+> otherwise unchanged and still accurate.
+> **Second update (2026-09-05, same session):** the plugin author separately requested removing
+> Phase 1 Step 4 (tmux auto-pane) ENTIRELY — it was added specifically so the author could visually
+> confirm live Claude+Codex round communication while this plugin was under active development;
+> that verification purpose is now satisfied and the live-pane feature is no longer needed. This
+> is a genuine feature removal (not a token-cost relocation), approved directly by the plugin
+> author, and back-to-back with it: Step 3 ("early THREAD_ID signal") is ALSO removable in full —
+> its own text already states its only purpose is deciding when to open the tmux pane, and that
+> `GROUP_THREADS` is already correctly, authoritatively established from each round's own JSON
+> response (Phase 2 step 1) regardless of whether Step 3 ever ran. `scripts/watch-rollout.sh`
+> becomes dead code once Step 4 is gone (confirmed via repo-wide grep: referenced nowhere except
+> Step 4 itself) and is deleted too. This removes ~200 additional lines with no reference-file
+> relocation needed (pure deletion) — the corrected core-size estimate is now **~1,300–1,350
+> lines (~30% reduction)**, closer to the originally-approved target than the tmux-inclusive
+> estimate above. See the implementation plan for the exact task covering this removal.
 > Companion reading: `docs/2026-09-03-ccs-design.md` (original `/ccs` design),
 > `docs/2026-09-04-ccs-parallel-mode-design.md` (parallel multi-reviewer mode, whose content this
 > restructure partially relocates).
@@ -59,9 +82,12 @@ re-verified and accepted — folded into the design below rather than left as a 
   below)
 - Phase 1: the sizing/mode-selection heuristic in full (must always run, single-reviewer or
   parallel, to decide which) including its git-sanitization command blocks — this is the ONE
-  canonical copy `references/non-repo-artifact.md` will point back to; Step 1's single-group
-  dispatch form (ditto, the canonical sanitization copy for parallel-mode's own pointer); Step 2
-  liveness watcher; Step 3 single-group `THREAD_ID` signal; Step 4 **single-pane** tmux logic only
+  canonical copy `references/non-repo-artifact.md` will point back to; Step 1's dispatch block in
+  full (this is the canonical sanitization copy for `references/non-repo-artifact.md`'s own
+  pointer too); Step 2 liveness watcher; Step 3 `THREAD_ID` signal; **Step 4 (tmux pane logic) in
+  full** — written as one unified single/N-pane procedure (N=1 is a special case of the same
+  mechanism, not a separate code path), not cleanly splittable without duplicating logic across
+  two files, the identical risk already identified for Guards below
 - Phase 2 in full, Guards included — Codex's own review confirmed keeping this whole section
   intact is correct: its parallel-mode asides are compact one-sentence extensions of
   already-present single-reviewer rules, not self-contained separable blocks, so extracting them
@@ -75,9 +101,11 @@ lines) plus the `investigation_evidence` JSONL field spec.
 
 **`references/parallel-mode.md`:** the "what parallel mode actually is" / splitting-strategy prose
 and scope table (the sizing heuristic's git commands stay in core, per above — only the prose
-built on top of an already-computed size defers), Step 0's `GROUP`-templating rationale, Step 1's
-N-group concurrent dispatch loop mechanics, Step 4's N-pane tmux mechanics, "Per-group History
-construction", the `groups[]` JSONL schema.
+built on top of an already-computed size defers), Step 0's two self-contained parallel-specific
+sub-bullets ("Parallel mode (more than one group this round)" and "Per-group History
+construction" — each purely additive with no single-reviewer analog to leave incomplete, unlike
+Guards' interleaved asides), the `groups[]` JSONL schema. (Step 1's and Step 4's parallel content
+turned out NOT to be cleanly separable — see the 2026-09-05 update above — and stays in core.)
 
 **`references/non-repo-artifact.md`:** the `CLEAN_REPO_DIR` mechanism in full (~150 lines).
 
