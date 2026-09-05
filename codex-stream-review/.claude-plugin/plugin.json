@@ -1,6 +1,6 @@
 {
   "name": "codex-stream-review",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Stream live Codex review progress by tailing a persisted thread's rollout file, with multi-round follow-up via codex exec resume (no diff re-send). Includes /ccs, a Claude+Codex adversarial cross-review loop on a resumable thread.",
   "author": {
     "name": "youzooyou",
