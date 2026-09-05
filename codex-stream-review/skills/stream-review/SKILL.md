@@ -12,7 +12,7 @@ Runs a Codex review as a **persisted, resumable thread** via this plugin's
 Round 1 starts the thread with `codex exec --sandbox read-only`; every
 follow-up round resumes that same thread with `codex exec resume`, so Codex
 already has the diff and prior findings in its own context — a follow-up
-`--focus` should carry only the new question, never the diff again. Unlike a
+round's stdin focus text should carry only the new question, never the diff again. Unlike a
 fresh-process-per-round design, which re-runs everything from scratch each
 round and never leaves anything on disk, this plugin leaves a real thread +
 rollout file behind on purpose (that's what makes resume possible), which is
@@ -33,9 +33,9 @@ shared state between them.
 ### 1. Start a review (round 1)
 
 ```bash
+printf '%s' "<what to review and what to check for>" | \
 "${CLAUDE_PLUGIN_ROOT}/scripts/run-stream-review.sh" \
   --cwd "<the project directory>" \
-  --focus "<what to review and what to check for>" \
   [--output-schema <path to a JSON Schema file>]
 ```
 
@@ -51,8 +51,9 @@ progress, redirect stdout and stderr to SEPARATE files (never combine them
 with `2>&1` if you want this):
 
 ```bash
+printf '%s' "<prompt>" | \
 "${CLAUDE_PLUGIN_ROOT}/scripts/run-stream-review.sh" \
-  --cwd "<dir>" --focus "<prompt>" \
+  --cwd "<dir>" \
   > result.json 2>stderr.log &
 ```
 
@@ -66,13 +67,14 @@ extra `THREAD_ID=` line mixed into that combined file alongside the final
 JSON verdict.
 
 This wrapper has no `--uncommitted`/`--base`/`--commit` flags and gathers no
-diff itself — it
-forwards `--focus` verbatim as the prompt to `codex exec`. Scope is entirely
-the caller's responsibility: either embed the actual diff content in
-`--focus` directly, or give Codex explicit instructions for finding it
-itself (e.g. "review the uncommitted diff in this repo") and let it run
-`git diff` on its own — `--sandbox read-only` permits reads and shell exec,
-just not writes.
+diff itself — it reads its own stdin, in full, and forwards it verbatim as
+the prompt to `codex exec` (no positional PROMPT argument is passed; per
+`codex exec --help`, omitting it makes the CLI read its instructions from
+stdin instead). Scope is entirely the caller's responsibility: either embed
+the actual diff content in that stdin text directly, or give Codex explicit
+instructions for finding it itself (e.g. "review the uncommitted diff in
+this repo") and let it run `git diff` on its own — `--sandbox read-only`
+permits reads and shell exec, just not writes.
 
 The wrapper prints exactly one line of JSON:
 
@@ -93,14 +95,14 @@ and `--cleanup` possible.
 ### 2. Continue a review (round 2+, `--resume`)
 
 ```bash
+printf '%s' "<only the new follow-up/rebuttal question>" | \
 "${CLAUDE_PLUGIN_ROOT}/scripts/run-stream-review.sh" \
   --cwd "<the same project directory>" \
   --resume "<threadId from the prior round>" \
-  --focus "<only the new follow-up/rebuttal question>" \
   [--output-schema <path to a JSON Schema file>]
 ```
 
-Put only the new question in `--focus` — the diff and every prior finding
+Put only the new question on stdin — the diff and every prior finding
 are already in the thread's own context, and re-sending them defeats the
 entire point of resuming instead of starting fresh. There is no preflight
 check on `--resume`'s `threadId` before dispatch (this wrapper does not look
